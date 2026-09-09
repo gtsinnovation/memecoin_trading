@@ -1,0 +1,8 @@
+# Python files
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+
+# Docker / PostgreSQL local data volume
+pgdata/
