@@ -144,6 +144,52 @@ def decode_jupiter_swap_transaction(swap_transaction_b64: str) -> bytes:
     return bytes(vtx)
 
 
+def verify_jupiter_swap_transaction(swap_transaction_b64: str, *,
+                                      expected_fee_payer: str,
+                                      sim_result: Optional[dict],
+                                      input_mint: str,
+                                      output_mint: str,
+                                      max_input_raw: int):
+    """Check an inbound Jupiter transaction BEFORE it is sent for signing.
+
+    This closes the other half of the trust loop. reassemble_signed_*
+    already proves Turnkey returned the same message we submitted --
+    the OUTBOUND boundary. Nothing checked the INBOUND one: Jupiter
+    builds the whole instruction set server-side and we signed whatever
+    came back, so a compromised endpoint, an intercepting proxy or a
+    response-tampering bug produced a transaction that was faithfully
+    signed and faithfully broadcast.
+
+        Jupiter --?--> us ------> Turnkey --OK--> us ---> network
+                 ^^^^^                    ^^^^
+              this check            already checked
+
+    Delegates to tx_verify, the same dependency-free module the pipeline
+    uses, so there is exactly one implementation of the wire format in
+    the codebase rather than one here and one there.
+
+    Raises ValueError on refusal -- callers must not catch and continue.
+    """
+    import tx_verify
+
+    result = tx_verify.verify_before_signing(
+        swap_transaction_b64,
+        expected_fee_payer=expected_fee_payer,
+        sim_result=sim_result,
+        input_mint=input_mint,
+        output_mint=output_mint,
+        max_input_raw=max_input_raw,
+    )
+    if not result.ok:
+        raise ValueError(
+            "Refusing to sign the Jupiter swap transaction: " + "; ".join(result.reasons))
+    if result.partially_verified:
+        logger.warning(
+            "Jupiter swap only PARTIALLY verified offline (%s). The simulation check "
+            "passed, which is what bounds the spend.", result.detail)
+    return result
+
+
 def reassemble_signed_versioned_tx(unsigned_tx_bytes: bytes, signed_tx_hex: str) -> bytes:
     """Same idea as reassemble_signed_sol_transfer() but for the
     VersionedTransaction Jupiter swaps use. Turnkey returns the full

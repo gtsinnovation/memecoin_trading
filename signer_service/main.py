@@ -83,6 +83,9 @@ async def startup():
     # variable at mainnet and leaving the mode alone signed and broadcast a
     # REAL mainnet transfer paying real fees. Refuse to start on that
     # combination rather than document it as safe.
+    # Refuse to start on an inconsistent cap set before anything can be signed.
+    policy_guard.assert_caps_consistent()
+
     if SIGNER_MODE == "devnet_transfer_test" and resolved != "devnet":
         raise RuntimeError(
             f"SIGNER_MODE=devnet_transfer_test but the configured RPC resolves to "
@@ -143,7 +146,8 @@ class ExecuteRequest(BaseModel):
 
 
 async def _write_audit_log(token_address: str, token_symbol: Optional[str], requested_usd: float,
-                             outcome: str, reason: str, tx_signature: Optional[str], network: str):
+                             outcome: str, reason: str, tx_signature: Optional[str], network: str) -> bool:
+    """Returns True when the audit row was written, False when it was not."""
     try:
         async with _pool.acquire() as conn:
             await conn.execute(
@@ -152,12 +156,19 @@ async def _write_audit_log(token_address: str, token_symbol: Optional[str], requ
                    VALUES ($1, $2, $3, $4, $5, $6, $7);""",
                 token_address, token_symbol, requested_usd, outcome, reason, tx_signature, network,
             )
+        return True
     except Exception as e:
         # The audit write failing must never be silently swallowed, but it
         # also must never block returning the real outcome to the caller
         # (an execution result the operator can't see because a logging
         # write failed would be worse than a slightly incomplete log).
+        #
+        # It must also not be reported as success. A confirmed on-chain
+        # transaction with no audit row is exactly the state an operator
+        # needs to know about, so the outcome is returned to the caller and
+        # surfaced in the response rather than living only in a log line.
         logger.error(f"Failed to write execution_audit_log: {e}")
+        return False
 
 
 @app.get("/health")
@@ -309,6 +320,9 @@ async def execute(req: ExecuteRequest):
         reason = (f"broadcast, but the confirmation check failed ({e}) -- the transaction "
                   f"IS on-chain; check tx_signature on an explorer")
         logger.error(reason)
-    await _write_audit_log(req.token_address, req.token_symbol, req.requested_usd,
+    audited = await _write_audit_log(req.token_address, req.token_symbol, req.requested_usd,
                              "SIGNED_BROADCAST", reason, tx_signature, network)
-    return {"executed": True, "confirmed": confirmed, "tx_signature": tx_signature, "network": network, "reason": reason}
+    if not audited:
+        reason += " -- WARNING: the execution audit row could not be written; this transaction is on-chain with no local record"
+    return {"executed": True, "confirmed": confirmed, "tx_signature": tx_signature,
+            "network": network, "reason": reason, "audit_logged": audited}

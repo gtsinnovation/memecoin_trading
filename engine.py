@@ -5,6 +5,7 @@ import time
 import logging
 import random
 import concurrent.futures
+import threading
 from typing import TypedDict, Optional, Dict, Any, List
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -229,6 +230,8 @@ def evaluate_open_positions() -> List[Dict[str, Any]]:
     """
     conn = None
     closed_summaries: List[Dict[str, Any]] = []
+    # Staged here and only merged after the transaction commits.
+    pending_summaries = []
     try:
         conn = psycopg2.connect(DB_DSN)
         with conn:
@@ -286,13 +289,21 @@ def evaluate_open_positions() -> List[Dict[str, Any]]:
                     ))
                     cur.execute("DELETE FROM active_positions WHERE id = %s;", (pos["id"],))
 
-                    closed_summaries.append({
+                    pending_summaries.append({
                         "token_symbol": pos["token_symbol"],
                         "exit_reason": exit_reason,
                         "realized_pnl_usd": round(pnl_usd, 2),
                     })
+        # Only now. `with conn` commits on a clean exit and rolls back on an
+        # exception, so appending to the returned list INSIDE the block
+        # reported closes that the database then discarded -- operators saw
+        # exits that never happened, and the same positions closed again on
+        # the next tick because the DELETE was rolled back too.
+        closed_summaries.extend(pending_summaries)
     except Exception as e:
         logger.error(f"Failed to evaluate open position exits: {e}")
+        # pending_summaries is deliberately dropped here: the transaction
+        # rolled back, so none of those closes exist.
     finally:
         if conn is not None:
             conn.close()
@@ -329,6 +340,11 @@ def _fetch_position_prices(token_addresses: List[str]) -> Dict[str, float]:
 # watchdog behavior, kill-switch thresholds) -- a single row in app_settings.
 _settings_cache: Dict[str, Any] = {"data": None, "fetched_at": 0.0}
 _SETTINGS_CACHE_TTL_SECONDS = 3.0
+# How long a cached copy may still be served once the database has stopped
+# answering. Past this the reader returns None and every caller must fail
+# closed, because the alternative is serving a run_status from before an
+# operator paused the agent -- for the entire length of the outage.
+_SETTINGS_MAX_STALE_SECONDS = 60.0
 
 
 def get_app_settings(force_refresh: bool = False) -> Optional[Dict[str, Any]]:
@@ -350,8 +366,19 @@ def get_app_settings(force_refresh: bool = False) -> Optional[Dict[str, Any]]:
                 _settings_cache["fetched_at"] = now
                 return _settings_cache["data"]
     except Exception as e:
-        logger.error(f"Failed to load app settings: {e}")
-        return _settings_cache["data"]
+        # Serving the last good row through a brief blip is useful. Serving it
+        # forever is not: a pause set during the outage would never be seen,
+        # and the agent would keep trading on a stale RUNNING.
+        age = now - _settings_cache["fetched_at"]
+        if _settings_cache["data"] is not None and age <= _SETTINGS_MAX_STALE_SECONDS:
+            logger.error(f"Failed to load app settings ({e}); serving cached copy {age:.0f}s old.")
+            return _settings_cache["data"]
+        logger.error(
+            f"Failed to load app settings ({e}) and the cached copy is {age:.0f}s old "
+            f"(limit {_SETTINGS_MAX_STALE_SECONDS:.0f}s) -- returning None so callers fail closed."
+        )
+        _settings_cache["data"] = None
+        return None
     finally:
         if conn is not None:
             conn.close()
@@ -542,7 +569,47 @@ def check_kill_switch() -> Dict[str, Any]:
 # 2c. Agent Watchdog -- wraps every node with a timeout so one hung agent
 # (an unresponsive external call, an infinite loop, a DB stall) is detected
 # and reported by name instead of hanging the whole pipeline forever.
-_watchdog_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="agent-watchdog")
+# A hung agent cannot be killed -- Python has no way to interrupt a thread
+# blocked in a socket read. The timeout only stops US waiting; the thread
+# keeps the worker forever.
+#
+# With max_workers=1 that was terminal: one wedged agent held the only
+# worker, so every subsequent tick queued behind it and timed out in turn.
+# The pipeline died permanently after a single hang, emitting one CRITICAL
+# per tick, and only a container restart recovered it.
+#
+# The fix is to ABANDON the wedged pool rather than wait on it. The stuck
+# thread is left to finish or leak (it is daemon-threaded, so it cannot hold
+# up shutdown), and the next tick gets a clean worker.
+_watchdog_pool_lock = threading.Lock()
+
+
+def _new_watchdog_pool() -> concurrent.futures.ThreadPoolExecutor:
+    return concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="agent-watchdog")
+
+
+_watchdog_pool = _new_watchdog_pool()
+# Pools abandoned after a timeout. Kept referenced only so they are not
+# garbage-collected mid-call; never waited on.
+_abandoned_pools: List[concurrent.futures.ThreadPoolExecutor] = []
+
+
+def _recycle_watchdog_pool(old_pool) -> None:
+    """Replace the pool after a hang so the next tick is not queued behind it."""
+    global _watchdog_pool
+    with _watchdog_pool_lock:
+        if _watchdog_pool is not old_pool:
+            return  # another thread already recycled it
+        _abandoned_pools.append(old_pool)
+        if len(_abandoned_pools) > 8:
+            _abandoned_pools.pop(0)
+        _watchdog_pool = _new_watchdog_pool()
+    # wait=False: never block on the wedged thread, which is the whole point.
+    try:
+        old_pool.shutdown(wait=False)
+    except Exception:
+        pass
 
 
 # Real per-agent execution times, in milliseconds, from the most recent tick.
@@ -569,16 +636,21 @@ def with_watchdog(agent_name: str):
             settings = get_app_settings()
             timeout = float(settings["agent_timeout_seconds"]) if settings and settings.get("agent_timeout_seconds") else 15.0
             started = time.perf_counter()
-            future = _watchdog_pool.submit(fn, state)
+            pool = _watchdog_pool
+            future = pool.submit(fn, state)
             try:
                 result = future.result(timeout=timeout)
                 AGENT_LATENCY_MS[agent_name] = round((time.perf_counter() - started) * 1000.0, 1)
                 return result
             except concurrent.futures.TimeoutError:
                 AGENT_LATENCY_MS[agent_name] = round((time.perf_counter() - started) * 1000.0, 1)
+                # The thread is unkillable, so abandon the pool instead of
+                # leaving the next tick to queue behind it.
+                _recycle_watchdog_pool(pool)
                 write_system_alert(
                     "CRITICAL", agent_name,
-                    f"No response within {timeout}s -- flagged unresponsive by the network watchdog."
+                    f"No response within {timeout}s -- flagged unresponsive by the network "
+                    f"watchdog. Worker pool recycled; the hung thread was abandoned."
                 )
                 raise AgentUnresponsiveError(agent_name, timeout)
             except Exception:
@@ -668,25 +740,51 @@ def node_C_VECTOR(state: AgentNetworkState) -> Dict[str, Any]:
     return {"entry_conditions_met": True,
             "execution_degraded": bool(state.get("execution_degraded")) or degraded,
             "drawdown_detail": finding.detail}
+# The original geometry set entry at 0.93x spot and the stop at 0.86x spot,
+# i.e. the stop sat 7.53% BELOW THE ENTRY and the target 2:1 beyond that.
+# Those relative distances are the strategy; the 0.93 was an entry-price
+# assumption, and it is the part that was wrong. Expressed relative to the
+# entry, the risk/reward is unchanged by the fix below.
+STOP_DISTANCE_PERCENT = 7.53
+REWARD_RISK_MULTIPLE = 2.0
+
+
 def node_D_PULSE(state: AgentNetworkState) -> Dict[str, Any]:
     """Entry, stop and target for the setup.
 
-    Levels are rounded to SIGNIFICANT FIGURES, not to a fixed number of decimal
-    places. Fixed-decimal rounding collapses on this asset class: at five
-    decimals a token priced at 1e-4 rounds its entry and stop to the SAME
-    number, and anything below roughly 5e-6 rounds all three levels to 0.0.
+    ENTRY IS THE PRICE WE CAN ACTUALLY TRANSACT AT.
 
-    A zero target is not a harmless cosmetic error. evaluate_open_positions
-    exits on `next_price >= target_exit_price`, which is true for every
-    possible price when that target is 0.0 -- so the position books an instant
-    take-profit at a price that never traded, and records it as a win. Equal
-    entry and stop do the same thing one tick later.
+    This node used to set the entry 7% below spot and return
+    pullback_detected=True unconditionally. Nothing ever waited for that
+    pullback and nothing ever checked whether it happened: I_ACCOUNTANT
+    opened the position on the same tick, at a price the market had not
+    traded. Every position therefore opened 7% in profit against reality,
+    and that 7% flowed into entry price, stop distance, target distance,
+    realised P&L and every cohort statistic built on them. It is the single
+    largest reason the accumulated results flatter the strategy.
 
-    A level set that is not strictly ordered is therefore refused outright
-    rather than written down. The refusal sets termination_reason, which
-    router_G honours by routing past H_FUSE, and node_I_ACCOUNTANT then skips
-    save_active_position -- so no position is opened on geometry we could not
-    compute.
+    paper_trading.py already models this correctly and is the reference: it
+    writes TWO rows per candidate -- an IMMEDIATE fill at the evaluation
+    price, and a LIMIT order at the pullback which waits and may EXPIRE
+    unfilled. The live path was taking the LIMIT price with IMMEDIATE
+    semantics, which is the one combination that cannot happen in a market:
+    the better fill without the risk of not getting it.
+
+    The live path is a market buy, so it books at spot. Confirming a genuine
+    pullback needs intrabar data this pipeline does not have, so
+    pullback_detected reports False rather than asserting something
+    unobserved -- the field is kept for schema continuity, not as a claim.
+    When Stage 4 executes for real, fill_accounting.reconstruct_fill replaces
+    this estimate with the actual on-chain fill.
+
+    Levels are rounded to SIGNIFICANT FIGURES, not decimal places. Fixed
+    decimals collapse on this asset class: at five decimals a token at 1e-4
+    rounds its entry and stop to the same number, and below ~5e-6 all three
+    round to 0.0. A zero target makes evaluate_open_positions' exit test
+    true for every possible price, so the position books an instant
+    take-profit that never happened. A set that is not strictly ordered is
+    refused via termination_reason, which router_G honours by routing past
+    H_FUSE so I_ACCOUNTANT never calls save_active_position.
     """
     price = state.get("current_price")
     empty_levels = {
@@ -700,26 +798,33 @@ def node_D_PULSE(state: AgentNetworkState) -> Dict[str, Any]:
         write_system_alert("WARN", "D_PULSE", reason)
         return {"pullback_detected": False, "termination_reason": reason, **empty_levels}
 
-    target_pullback = round_significant(price * 0.93)
-    invalidation_floor = round_significant(price * 0.86)
-    # Take-profit set at a 2:1 reward:risk multiple of the entry-to-stop distance,
-    # so the position actually has an upside exit target, not just a stop-loss.
-    risk_per_unit = target_pullback - invalidation_floor
-    target_exit = round_significant(target_pullback + (risk_per_unit * 2.0))
+    # Entry at spot. The field name is kept because schema and dashboard
+    # read it; it no longer holds a pullback.
+    entry = round_significant(float(price))
+    invalidation_floor = round_significant(entry * (1.0 - STOP_DISTANCE_PERCENT / 100.0))
+    risk_per_unit = entry - invalidation_floor
+    target_exit = round_significant(entry + (risk_per_unit * REWARD_RISK_MULTIPLE))
 
-    if not (0 < invalidation_floor < target_pullback < target_exit):
+    if not (0 < invalidation_floor < entry < target_exit):
         reason = (f"D_PULSE: Short-circuit. Degenerate levels at price {price} -- "
-                  f"stop={invalidation_floor}, entry={target_pullback}, target={target_exit}.")
+                  f"stop={invalidation_floor}, entry={entry}, target={target_exit}.")
         write_system_alert("WARN", "D_PULSE", reason)
         return {"pullback_detected": False, "termination_reason": reason, **empty_levels}
 
-    write_system_alert("INFO", "D_PULSE", f"Calculated limits: Pullback={target_pullback}, Invalidation Floor={invalidation_floor}, Target Exit={target_exit}.")
+    write_system_alert(
+        "INFO", "D_PULSE",
+        f"Market entry at {entry} (spot). Invalidation Floor={invalidation_floor}, "
+        f"Target Exit={target_exit}.")
     return {
-        "pullback_detected": True,
-        "target_pullback_price": target_pullback,
+        # No pullback was observed -- this pipeline cannot observe one. The
+        # entry is a market fill at spot, which is what actually happens.
+        "pullback_detected": False,
+        "target_pullback_price": entry,
         "invalidation_level_price": invalidation_floor,
         "target_exit_price": target_exit
     }
+
+
 MIN_CAPITAL_PER_PARTICIPANT_USD = 15.0
 
 

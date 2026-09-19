@@ -11,6 +11,10 @@
 \if :{?fee}
 \else
 \set fee 0.5
+-- Charged when price impact could not be measured at all. MUST match
+-- paper_trading.PAPER_UNMEASURED_SLIPPAGE_PERCENT, or this report and the
+-- Python one answer the same question differently.
+\set unmeasured_slip 3.0
 \endif
 
 \echo ''
@@ -116,9 +120,19 @@ SELECT h.horizon_minutes AS mins, t.cohort,
        -- :fee is PAPER_FEE_PERCENT_PER_SIDE * 2, defaulted below. Hardcoding
        -- 0.5 meant an operator who raised the fee to be stricter saw no
        -- change in the only report that actually ships.
-       -- NULL slippage propagates to a NULL net rather than being charged as
-       -- zero cost -- an unmeasured cost is not a free trade.
-       ROUND(AVG(h.return_percent - (:fee + 2*ABS(t.assumed_slippage_percent))), 2) AS net,
+       -- NULL slippage is charged at :unmeasured_slip, NOT skipped.
+       --
+       -- Letting it propagate to NULL looked conservative but silently broke
+       -- the comparison this report exists for: AVG ignores NULL rows, so
+       -- `mean` averaged EVERY row while `net` averaged only the subset whose
+       -- slippage was measurable -- a systematically more liquid subset. The
+       -- two columns sat side by side describing different populations, and
+       -- the gap between them was read as a cost estimate.
+       --
+       -- assumed_n exposes how much of each row is assumed rather than
+       -- measured, so a net built mostly from assumptions is visible as such.
+       ROUND(AVG(h.return_percent - (:fee + 2*ABS(COALESCE(t.assumed_slippage_percent, :unmeasured_slip)))), 2) AS net,
+       COUNT(*) FILTER (WHERE t.assumed_slippage_percent IS NULL) AS assumed_n,
        ROUND(100.0 * COUNT(*) FILTER (WHERE h.return_percent > 0) / NULLIF(COUNT(*),0)) AS pct_up
 FROM paper_horizon_returns h JOIN paper_trades t ON t.id = h.paper_trade_id
 WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5

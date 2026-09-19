@@ -9,10 +9,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+COPY signer_service/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY signer_service/ .
+# Shared with the main pipeline. tx_verify.py has no third-party imports by
+# design, so it runs unchanged in both images.
+COPY tx_verify.py .
 
 EXPOSE 8100
 

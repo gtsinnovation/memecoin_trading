@@ -129,7 +129,14 @@ services:
   # Its secrets live in signer_service/.env (a SEPARATE file from the
   # project root's .env) -- see signer_service/.env.example.
   signer:
-    build: ./signer_service
+    # Context is the repo ROOT, not signer_service/, so the image can include
+    # tx_verify.py -- the same file the pipeline uses. A second copy inside
+    # signer_service/ would be one more implementation of the transaction
+    # wire format to keep in step, which is exactly the divergence this
+    # codebase has been bitten by.
+    build:
+      context: .
+      dockerfile: ./signer_service/Dockerfile
     container_name: trading_signer_service
     restart: unless-stopped
     profiles: ["stage3"]

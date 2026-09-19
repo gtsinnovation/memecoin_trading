@@ -122,3 +122,32 @@ if failed:
     print("https://kevinheavey.github.io/solders/ and adjust solana_tx.py.")
     sys.exit(1)
 print("ALL CHECKS PASSED -- solana_tx.py matches the installed solders. Safe to proceed to Turnkey setup.")
+
+
+# The swap path compares two VersionedTransaction MESSAGES byte for byte.
+# reassemble_signed_versioned_tx notes in its own comment that bytes(message)
+# is not proven here and that it fails closed if neither serialization works --
+# correct, but it means the Stage 4 integrity check has never been shown to
+# actually run against the installed solders. Prove it before Stage 4 relies
+# on it.
+def versioned_message_is_serializable():
+    from solders.transaction import VersionedTransaction
+    tx = solana_tx.build_sol_transfer_tx(ADDR, ADDR, 1000, BLOCKHASH)
+    vtx = VersionedTransaction.from_bytes(bytes(tx))
+    msg = vtx.message
+    out = None
+    for attempt in (lambda: bytes(msg), lambda: msg.to_bytes()):
+        try:
+            candidate = attempt()
+            if isinstance(candidate, (bytes, bytearray)):
+                out = bytes(candidate)
+                break
+        except Exception:
+            continue
+    assert out, "neither bytes(message) nor message.to_bytes() works -- the swap-path integrity check cannot run"
+    assert len(out) > 0, "message serialized to zero bytes"
+    print(f"      message serializes to {len(out)} bytes")
+
+
+check("VersionedTransaction message is serializable (swap-path integrity check)",
+      versioned_message_is_serializable)

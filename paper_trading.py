@@ -55,6 +55,13 @@ logger = logging.getLogger("paper_trading")
 # isn't accused of being rigged pessimistic -- raise it to be stricter.
 PAPER_FEE_PERCENT_PER_SIDE = float(os.environ.get("PAPER_FEE_PERCENT_PER_SIDE", "0.25"))
 
+# Charged when price impact could not be measured at all. Set to the slippage
+# gate's own ceiling: a token that passed the gate is known to be under it, and
+# one we could not measure could be anything up to it. Erring high is the right
+# direction for an experiment whose failure mode is flattering the strategy.
+# Keep this in step with the G_ANCHOR impact ceiling if that changes.
+PAPER_UNMEASURED_SLIPPAGE_PERCENT = 3.0
+
 # How long a LIMIT candidate waits for its pullback before being written
 # off as never-filled. Real limit orders don't sit forever, and letting
 # them wait indefinitely would quietly bias the sample toward tokens that
@@ -202,7 +209,23 @@ def total_cost_percent(assumed_slippage_percent: Optional[float]) -> float:
     toward higher costs is the right direction for an experiment whose
     failure mode is flattering the strategy.
     """
-    slippage = abs(float(assumed_slippage_percent or 0.0))
+    # `or 0.0` used to turn an UNMEASURED slippage into a measured zero, so a
+    # trade whose price impact could not be read was charged 0.5% -- fees
+    # alone -- and looked cheaper than one where impact was successfully
+    # measured at any positive value.
+    #
+    # That bias is not random. Impact fails to measure most often on thin,
+    # illiquid tokens, which are concentrated in the REJECTED cohort. Charging
+    # them nothing manufactures part of the very cohort gap in net return that
+    # the experiment exists to measure.
+    #
+    # Unmeasured now costs the documented stand-in below, never zero. The row
+    # keeps assumed_slippage_percent = NULL, so analysis can still separate
+    # measured from assumed without a second column.
+    if assumed_slippage_percent is None:
+        slippage = PAPER_UNMEASURED_SLIPPAGE_PERCENT
+    else:
+        slippage = abs(float(assumed_slippage_percent))
     return round((PAPER_FEE_PERCENT_PER_SIDE * 2.0) + (slippage * 2.0), 4)
 
 
@@ -368,6 +391,34 @@ def open_token_addresses(conn) -> List[str]:
         return [r[0] for r in cur.fetchall()]
 
 
+# Keys mark_horizons() uses for dropout accounting. Negative so they cannot
+# collide with a horizon expressed in minutes.
+HORIZON_DROPPED_NO_PRICE = -1
+HORIZON_DROPPED_NO_BASIS = -2
+HORIZON_DUE_TOTAL = -3
+
+
+def horizon_dropout_summary(marks: Dict[int, int]) -> Dict[str, Any]:
+    """Human-readable dropout figures from a mark_horizons() result.
+
+    `dropout_percent` is the share of trades that were DUE for a mark this
+    tick and could not be given one. A rising number means the sample is
+    being eroded by tokens that stopped pricing, which biases every horizon
+    statistic toward the survivors.
+    """
+    due = marks.get(HORIZON_DUE_TOTAL, 0)
+    no_price = marks.get(HORIZON_DROPPED_NO_PRICE, 0)
+    no_basis = marks.get(HORIZON_DROPPED_NO_BASIS, 0)
+    dropped = no_price + no_basis
+    return {
+        "due": due,
+        "dropped_no_price": no_price,
+        "dropped_no_basis": no_basis,
+        "marked": sum(v for k, v in marks.items() if k >= 0),
+        "dropout_percent": round(100.0 * dropped / due, 2) if due else None,
+    }
+
+
 def mark_horizons(conn, prices: Dict[str, float]) -> Dict[int, int]:
     """Records each evaluation's return at every horizon that has elapsed.
 
@@ -377,8 +428,19 @@ def mark_horizons(conn, prices: Dict[str, float]) -> Dict[int, int]:
 
     ON CONFLICT DO NOTHING carries the once-only guarantee, so a tick that
     re-examines an already-marked horizon is a no-op rather than a duplicate.
+
+    DROPOUT IS COUNTED, NOT SILENT. A token that stops pricing simply
+    produced no row and vanished from the sample with nothing recorded
+    anywhere. That is survivorship bias in the one measurement the whole
+    experiment rests on: tokens stop pricing because they died, so the
+    horizon returns quietly described only the survivors, and the barrier
+    arm had an ABANDONED state while this arm had nothing. The counts are
+    returned under negative keys so the existing per-horizon dict shape is
+    unchanged for callers that only read horizons.
     """
     marks: Dict[int, int] = {}
+    # Negative keys cannot collide with a horizon in minutes.
+    DROPPED_NO_PRICE, DROPPED_NO_BASIS, DUE_TOTAL = -1, -2, -3
     if not prices or not HORIZONS_MINUTES:
         return marks
 
@@ -394,13 +456,17 @@ def mark_horizons(conn, prices: Dict[str, float]) -> Dict[int, int]:
         """, (_max_horizon_window(), len(HORIZONS_MINUTES)))
         due = cur.fetchall()
 
+        marks[DUE_TOTAL] = len(due)
         for tid, addr, basis, age_min in due:
             price = prices.get(addr)
-            if price is None:
-                continue  # unknown != zero, same rule as mark_to_market
-            basis = float(basis or 0.0)
-            if basis <= 0:
+            verdict = classify_horizon_row(price, basis)
+            if verdict == "DROPPED_NO_PRICE":
+                marks[DROPPED_NO_PRICE] = marks.get(DROPPED_NO_PRICE, 0) + 1
                 continue
+            if verdict == "DROPPED_NO_BASIS":
+                marks[DROPPED_NO_BASIS] = marks.get(DROPPED_NO_BASIS, 0) + 1
+                continue
+            basis = float(basis)
             age = float(age_min or 0.0)
             ret = ((float(price) / basis) - 1.0) * 100.0
             for horizon in HORIZONS_MINUTES:
@@ -418,6 +484,51 @@ def mark_horizons(conn, prices: Dict[str, float]) -> Dict[int, int]:
                 if cur.rowcount is not None and cur.rowcount > 0:
                     marks[horizon] = marks.get(horizon, 0) + 1
     return marks
+
+
+def decide_exit(price: float, target: Optional[float], stop: Optional[float],
+                held_minutes: Optional[float]) -> Tuple[Optional[str], float]:
+    """Which exit (if any) a live trade takes at this price, and at what price.
+
+    Extracted from mark_to_market so it can be tested without a database.
+    The asymmetry between the two barriers is the point:
+
+      TARGET_HIT  fills AT the target. A take-profit is a limit sell; the
+                  market trading through it does not improve your fill.
+      STOPPED_OUT fills at the WORSE of the stop and the observed price. A
+                  stop is not a limit -- it triggers at the level and fills
+                  at whatever the market is, which on this asset class is
+                  routinely far below.
+
+    Booking stop-outs AT the stop capped every loss at exactly the stop
+    distance, so a token that fell from -3% to -99% between two marks
+    recorded a tidy -7.5%. The left tail -- the rug, the event that decides
+    whether the strategy survives -- could not be represented at all, in the
+    direction that flatters it.
+    """
+    if target is not None and price >= float(target):
+        return "TARGET_HIT", float(target)
+    if stop is not None and price <= float(stop):
+        return "STOPPED_OUT", min(float(price), float(stop))
+    if float(held_minutes or 0) >= MAX_HOLD_MINUTES:
+        return "TIMEOUT", float(price)
+    return None, float(price)
+
+
+def classify_horizon_row(price: Optional[float], basis: Optional[float]) -> str:
+    """Whether a due horizon row can be marked, and if not, why.
+
+    Extracted from mark_horizons for the same reason as decide_exit. The
+    outcomes are counted rather than skipped silently: a token that stops
+    being priced is exactly the token whose return would have been worst,
+    so dropping it without a record biases every horizon statistic toward
+    the survivors.
+    """
+    if price is None:
+        return "DROPPED_NO_PRICE"   # unknown is not zero
+    if basis is None or float(basis) <= 0:
+        return "DROPPED_NO_BASIS"
+    return "MARKABLE"
 
 
 def mark_to_market(conn, prices: Dict[str, float]) -> Dict[str, int]:
@@ -486,14 +597,7 @@ def mark_to_market(conn, prices: Dict[str, float]) -> Dict[str, int]:
 
             # status == 'OPEN'
             basis = float(fill_price or 0.0)
-            exit_reason = None
-            exit_price = price
-            if target is not None and price >= float(target):
-                exit_reason, exit_price = "TARGET_HIT", float(target)
-            elif stop is not None and price <= float(stop):
-                exit_reason, exit_price = "STOPPED_OUT", float(stop)
-            elif float(held_min or 0) >= MAX_HOLD_MINUTES:
-                exit_reason = "TIMEOUT"
+            exit_reason, exit_price = decide_exit(price, target, stop, held_min)
 
             if exit_reason is None:
                 continue

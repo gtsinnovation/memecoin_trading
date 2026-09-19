@@ -68,7 +68,7 @@ def main() -> int:
         import engine
         import paper_trading
         import token_discovery
-        from tests import test_gates, test_paper, test_discovery, test_prices, test_microstructure, test_tx_verify, test_fill_accounting, test_dpulse, test_direction_agents
+        from tests import test_gates, test_paper, test_discovery, test_prices, test_microstructure, test_tx_verify, test_fill_accounting, test_dpulse, test_direction_agents, test_hardening
 
         suites.append(test_gates.run(psycopg2, engine, dsn))
         suites.append(test_paper.run(psycopg2, paper_trading, dsn))
@@ -81,6 +81,7 @@ def main() -> int:
         suites.append(test_fill_accounting.run())
         suites.append(test_dpulse.run(engine))
         suites.append(test_direction_agents.run(engine))
+        suites.append(test_hardening.run())
     except Exception as e:
         print(f"\nSUITE CRASHED: {type(e).__name__}: {e}")
         traceback.print_exc()

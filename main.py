@@ -104,7 +104,23 @@ if not SESSION_SECRET_KEY:
     )
     SESSION_SECRET_KEY = secrets.token_hex(32)
 
-app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET_KEY, same_site="lax")
+# https_only: the deployment guide exposes this dashboard on a public port,
+# and without Secure the session cookie travels in clear over plain HTTP --
+# a cookie that grants capital limits, the kill switch and pause/resume.
+# Defaults to on; set SESSION_COOKIE_INSECURE=1 only for local http testing.
+_COOKIE_INSECURE = os.environ.get("SESSION_COOKIE_INSECURE", "").strip() in ("1", "true", "yes")
+if _COOKIE_INSECURE:
+    logger.warning(
+        "SESSION_COOKIE_INSECURE is set -- the session cookie will be sent over plain "
+        "HTTP. Acceptable on localhost only; never set this on a deployed host."
+    )
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SESSION_SECRET_KEY,
+    same_site="lax",
+    https_only=not _COOKIE_INSECURE,
+    max_age=int(os.environ.get("SESSION_MAX_AGE_SECONDS", "43200")),
+)
 
 # Single-operator allowlist: only this Gmail address may sign in. See
 # authorized_users in schema.sql if this ever needs to grow into a real
@@ -289,7 +305,23 @@ async def _fetch_settings_row() -> Optional[dict]:
 
 
 def _require_user(request: Request):
-    return request.session.get("user")
+    """The signed-in operator, or None.
+
+    Re-checks the session against the CURRENT allowlist on every request.
+    Rotating AUTHORIZED_GOOGLE_EMAIL used to revoke nothing: the old address
+    kept full access until its cookie happened to expire, because the
+    allowlist was consulted only at sign-in. Only rotating SESSION_SECRET_KEY
+    actually ejected anyone, and nothing said so.
+    """
+    user = request.session.get("user")
+    if not user:
+        return None
+    email = (user.get("email") if isinstance(user, dict) else str(user)).strip().lower()
+    if not AUTHORIZED_GOOGLE_EMAIL or email != AUTHORIZED_GOOGLE_EMAIL:
+        request.session.clear()
+        logger.warning("Session rejected: %r is no longer the authorised address.", email)
+        return None
+    return user
 
 
 @app.get("/api/settings")
@@ -577,8 +609,27 @@ async def pipeline_executor_worker():
             # This only ever flips run_status -- I_ACCOUNTANT is what actually
             # refuses new entries while paused; already-open positions keep
             # resolving normally above.
-            await loop.run_in_executor(None, check_kill_switch)
+            # check_kill_switch() writes run_status itself when a threshold
+            # trips, but it also has two paths -- settings unreadable, and the
+            # row missing entirely -- where it can only REPORT a closed gate
+            # and has nothing to write to. Its docstring says callers must
+            # treat those as not-open; this caller used to discard the return
+            # value entirely, so "I cannot tell whether trading is allowed"
+            # silently meant "carry on".
+            kill_switch_verdict = await loop.run_in_executor(None, check_kill_switch)
             settings_snapshot = await loop.run_in_executor(None, get_app_settings)
+
+            gate_open = bool((kill_switch_verdict or {}).get("gate_open", False))
+            gate_reason = (kill_switch_verdict or {}).get("reason") or "UNKNOWN"
+            if not gate_open and gate_reason in ("SETTINGS_UNAVAILABLE", "UNKNOWN"):
+                # Nothing was written to the database, so nothing else will
+                # stop entries. Pause explicitly rather than trusting a
+                # run_status we could not read.
+                await loop.run_in_executor(
+                    None, pause_trading,
+                    f"Kill-switch state unreadable ({gate_reason}) -- pausing rather than "
+                    f"trading on an unverified gate.")
+                settings_snapshot = await loop.run_in_executor(None, get_app_settings)
 
             async with pool.acquire() as conn:
                 totals = await conn.fetchrow("""
@@ -777,7 +828,13 @@ async def pipeline_executor_worker():
                 "recent_closed_trades": [dict(r) for r in recent_closed],
                 "alerts": [dict(a) for a in alert_rows],
                 "run_state": {
-                    "run_status": (settings_snapshot or {}).get("run_status", "RUNNING"),
+                    # Defaulting to "RUNNING" painted a green, healthy dashboard
+                    # over a pipeline whose state could not be read at all -- a
+                    # tripped kill switch plus one transient database error was
+                    # enough to show an operator that everything was fine.
+                    # Unknown is now reported as unknown.
+                    "run_status": (settings_snapshot or {}).get("run_status") or "UNKNOWN",
+                    "run_status_known": settings_snapshot is not None,
                     "run_status_reason": (settings_snapshot or {}).get("run_status_reason"),
                     "run_duration_minutes": (settings_snapshot or {}).get("run_duration_minutes"),
                     "run_duration_remaining_minutes": run_duration_remaining_minutes,

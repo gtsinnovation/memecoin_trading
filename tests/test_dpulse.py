@@ -27,17 +27,27 @@ def run(engine) -> Suite:
         entry = out["target_pullback_price"]
         target = out["target_exit_price"]
         s.check_true(f"levels strictly ordered and non-zero at {price:.0e}",
-                     out.get("pullback_detected") and 0 < stop < entry < target)
+                     not out.get("termination_reason") and 0 < stop < entry < target)
 
-    # The geometry itself must survive the precision change: entry 7% below
-    # spot, stop 14% below, target at a 2:1 multiple of entry-to-stop.
+    # ENTRY IS SPOT. The node used to set entry 7% below spot and report
+    # pullback_detected=True without anything ever waiting for that pullback,
+    # so every position opened 7% in profit against a price the market had
+    # not traded. Risk and reward are still measured RELATIVE to the entry,
+    # so the strategy's geometry is unchanged -- only the fabricated discount
+    # is gone.
     out = levels(1e-7)
     entry, stop, target = (out["target_pullback_price"], out["invalidation_level_price"],
                            out["target_exit_price"])
-    s.check_true("entry sits 7% below spot at 1e-7", abs(entry / 1e-7 - 0.93) < 1e-6)
-    s.check_true("stop sits 14% below spot at 1e-7", abs(stop / 1e-7 - 0.86) < 1e-6)
-    s.check_true("target is a 2:1 multiple of the entry-to-stop distance at 1e-7",
+    s.check_true("entry is spot, not a discount to it", abs(entry / 1e-7 - 1.0) < 1e-6)
+    s.check_true("no pullback is claimed, because none is observed",
+                 out.get("pullback_detected") is False)
+    s.check_true("stop sits 7.53% below the entry", abs((stop / entry) - (1 - 0.0753)) < 1e-6)
+    s.check_true("target is a 2:1 multiple of the entry-to-stop distance",
                  abs((target - entry) / (entry - stop) - 2.0) < 1e-6)
+    # The specific defect: an entry better than the price we could transact at.
+    for price in [1e-2, 1e-4, 1e-7]:
+        s.check_true(f"entry at {price:.0e} is never below spot",
+                     levels(price)["target_pullback_price"] >= price * (1 - 1e-9))
 
     # The specific values the old fixed-decimal rounding destroyed.
     s.check_true("a 1e-4 token no longer collapses entry onto stop",
@@ -50,7 +60,7 @@ def run(engine) -> Suite:
     for price in [1e-6, 1e-7, 2e-9]:
         out = levels(price)
         s.check_true(f"an approved setup at {price:.0e} never carries a zero exit level",
-                     not (out.get("pullback_detected") and
+                     not (not out.get("termination_reason") and
                           (out["target_exit_price"] == 0 or out["invalidation_level_price"] == 0)))
 
     # The ordering guard is unreachable at any realistic price once rounding is
@@ -60,7 +70,7 @@ def run(engine) -> Suite:
     # rounded. Pinned here so the guard itself is exercised, not just trusted.
     out = levels(5e-324)
     s.check_true("a price at the denormal floor collapses and must be refused",
-                 not out.get("pullback_detected") and bool(out.get("termination_reason")))
+                 bool(out.get("termination_reason")))
     s.check_true("a collapsed level set leaves no non-zero target behind",
                  out["target_exit_price"] == 0.0)
 
@@ -69,7 +79,7 @@ def run(engine) -> Suite:
     for bad, label in [(0.0, "a zero price"), (None, "a missing price"), (-1.0, "a negative price")]:
         out = levels(bad)
         s.check_true(f"{label} must refuse rather than emit levels",
-                     not out.get("pullback_detected") and bool(out.get("termination_reason")))
+                     bool(out.get("termination_reason")))
         s.check_true(f"{label} must not leave a non-zero target behind",
                      out["target_exit_price"] == 0.0)
 

@@ -547,11 +547,19 @@ async def fetch_social_volume_score(client: httpx.AsyncClient, token_symbol: str
     confirm it against their current docs if you wire in a real key.
     """
     if not LUNARCRUSH_API_KEY:
+        # Returned 25.0 -- a number that was then written to the database and
+        # broadcast to the dashboard as though it had been measured, while the
+        # log line claimed it was a placeholder. A reader of the data had no
+        # way to tell. The other provider (free_market_data) already returns
+        # 0.0 here and relies on the _social_data_missing flag to mark it
+        # unavailable; this now matches, so the two providers agree and the
+        # flag is the single place that says "not measured".
         logger.warning(
             f"[SIMULATED] No LUNARCRUSH_API_KEY configured -- social_volume_score for "
-            f"${token_symbol} is a placeholder, not real social data. See README.md."
+            f"${token_symbol} is unavailable and is reported as 0.0 with "
+            f"_social_data_missing set. It is NOT a measurement. See README.md."
         )
-        return 25.0
+        return 0.0
 
     try:
         resp = await client.get(

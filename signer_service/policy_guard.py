@@ -44,6 +44,29 @@ ALLOWED_EXECUTION_TOKENS = [
 ]
 MAX_TRADE_USD = float(os.environ.get("MAX_TRADE_USD", "0"))
 
+# The pipeline carries its own hard ceiling as a source constant
+# (execution_rails.ABSOLUTE_MAX_POSITION_USD). These two caps, plus Turnkey's
+# own enclave policy, are three independent limits on the same quantity, and
+# nothing used to reconcile them -- an operator could raise MAX_TRADE_USD in
+# an env file and silently exceed the ceiling the pipeline believes is
+# absolute. The mismatch is now refused at startup rather than discovered by
+# a trade that should not have been possible.
+try:
+    from execution_rails import ABSOLUTE_MAX_POSITION_USD
+except Exception:  # pragma: no cover - the constant is mirrored if unavailable
+    ABSOLUTE_MAX_POSITION_USD = 250.0
+
+
+def assert_caps_consistent() -> None:
+    """Refuse to start when this signer's cap exceeds the pipeline's ceiling."""
+    if MAX_TRADE_USD > ABSOLUTE_MAX_POSITION_USD:
+        raise RuntimeError(
+            f"MAX_TRADE_USD (${MAX_TRADE_USD:.2f}) exceeds the pipeline's absolute ceiling "
+            f"ABSOLUTE_MAX_POSITION_USD (${ABSOLUTE_MAX_POSITION_USD:.2f}). Refusing to start: "
+            f"a signer that would sign more than the pipeline believes is possible is not a "
+            f"safety layer. Lower MAX_TRADE_USD, or raise the source constant in a reviewed commit."
+        )
+
 
 @dataclass
 class PolicyResult:
