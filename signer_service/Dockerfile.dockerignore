@@ -1,0 +1,63 @@
+# Build-context exclusions for the SIGNER image only.
+#
+# WHY THIS FILE EXISTS
+# The signer builds from the repository ROOT (see docker-compose.yml) so it can
+# share tx_verify.py and execution_rails.py with the pipeline instead of
+# carrying second copies that drift. A root context means Docker would
+# otherwise apply the ROOT .dockerignore -- which excludes signer_service/
+# entirely, because the WEB image must never contain the signing key. Applied
+# to this build that exclusion removes the signer's own source and the build
+# fails at COPY.
+#
+# BuildKit reads <dockerfile-path>.dockerignore in preference to the context
+# root's, so this file scopes the rules correctly per image. BuildKit is the
+# default builder in Docker Desktop; if a build ever reports that
+# signer_service/ is missing, the legacy builder is in use -- set
+# DOCKER_BUILDKIT=1.
+#
+# The web image's protection is unaffected: the root .dockerignore still
+# applies to the web build, so signer_service/ and every credential pattern
+# stay out of it.
+
+# Secrets never enter any image layer. The signer receives these at RUNTIME
+# through env_file in docker-compose.
+.env
+*.env
+!.env.example
+*credential*
+*credentials*
+*secret*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+
+# Not needed at runtime.
+.git/
+.gitignore
+.gitattributes
+__pycache__/
+*.py[cod]
+pgdata/
+*.bak
+_to_delete/
+error.txt
+
+# The pipeline's own application code. The signer deliberately shares only the
+# two dependency-free modules its Dockerfile names explicitly; everything else
+# belongs to the web image and must not be in this one.
+main.py
+engine.py
+paper_trading.py
+market_data.py
+free_market_data.py
+token_discovery.py
+gmgn_market_data.py
+gmgn_diagnose.py
+app_time.py
+probe_*.py
+explore_*.py
+smoke_test_*.py
+test_provider_access.py
+tests/
