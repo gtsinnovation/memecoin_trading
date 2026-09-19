@@ -1,0 +1,15 @@
+# Build context exclusions for the SIGNER image.
+#
+# The signer receives its Turnkey credentials as environment variables at
+# RUNTIME (docker-compose's `env_file: ./signer_service/.env`). They must
+# never be COPYed into the image: an image layer is permanent, gets pushed
+# to any registry the image goes to, and survives deleting the file.
+.env
+*.env
+!.env.example
+*credentials*.json
+*.pem
+*.key
+
+__pycache__/
+*.py[cod]

@@ -1,0 +1,45 @@
+# Build context exclusions for the WEB image.
+#
+# The root Dockerfile does `COPY . .`, so without this file every build of
+# `web` copies the whole project into the image -- including signer_service/
+# and any Turnkey credentials in it. That would put the signing key inside
+# the one container that must never have it, silently, in an image layer
+# that persists even after the file is later deleted from disk.
+#
+# The signer is a SEPARATE service with its own build context
+# (build: ./signer_service) and its own .dockerignore. The web image has no
+# use for any of it.
+signer_service/
+
+# Secrets. The web container receives these as environment variables at
+# RUNTIME via docker-compose; baking them into an image layer is both
+# unnecessary and permanent.
+.env
+*.env
+!.env.example
+# Any file whose name mentions credentials, secrets or keys, in ANY
+# format. The earlier patterns were anchored to .json and missed a
+# turnkey-credentials.TXT that appeared later -- an extension is not a
+# security boundary.
+*credential*
+*credentials*
+*secret*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+
+# Not needed at runtime, and .git in particular can be large and carries
+# full history of anything ever committed.
+.git/
+.gitignore
+.gitattributes
+__pycache__/
+*.py[cod]
+pgdata/
+
+# Local scratch / docs that don't belong in a runtime image.
+*.md
+!README.md
+error.txt

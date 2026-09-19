@@ -1,0 +1,20 @@
+# signer_service/requirements.txt
+#
+# Deliberately a SEPARATE requirements file from the main app's -- this
+# service has its own dependency footprint (Solana + Turnkey libraries)
+# and its own container, and should never share a virtualenv/image with
+# the pipeline app. See STAGE3_SETUP.md.
+
+fastapi==0.112.0
+uvicorn==0.30.5
+pydantic==2.8.2
+asyncpg==0.29.0
+httpx==0.27.0
+
+# Solana transaction construction/(de)serialization.
+solders==0.21.0
+
+# Turnkey request signing/stamping (the P-256 request-stamp cryptography
+# -- see turnkey_client.py's docstring for why we use the official
+# package for this specific piece instead of hand-rolling it).
+turnkey-api-key-stamper==0.1.0

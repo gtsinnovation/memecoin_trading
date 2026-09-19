@@ -6,3 +6,29 @@ __pycache__/
 
 # Docker / PostgreSQL local data volume
 pgdata/
+
+# Secrets -- never commit these.
+#
+# .env above covers any file named .env at any depth, including
+# signer_service/.env. These cover the credential files Turnkey and other
+# providers hand you as downloads, which do NOT match that pattern and were
+# one `git add .` away from being committed.
+# Any file whose name mentions credentials, secrets or keys, in ANY
+# format. The earlier patterns were anchored to .json and missed a
+# turnkey-credentials.TXT that appeared later -- an extension is not a
+# security boundary.
+*credential*
+*credentials*
+*secret*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+
+# Scratch backups taken before an edit, and the parking lot for files this
+# environment cannot delete. Neither belongs in history.
+*.bak
+*.pre-*.bak
+error.txt
+_to_delete/

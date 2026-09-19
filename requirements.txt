@@ -1,0 +1,21 @@
+# requirements.txt
+
+langgraph==0.1.4
+langchain-core==0.2.23
+psycopg2-binary==2.9.9
+asyncpg==0.29.0
+fastapi==0.112.0
+uvicorn==0.30.5
+websockets==12.0
+pydantic==2.8.2
+
+# Simple Gmail-address login gate + cookie-based sessions (feature 8: user
+# authentication). No OAuth library needed -- see the comment in main.py.
+itsdangerous==2.2.0
+python-multipart==0.0.9
+
+# Real Solana market data (Stage 1 of DEX/wallet integration -- see
+# README.md and market_data.py). Used to call DexScreener, Jupiter, and a
+# Solana RPC endpoint. No wallet/signing libraries here -- this stage never
+# touches a private key.
+httpx==0.27.0

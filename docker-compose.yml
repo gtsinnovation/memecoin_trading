@@ -1,0 +1,146 @@
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: trading_postgres_db
+    restart: unless-stopped
+    environment:
+      # So `docker compose exec db psql` renders timestamps in the same zone
+      # the dashboard does. Storage is unchanged: timestamptz values are
+      # absolute instants, and PGTZ/TZ only affect how they are displayed.
+      TZ: ${APP_TIMEZONE:-America/New_York}
+      PGTZ: ${APP_TIMEZONE:-America/New_York}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret}
+      POSTGRES_DB: memecoin_trading
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Automatically executes schema.sql when the database initialization occurs
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d memecoin_trading"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  web:
+    build: .
+    container_name: trading_agent_network
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:-secret}@db:5432/memecoin_trading
+      # Display timezone for the dashboard clock and log lines. Any IANA zone
+      # name; America/New_York applies EDT/EST automatically, which a fixed
+      # offset like "EST5" would not. Stored timestamps are unaffected --
+      # every timestamp column is TIMESTAMP WITH TIME ZONE, so instants are
+      # absolute and this only changes how they are rendered.
+      - APP_TIMEZONE=${APP_TIMEZONE:-America/New_York}
+      - TZ=${APP_TIMEZONE:-America/New_York}
+      # Random, persistent secret used to sign session cookies. If unset, the
+      # app generates a temporary one at startup (logged as a WARNING) and all
+      # sessions/logins are invalidated on every restart.
+      - SESSION_SECRET_KEY=${SESSION_SECRET_KEY}
+      # The one Gmail address allowed to sign in (feature 8). Simple
+      # email-match login, not real Google OAuth -- see .env.example.
+      - AUTHORIZED_GOOGLE_EMAIL=${AUTHORIZED_GOOGLE_EMAIL}
+      # Real Solana market data (Stage 1 of DEX/wallet integration -- see
+      # README.md). Required: comma-separated token mint addresses, no
+      # default shipped on purpose -- see .env.example.
+      - WATCHLIST_TOKEN_ADDRESSES=${WATCHLIST_TOKEN_ADDRESSES}
+      - SOLANA_RPC_URL=${SOLANA_RPC_URL:-https://api.mainnet.solana.com}
+      - JUPITER_API_BASE=${JUPITER_API_BASE:-https://api.jup.ag}
+      - DEXSCREENER_API_BASE=${DEXSCREENER_API_BASE:-https://api.dexscreener.com}
+      - SLIPPAGE_PROBE_USD=${SLIPPAGE_PROBE_USD:-500}
+      # Optional -- see .env.example. Without it, social_volume_score is a
+      # labeled placeholder, not real data.
+      - LUNARCRUSH_API_KEY=${LUNARCRUSH_API_KEY:-}
+      # Market-data provider: "free" (default -- DexScreener + RugCheck +
+      # Jupiter, no API key, includes rug/security signals), "dexscreener",
+      # or "gmgn" (bot-blocked in practice). All are read-only: no signing
+      # key, no wallet, no custody. See .env.example.
+      - MARKET_DATA_PROVIDER=${MARKET_DATA_PROVIDER:-free}
+      - GMGN_API_KEY=${GMGN_API_KEY:-}
+      - GMGN_HOT_SEARCH_INTERVAL=${GMGN_HOT_SEARCH_INTERVAL:-1h}
+      - GMGN_HOT_SEARCH_CACHE_TTL_S=${GMGN_HOT_SEARCH_CACHE_TTL_S:-300}
+      - GMGN_HOT_SEARCH_LIMIT=${GMGN_HOT_SEARCH_LIMIT:-500}
+      # Birdeye (read-only market data) -- the primary discovery provider.
+      # The real value lives ONLY in the project-root .env, which .gitignore
+      # and .dockerignore both cover. It is named here because compose
+      # forwards only what it names: omit this line and the key is invisible
+      # inside the container, which looks identical to a rejected key.
+      - BIRDEYE_API_KEY=${BIRDEYE_API_KEY:-}
+      - BIRDEYE_API_BASE=${BIRDEYE_API_BASE:-https://public-api.birdeye.so}
+      # Triton One (read-only Solana RPC). NOT a discovery source -- it has no
+      # trending or new-listing endpoint. It is the layer underneath the
+      # aggregators: chain truth for the numbers the gates judge, and, via
+      # Dragon's Mouth gRPC, sub-second new-pool detection if that is ever
+      # built. Under evaluation only; see probe_triton.py.
+      #
+      # Triton issues either a URL with the token in the path or a hostname
+      # plus an x-token header. Set whichever you were given.
+      - TRITON_RPC_URL=${TRITON_RPC_URL:-}
+      - TRITON_X_TOKEN=${TRITON_X_TOKEN:-}
+      # --- Token discovery -------------------------------------------
+      # Every value below matches the default compiled into
+      # token_discovery.py, so leaving them unset changes nothing. They are
+      # listed here because compose only forwards variables it names: without
+      # these lines, setting one in .env has no effect inside the container
+      # and the silence looks exactly like the knob not working.
+      - ENABLE_TOKEN_DISCOVERY=${ENABLE_TOKEN_DISCOVERY:-true}
+      - DISCOVERY_CACHE_TTL_S=${DISCOVERY_CACHE_TTL_S:-180}
+      - DISCOVERY_MAX_CANDIDATES=${DISCOVERY_MAX_CANDIDATES:-300}
+      # Birdeye is the primary discovery provider. min_liquidity is applied
+      # SERVER-SIDE, and the recency window replaced the in-memory holding pen.
+      - BIRDEYE_PAGE_LIMIT=${BIRDEYE_PAGE_LIMIT:-100}
+      - BIRDEYE_MIN_LIQUIDITY_USD=${BIRDEYE_MIN_LIQUIDITY_USD:-25000}
+      - BIRDEYE_MIN_AGE_MINUTES=${BIRDEYE_MIN_AGE_MINUTES:-15}
+      - BIRDEYE_MAX_AGE_MINUTES=${BIRDEYE_MAX_AGE_MINUTES:-90}
+      # Per-provider rate limits. Birdeye's 60/min is enforced per second;
+      # GeckoTerminal is now one call per refresh, so 2.5s barely binds and is
+      # insurance for the fallback pool walk.
+      - BIRDEYE_MIN_INTERVAL_S=${BIRDEYE_MIN_INTERVAL_S:-1.1}
+      - GECKOTERMINAL_MIN_INTERVAL_S=${GECKOTERMINAL_MIN_INTERVAL_S:-2.5}
+      # GeckoTerminal pool walk -- FALLBACK ONLY, engages when Birdeye returns
+      # nothing (missing key, exhausted quota, vendor outage).
+      - DISCOVERY_POOL_PAGES=${DISCOVERY_POOL_PAGES:-4}
+      - DISCOVERY_PAGE_SPACING_S=${DISCOVERY_PAGE_SPACING_S:-0.4}
+      # Stage 3 (real signing -- see STAGE3_SETUP.md). "web" never gets any
+      # Turnkey credentials -- only the internal URL of the separate
+      # signer service, and an explicit, default-off switch to ever call
+      # it. Flip this only after completing STAGE3_SETUP.md's devnet
+      # smoke test yourself.
+      - SIGNER_SERVICE_URL=${SIGNER_SERVICE_URL:-http://signer:8100}
+      - ENABLE_STAGE3_EXECUTION=${ENABLE_STAGE3_EXECUTION:-false}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Stage 3 (real signing -- see STAGE3_SETUP.md). A deliberately separate
+  # service/container from "web": it is the only place Turnkey credentials
+  # exist, and it independently re-validates every request against its own
+  # database read before ever calling Turnkey (see signer_service/
+  # policy_guard.py). Not started by a plain "docker compose up" -- it's
+  # gated behind the "stage3" profile so it stays off by default at the
+  # infrastructure level, not just the app-config level:
+  #   docker compose --profile stage3 up -d --build
+  # Its secrets live in signer_service/.env (a SEPARATE file from the
+  # project root's .env) -- see signer_service/.env.example.
+  signer:
+    build: ./signer_service
+    container_name: trading_signer_service
+    restart: unless-stopped
+    profiles: ["stage3"]
+    env_file:
+      - ./signer_service/.env
+    depends_on:
+      db:
+        condition: service_healthy
+    # No "ports:" mapping on purpose -- this service is reachable only
+    # from other containers on the compose network (i.e. "web"), never
+    # from the host or the internet.
+
+volumes:
+  pgdata:
