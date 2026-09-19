@@ -79,6 +79,49 @@ def run() -> Suite:
     s.check_true("nothing due reports None rather than a fabricated 0%",
                  pt.horizon_dropout_summary({})["dropout_percent"] is None)
 
+    # --- both paper arms must test the SAME strategy ---
+    # compute_levels used to build one absolute level set around the 0.93
+    # pullback entry and give it to both arms. LIMIT filled at 0.93 and got
+    # the intended 2:1; IMMEDIATE filled at spot and inherited a stop 14%
+    # below and a target 7% above its own fill -- 0.5:1. The two-arm design
+    # exists to test entry TIMING, and it was silently testing risk/reward
+    # instead, with a foregone answer.
+    def rr(model, price=1.0):
+        entry, stop, target = pt.compute_levels(price, model)
+        fill = price if model == "IMMEDIATE" else entry
+        return (target - fill) / (fill - stop)
+
+    s.check_true("the IMMEDIATE arm has 2:1 reward:risk, not 0.5:1",
+                 abs(rr("IMMEDIATE") - pt.REWARD_RISK_MULTIPLE) < 1e-6)
+    s.check_true("the LIMIT arm has the same 2:1", abs(rr("LIMIT") - pt.REWARD_RISK_MULTIPLE) < 1e-6)
+    s.check_true("both arms carry identical geometry, so only entry timing differs",
+                 abs(rr("IMMEDIATE") - rr("LIMIT")) < 1e-9)
+    imm_e, _, _ = pt.compute_levels(1.0, "IMMEDIATE")
+    lim_e, _, _ = pt.compute_levels(1.0, "LIMIT")
+    s.check_true("the IMMEDIATE arm enters at spot", abs(imm_e - 1.0) < 1e-9)
+    s.check_true("the LIMIT arm still waits for a pullback below spot", lim_e < 1.0)
+    # And the IMMEDIATE arm must model the live path exactly.
+    imm_e, imm_s, imm_t = pt.compute_levels(1.0, "IMMEDIATE")
+    s.check_true("the IMMEDIATE arm's stop matches live D_PULSE",
+                 abs((imm_s / imm_e) - (1 - 7.53 / 100)) < 1e-6)
+    # Ordering must still hold at the magnitudes that broke fixed rounding.
+    for price in [1e-2, 1e-4, 1e-7, 2e-9]:
+        for model in ("IMMEDIATE", "LIMIT"):
+            e, st, tg = pt.compute_levels(price, model)
+            s.check_true(f"{model} levels ordered at {price:.0e}", 0 < st < e < tg)
+
+    # --- the dropout denominator must mean something ---
+    # It counted every row still missing any horizon, including rows too young
+    # to have been marked at all. A real dropout divided by that denominator
+    # looked like noise.
+    s.check_true("a row younger than the shortest horizon cannot be a missed mark",
+                 not pt.horizon_elapsed(min(pt.HORIZONS_MINUTES) - 1))
+    s.check_true("a row exactly at the shortest horizon counts",
+                 pt.horizon_elapsed(min(pt.HORIZONS_MINUTES)))
+    s.check_true("an older row counts", pt.horizon_elapsed(min(pt.HORIZONS_MINUTES) * 3))
+    s.check_true("an unknown age cannot count as a missed mark",
+                 not pt.horizon_elapsed(None))
+
     # --- the signer's cap may not exceed the pipeline's hard ceiling ---
     s.check_true("the absolute ceiling is a source constant, not config",
                  isinstance(rails.ABSOLUTE_MAX_POSITION_USD, float))

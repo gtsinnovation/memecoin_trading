@@ -181,21 +181,47 @@ def levels_are_sane(price: float, entry: float, stop: float,
     return target > price
 
 
-def compute_levels(price: float) -> Tuple[float, float, float]:
-    """Entry trigger, stop, and target for a candidate.
+# The entry the LIMIT arm waits for, as a fraction of the evaluation price.
+PULLBACK_ENTRY_FACTOR = 0.93
+# Risk and reward, measured RELATIVE TO THE ENTRY -- not to the evaluation
+# price. Kept in step with engine.STOP_DISTANCE_PERCENT / REWARD_RISK_MULTIPLE.
+STOP_DISTANCE_PERCENT = 7.53
+REWARD_RISK_MULTIPLE = 2.0
 
-    Deliberately mirrors node_D_PULSE's formula (7% pullback entry, 14%
-    stop, take-profit at 2:1 reward:risk) but is computed here for EVERY
-    evaluated token, including ones rejected before D_PULSE ever ran.
-    Otherwise the control cohort would have no levels and there would be
-    nothing to compare against.
+
+def compute_levels(price: float, entry_model: str = "LIMIT") -> Tuple[float, float, float]:
+    """Entry, stop and target for one candidate under one entry model.
+
+    BARRIERS ARE RELATIVE TO THE ENTRY THAT ARM ACTUALLY FILLS AT.
+
+    This used to compute a single level set around the 0.93 pullback entry
+    and hand it to BOTH arms. The LIMIT arm fills at 0.93 and got the
+    intended 2:1 reward:risk. The IMMEDIATE arm fills at the evaluation
+    price and inherited the same absolute levels -- a stop 14% below its
+    own fill and a target 7% above it, which is 0.5:1. It was risking twice
+    what it stood to gain.
+
+    The consequence was worse than a bad arm. The two-model design exists to
+    answer ONE question -- does waiting for a pullback beat buying now? --
+    and that comparison silently became 2:1 against 0.5:1, which is a
+    different question with a foregone answer. Any measured advantage for
+    LIMIT was partly just the better risk/reward it was quietly given.
+
+    Both arms now carry the same geometry and differ only in entry timing,
+    which is the variable under test. The IMMEDIATE arm consequently matches
+    live node_D_PULSE exactly.
+
+    Computed here for EVERY evaluated token, including ones rejected before
+    D_PULSE ever ran -- otherwise the control cohort would have no levels
+    and there would be nothing to compare against.
 
     Rounded to significant figures rather than decimal places -- see
     _round_sig() for what fixed decimals did to sub-1e-7 tokens.
     """
-    entry = _round_sig(price * 0.93)
-    stop = _round_sig(price * 0.86)
-    target = _round_sig(entry + (entry - stop) * 2.0)
+    entry = _round_sig(price if entry_model == "IMMEDIATE"
+                       else price * PULLBACK_ENTRY_FACTOR)
+    stop = _round_sig(entry * (1.0 - STOP_DISTANCE_PERCENT / 100.0))
+    target = _round_sig(entry + (entry - stop) * REWARD_RISK_MULTIPLE)
     return entry, stop, target
 
 
@@ -273,7 +299,10 @@ def record_candidate(conn, snapshot: Dict[str, Any], final_state: Dict[str, Any]
         if cur.fetchone():
             return
 
-    entry, stop, target = compute_levels(price)
+    # Sanity-checked on the LIMIT geometry, which is the tighter of the two:
+    # its entry sits below spot, so if that set is non-degenerate the
+    # IMMEDIATE set (entry at spot, strictly larger) cannot be either.
+    entry, stop, target = compute_levels(price, "LIMIT")
     if not levels_are_sane(price, entry, stop, target):
         # Refusing beats recording. A degenerate set closes on the next mark
         # with a fabricated outcome, and that outcome is indistinguishable
@@ -319,14 +348,18 @@ def record_candidate(conn, snapshot: Dict[str, Any], final_state: Dict[str, Any]
     m5_buys, m5_sells = _num("txns_m5_buys"), _num("txns_m5_sells")
     chg_m5, chg_h1 = _num("price_change_m5"), _num("price_change_h1")
 
+    # Each arm carries the barriers for ITS OWN entry. Sharing one absolute
+    # level set gave the IMMEDIATE arm a 0.5:1 reward:risk while LIMIT got
+    # 2:1, so the two arms were never comparable -- see compute_levels().
+    imm_entry, imm_stop, imm_target = compute_levels(price, "IMMEDIATE")
     rows = [
         # IMMEDIATE is filled on the spot at the evaluation price.
-        ("IMMEDIATE", "OPEN", price),
+        ("IMMEDIATE", "OPEN", price, imm_entry, imm_stop, imm_target),
         # LIMIT waits for the pullback and may never fill.
-        ("LIMIT", "PENDING_FILL", None),
+        ("LIMIT", "PENDING_FILL", None, entry, stop, target),
     ]
     with conn.cursor() as cur:
-        for entry_model, status, fill_price in rows:
+        for entry_model, status, fill_price, row_entry, row_stop, row_target in rows:
             # The partial unique index in migrate.sql is the backstop against a
             # race between two ticks. A violation means "already recorded",
             # which is success, not failure -- but an unhandled one would abort
@@ -350,7 +383,7 @@ def record_candidate(conn, snapshot: Dict[str, Any], final_state: Dict[str, Any]
                 """, (
                     token_address, snapshot.get("token_symbol"),
                     cohort, rejected_by, entry_model, status,
-                    price, entry, target, stop, slippage,
+                    price, row_entry, row_target, row_stop, slippage,
                     fill_price, fill_price, price,
                     volume_h1, txns,
                     int(buys) if buys is not None else None,
@@ -456,8 +489,15 @@ def mark_horizons(conn, prices: Dict[str, float]) -> Dict[int, int]:
         """, (_max_horizon_window(), len(HORIZONS_MINUTES)))
         due = cur.fetchall()
 
-        marks[DUE_TOTAL] = len(due)
         for tid, addr, basis, age_min in due:
+            # Only rows with an ELAPSED horizon could have been marked this
+            # tick, and only those belong in the dropout denominator. `due`
+            # includes every row still missing any horizon -- mostly rows
+            # whose next horizon simply has not arrived -- so dividing drops
+            # by it made a real dropout look like a rounding error.
+            if not horizon_elapsed(age_min):
+                continue
+            marks[DUE_TOTAL] = marks.get(DUE_TOTAL, 0) + 1
             price = prices.get(addr)
             verdict = classify_horizon_row(price, basis)
             if verdict == "DROPPED_NO_PRICE":
@@ -513,6 +553,18 @@ def decide_exit(price: float, target: Optional[float], stop: Optional[float],
     if float(held_minutes or 0) >= MAX_HOLD_MINUTES:
         return "TIMEOUT", float(price)
     return None, float(price)
+
+
+def horizon_elapsed(age_minutes: Optional[float]) -> bool:
+    """True when at least one horizon has passed for a row of this age.
+
+    A row younger than the shortest horizon could not have been marked this
+    tick however healthy it is, so counting it as a missed mark would drown
+    a genuine dropout signal in rows that are simply young.
+    """
+    if age_minutes is None:
+        return False
+    return float(age_minutes) >= min(HORIZONS_MINUTES)
 
 
 def classify_horizon_row(price: Optional[float], basis: Optional[float]) -> str:

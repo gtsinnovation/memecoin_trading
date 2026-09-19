@@ -43,13 +43,21 @@ services:
       # app generates a temporary one at startup (logged as a WARNING) and all
       # sessions/logins are invalidated on every restart.
       - SESSION_SECRET_KEY=${SESSION_SECRET_KEY}
+      # Set SESSION_COOKIE_INSECURE=1 in .env for local http://localhost
+      # testing only -- the session cookie is Secure by default and a
+      # Secure cookie is never sent over plain HTTP, so sign-in fails
+      # silently without it. Never set it on a deployed host.
+      - SESSION_COOKIE_INSECURE=${SESSION_COOKIE_INSECURE:-}
+      - SESSION_MAX_AGE_SECONDS=${SESSION_MAX_AGE_SECONDS:-43200}
       # The one Gmail address allowed to sign in (feature 8). Simple
       # email-match login, not real Google OAuth -- see .env.example.
       - AUTHORIZED_GOOGLE_EMAIL=${AUTHORIZED_GOOGLE_EMAIL}
       # Real Solana market data (Stage 1 of DEX/wallet integration -- see
       # README.md). Required: comma-separated token mint addresses, no
       # default shipped on purpose -- see .env.example.
-      - WATCHLIST_TOKEN_ADDRESSES=${WATCHLIST_TOKEN_ADDRESSES}
+      # Empty is the normal case: token discovery supplies candidates.
+      # The :- default stops compose warning on every command.
+      - WATCHLIST_TOKEN_ADDRESSES=${WATCHLIST_TOKEN_ADDRESSES:-}
       - SOLANA_RPC_URL=${SOLANA_RPC_URL:-https://api.mainnet.solana.com}
       - JUPITER_API_BASE=${JUPITER_API_BASE:-https://api.jup.ag}
       - DEXSCREENER_API_BASE=${DEXSCREENER_API_BASE:-https://api.dexscreener.com}

@@ -466,7 +466,23 @@ def _mark_paper_trades() -> None:
             if any(stats.values()):
                 logger.info(f"Paper trades: {stats}")
             if horizons:
-                logger.info(f"Horizon marks recorded: {horizons}")
+                # mark_horizons returns per-horizon counts PLUS dropout
+                # accounting under negative sentinel keys. Logging the raw dict
+                # printed "{-3: 222}", which reads as nothing at all -- and
+                # buried the number that matters. Summarise it instead.
+                d = paper_trading.horizon_dropout_summary(horizons)
+                marked = {k: v for k, v in horizons.items() if k >= 0}
+                if d["dropout_percent"]:
+                    logger.warning(
+                        "Horizon marks: %s | %d/%d due rows DROPPED (%.1f%%) -- "
+                        "%d unpriceable, %d without a basis. Dropout biases every "
+                        "horizon statistic toward the survivors.",
+                        marked or "none", d["dropped_no_price"] + d["dropped_no_basis"],
+                        d["due"], d["dropout_percent"], d["dropped_no_price"],
+                        d["dropped_no_basis"])
+                else:
+                    logger.info("Horizon marks: %s | %d due, none dropped",
+                                marked or "none", d["due"])
     except Exception as e:
         logger.warning(f"Could not mark paper trades to market: {e}")
     finally:
