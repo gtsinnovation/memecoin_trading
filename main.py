@@ -431,6 +431,89 @@ def _invalidation_proximity_percent(price, invalidation_level):
     return round(((price - invalidation_level) / price) * 100.0, 1)
 
 
+
+# --- decisions extracted from pipeline_executor_worker ---------------------
+# These three lived inside a 300-line async tick loop, which meant the
+# kill-switch gate, the signer gate and the dashboard's honesty about its own
+# state could not be tested at all. They are pure functions now for exactly
+# that reason: each decides one thing from its arguments and touches nothing.
+
+# Reasons check_kill_switch() can return that mean "I could not verify the
+# gate", as opposed to "the gate is shut and I already wrote that to the
+# database". Only the former needs the caller to act.
+UNVERIFIED_GATE_REASONS = ("SETTINGS_UNAVAILABLE", "UNKNOWN")
+
+
+def kill_switch_pause_reason(verdict) -> Optional[str]:
+    """Why this tick must pause, or None to carry on.
+
+    check_kill_switch() writes run_status itself when a threshold trips, but
+    it has paths -- settings unreadable, row missing -- where it can only
+    REPORT a closed gate with nothing to write to. Its docstring says callers
+    must treat those as not-open. The caller used to discard the return value
+    entirely, so "I cannot tell whether trading is allowed" silently meant
+    "carry on".
+    """
+    verdict = verdict or {}
+    if bool(verdict.get("gate_open", False)):
+        return None
+    reason = verdict.get("reason") or "UNKNOWN"
+    if reason in UNVERIFIED_GATE_REASONS:
+        return (f"Kill-switch state unreadable ({reason}) -- pausing rather than "
+                f"trading on an unverified gate.")
+    # Any other reason means the gate is shut AND already recorded; the
+    # database is the source of truth and nothing more is needed here.
+    return None
+
+
+def signer_request_or_reason(final_state: dict, enabled: bool):
+    """The payload to send the signer, or the reason nothing will be sent.
+
+    Returns (payload, None) when a call should be made, else (None, reason).
+    """
+    if not enabled:
+        return None, "stage 3 execution is disabled"
+    state = final_state or {}
+    if not state.get("position_logged"):
+        return None, "no position was opened this tick"
+    token_address = state.get("token_address")
+    requested_usd = state.get("max_safe_position_usd")
+    if not token_address or requested_usd is None:
+        return None, ("position_logged was True but token_address/max_safe_position_usd "
+                      "is missing from final_state")
+    try:
+        amount = float(requested_usd)
+    except (TypeError, ValueError):
+        return None, "max_safe_position_usd is not a number"
+    if not amount > 0:
+        return None, "requested size is not positive"
+    return {"token_address": token_address,
+            "token_symbol": state.get("token_symbol"),
+            "requested_usd": amount}, None
+
+
+def run_state_payload(settings_snapshot, run_duration_remaining_minutes=None) -> dict:
+    """The run-state block the dashboard renders.
+
+    run_status used to default to "RUNNING" when the settings row could not be
+    read, painting a green, healthy dashboard over a pipeline whose state was
+    unknown -- a tripped kill switch plus one transient database error was
+    enough. Unknown is reported as unknown, and run_status_known lets the UI
+    say so rather than guess.
+    """
+    s = settings_snapshot or {}
+    return {
+        "run_status": s.get("run_status") or "UNKNOWN",
+        "run_status_known": settings_snapshot is not None,
+        "run_status_reason": s.get("run_status_reason"),
+        "run_duration_minutes": s.get("run_duration_minutes"),
+        "run_duration_remaining_minutes": run_duration_remaining_minutes,
+        "max_total_capital_usd": s.get("max_total_capital_usd"),
+        "capital_wallet_label": s.get("capital_wallet_label"),
+        "pnl_wallet_label": s.get("pnl_wallet_label"),
+        "show_realtime_balances": s.get("show_realtime_balances", True),
+    }
+
 def _record_paper_candidate(snapshot: dict, final_state: dict) -> None:
     """Sync wrapper: paper_trading uses psycopg2 like the rest of the
     engine, and this runs in the pipeline's worker thread. Best-effort --
@@ -541,22 +624,20 @@ async def maybe_execute_via_signer(http_client: httpx.AsyncClient, final_state: 
     system_alerts, not raised -- Stage 3 must never turn an unreachable or
     disagreeing signer into a pipeline outage.
     """
-    if not ENABLE_STAGE3_EXECUTION:
+    payload, refusal = signer_request_or_reason(final_state, ENABLE_STAGE3_EXECUTION)
+    if payload is None:
+        # Only the malformed-state case is worth a warning; "disabled" and
+        # "nothing opened" are the normal path on almost every tick.
+        if refusal and "missing from final_state" in refusal:
+            logger.warning("Stage 3: %s -- skipping signer call.", refusal)
         return
-    if not final_state.get("position_logged"):
-        return  # I_ACCOUNTANT didn't open anything this tick -- nothing to execute
-
-    token_address = final_state.get("token_address")
-    token_symbol = final_state.get("token_symbol")
-    requested_usd = final_state.get("max_safe_position_usd")
-    if not token_address or requested_usd is None:
-        logger.warning("Stage 3: position_logged was True but token_address/max_safe_position_usd missing from final_state -- skipping signer call.")
-        return
+    token_address = payload["token_address"]
+    token_symbol = payload["token_symbol"]
 
     try:
         resp = await http_client.post(
             f"{SIGNER_SERVICE_URL}/execute",
-            json={"token_address": token_address, "token_symbol": token_symbol, "requested_usd": float(requested_usd)},
+            json=payload,
             timeout=60.0,  # signing + broadcast + confirmation polling can take a while
         )
         data = resp.json()
@@ -635,16 +716,12 @@ async def pipeline_executor_worker():
             kill_switch_verdict = await loop.run_in_executor(None, check_kill_switch)
             settings_snapshot = await loop.run_in_executor(None, get_app_settings)
 
-            gate_open = bool((kill_switch_verdict or {}).get("gate_open", False))
-            gate_reason = (kill_switch_verdict or {}).get("reason") or "UNKNOWN"
-            if not gate_open and gate_reason in ("SETTINGS_UNAVAILABLE", "UNKNOWN"):
+            pause_reason = kill_switch_pause_reason(kill_switch_verdict)
+            if pause_reason:
                 # Nothing was written to the database, so nothing else will
                 # stop entries. Pause explicitly rather than trusting a
                 # run_status we could not read.
-                await loop.run_in_executor(
-                    None, pause_trading,
-                    f"Kill-switch state unreadable ({gate_reason}) -- pausing rather than "
-                    f"trading on an unverified gate.")
+                await loop.run_in_executor(None, pause_trading, pause_reason)
                 settings_snapshot = await loop.run_in_executor(None, get_app_settings)
 
             async with pool.acquire() as conn:
@@ -843,22 +920,7 @@ async def pipeline_executor_worker():
                 "active_positions": [dict(r) for r in positions],
                 "recent_closed_trades": [dict(r) for r in recent_closed],
                 "alerts": [dict(a) for a in alert_rows],
-                "run_state": {
-                    # Defaulting to "RUNNING" painted a green, healthy dashboard
-                    # over a pipeline whose state could not be read at all -- a
-                    # tripped kill switch plus one transient database error was
-                    # enough to show an operator that everything was fine.
-                    # Unknown is now reported as unknown.
-                    "run_status": (settings_snapshot or {}).get("run_status") or "UNKNOWN",
-                    "run_status_known": settings_snapshot is not None,
-                    "run_status_reason": (settings_snapshot or {}).get("run_status_reason"),
-                    "run_duration_minutes": (settings_snapshot or {}).get("run_duration_minutes"),
-                    "run_duration_remaining_minutes": run_duration_remaining_minutes,
-                    "max_total_capital_usd": (settings_snapshot or {}).get("max_total_capital_usd"),
-                    "capital_wallet_label": (settings_snapshot or {}).get("capital_wallet_label"),
-                    "pnl_wallet_label": (settings_snapshot or {}).get("pnl_wallet_label"),
-                    "show_realtime_balances": (settings_snapshot or {}).get("show_realtime_balances", True),
-                }
+                "run_state": run_state_payload(settings_snapshot, run_duration_remaining_minutes)
             }
 
             await ws_manager.broadcast(broadcast_payload)
