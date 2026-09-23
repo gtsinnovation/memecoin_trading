@@ -6,15 +6,29 @@
 -- Sections 3-6 answer "what does it say?" and are NOT meaningful until the
 -- token counts are in the dozens. Read n before reading any number beside it.
 
+-- Tunables. Each is guarded SEPARATELY, because one \if around all of them
+-- meant that passing any single override (psql -v fee=1.5) skipped the
+-- defaults for the others and the report failed on an unset variable.
+--
 -- Round-trip fee = PAPER_FEE_PERCENT_PER_SIDE * 2. Override with:
 --   psql -v fee=1.5 -f stage2_check.sql
 \if :{?fee}
 \else
 \set fee 0.5
+\endif
+
 -- Charged when price impact could not be measured at all. MUST match
 -- paper_trading.PAPER_UNMEASURED_SLIPPAGE_PERCENT, or this report and the
 -- Python one answer the same question differently.
+\if :{?unmeasured_slip}
+\else
 \set unmeasured_slip 3.0
+\endif
+
+-- MUST match holder_concentration.TOP10_CONCENTRATION_CEILING_PERCENT.
+\if :{?ceiling}
+\else
+\set ceiling 30.0
 \endif
 
 \echo ''
@@ -107,53 +121,134 @@ GROUP BY t.cohort ORDER BY t.cohort;
 
 \echo ''
 \echo '=== 5. HORIZON RETURNS by cohort -- the measurement that matters ==='
--- Compare APPROVED vs REJECTED at the SAME horizon, and judge any gap
--- against stdev. An approved cohort that is merely positive proves nothing:
--- memecoins drift, and a rising tide lifts the rejected cohort too.
--- A gap present in `mean` but absent in `net` is a liquidity filter, not
--- alpha -- and a cost edge does not survive real order sizes.
-SELECT h.horizon_minutes AS mins, t.cohort,
-       COUNT(DISTINCT t.token_address) AS tokens,
-       ROUND(AVG(h.return_percent), 2) AS mean,
-       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY h.return_percent)::numeric, 2) AS median,
-       ROUND(STDDEV_SAMP(h.return_percent), 2) AS stdev,
-       -- :fee is PAPER_FEE_PERCENT_PER_SIDE * 2, defaulted below. Hardcoding
-       -- 0.5 meant an operator who raised the fee to be stricter saw no
-       -- change in the only report that actually ships.
-       -- NULL slippage is charged at :unmeasured_slip, NOT skipped.
-       --
-       -- Letting it propagate to NULL looked conservative but silently broke
-       -- the comparison this report exists for: AVG ignores NULL rows, so
-       -- `mean` averaged EVERY row while `net` averaged only the subset whose
-       -- slippage was measurable -- a systematically more liquid subset. The
-       -- two columns sat side by side describing different populations, and
-       -- the gap between them was read as a cost estimate.
-       --
-       -- assumed_n exposes how much of each row is assumed rather than
-       -- measured, so a net built mostly from assumptions is visible as such.
-       ROUND(AVG(h.return_percent - (:fee + 2*ABS(COALESCE(t.assumed_slippage_percent, :unmeasured_slip)))), 2) AS net,
-       COUNT(*) FILTER (WHERE t.assumed_slippage_percent IS NULL) AS assumed_n,
-       ROUND(100.0 * COUNT(*) FILTER (WHERE h.return_percent > 0) / NULLIF(COUNT(*),0)) AS pct_up
-FROM paper_horizon_returns h JOIN paper_trades t ON t.id = h.paper_trade_id
-WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
-GROUP BY 1, 2 ORDER BY 1, 2;
+-- TOKEN-WEIGHTED, in two stages: average the marks within each token, then
+-- average across tokens. Every token counts once regardless of how many
+-- times it was re-recorded.
+--
+-- Averaging raw marks was wrong in a way that flattered the result. A
+-- 60-minute re-entry cooldown means a token that stays in the discovery
+-- list all day contributes ~24 rows while a token seen once contributes 1,
+-- so a row-weighted mean is dominated by whichever coins happened to linger
+-- -- and those are not a random sample. Worse, repeated marks on one token
+-- are correlated, so treating rows as independent understates the standard
+-- error by roughly sqrt(rows/tokens): at 154 rows over 19 tokens that is a
+-- factor of 2.8, which turns noise into an apparent edge.
+--
+-- `se` is the standard error of the token-level mean and is the only number
+-- here that says whether a gap is real. A cohort gap smaller than about
+-- twice the larger `se` is not evidence of anything. Section 5c does that
+-- subtraction explicitly.
+--
+-- `net` charges the round-trip fee (:fee) plus twice the slippage, with
+-- unmeasured slippage charged at :unmeasured_slip rather than skipped --
+-- letting it propagate to NULL made `mean` and `net` describe different
+-- populations (AVG ignores NULL rows), the more liquid subset being the one
+-- that survived. pct_assumed shows how much of `net` rests on that
+-- assumption.
+WITH marks AS (
+    SELECT h.horizon_minutes AS mins,
+           t.cohort,
+           t.token_address AS token,
+           h.return_percent AS ret,
+           h.return_percent
+             - (:fee + 2 * ABS(COALESCE(t.assumed_slippage_percent, :unmeasured_slip)))
+             AS net_ret,
+           (t.assumed_slippage_percent IS NULL)::int AS assumed
+    FROM paper_horizon_returns h
+    JOIN paper_trades t ON t.id = h.paper_trade_id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
+),
+per_token AS (
+    SELECT mins, cohort, token,
+           AVG(ret) AS ret,
+           AVG(net_ret) AS net_ret,
+           AVG(assumed::numeric) AS assumed_share,
+           AVG((ret > 0)::int::numeric) AS up_share,
+           COUNT(*) AS marks
+    FROM marks GROUP BY 1, 2, 3
+)
+SELECT mins, cohort,
+       COUNT(*) AS tokens,
+       SUM(marks) AS marks,
+       ROUND(AVG(ret), 2) AS mean,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ret)::numeric, 2) AS median,
+       ROUND(STDDEV_SAMP(ret), 2) AS stdev,
+       ROUND((STDDEV_SAMP(ret) / NULLIF(SQRT(COUNT(*)), 0))::numeric, 2) AS se,
+       ROUND(AVG(net_ret), 2) AS net,
+       ROUND(100.0 * AVG(assumed_share)) AS pct_assumed,
+       ROUND(100.0 * AVG(up_share)) AS pct_up
+FROM per_token GROUP BY 1, 2 ORDER BY 1, 2;
 
 \echo ''
-\echo '=== 5b. Same, but LIVE tokens only (>= 50 txns in the hour) ==='
+\echo '=== 5c. THE DECISION NUMBER: approved minus rejected, against its error ==='
+-- One row per horizon: the gap, and how big the gap would have to be to
+-- mean anything. `verdict` is deliberately blunt -- 'signal' requires the
+-- gap to clear two standard errors AND both arms to have enough tokens for
+-- the standard error itself to be trustworthy.
+--
+-- Power, so the wait is not a surprise: detecting a 10-percentage-point
+-- effect at memecoin variance needs roughly 144 tokens per arm. Reading
+-- this table at 19 tokens tells you nothing either way -- and 'noise' at a
+-- small n is not evidence the gates are worthless, only that the question
+-- has not been asked yet.
+WITH marks AS (
+    SELECT h.horizon_minutes AS mins, t.cohort, t.token_address AS token,
+           h.return_percent AS ret
+    FROM paper_horizon_returns h
+    JOIN paper_trades t ON t.id = h.paper_trade_id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
+),
+per_token AS (
+    SELECT mins, cohort, token, AVG(ret) AS ret FROM marks GROUP BY 1, 2, 3
+),
+per_cohort AS (
+    SELECT mins, cohort, COUNT(*) AS tokens, AVG(ret) AS mean,
+           COALESCE(VAR_SAMP(ret), 0) AS var
+    FROM per_token GROUP BY 1, 2
+),
+gap AS (
+    SELECT a.mins, a.tokens AS approved_tokens, r.tokens AS rejected_tokens,
+           a.mean - r.mean AS diff,
+           SQRT(a.var / NULLIF(a.tokens, 0) + r.var / NULLIF(r.tokens, 0)) AS se_diff
+    FROM per_cohort a JOIN per_cohort r ON r.mins = a.mins AND r.cohort = 'REJECTED'
+    WHERE a.cohort = 'APPROVED'
+)
+SELECT mins, approved_tokens, rejected_tokens,
+       ROUND(diff::numeric, 2) AS approved_minus_rejected,
+       ROUND(se_diff::numeric, 2) AS se_of_gap,
+       ROUND((diff / NULLIF(se_diff, 0))::numeric, 2) AS t_stat,
+       CASE
+         WHEN LEAST(approved_tokens, rejected_tokens) < 30 THEN 'too few tokens'
+         WHEN ABS(diff) > 2 * se_diff THEN 'signal'
+         ELSE 'noise'
+       END AS verdict
+FROM gap ORDER BY mins;
+
+\echo ''
+\echo '=== 5b. Same as 5, but LIVE tokens only (>= 50 txns in the hour) ==='
 -- If the cohort gap appears ONLY here, the gates work and DISCOVERY is what
 -- needs fixing. That is a completely different repair from the one the
--- barrier results pointed at.
-SELECT h.horizon_minutes AS mins, t.cohort,
-       COUNT(DISTINCT t.token_address) AS tokens,
-       ROUND(AVG(h.return_percent), 2) AS mean,
-       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY h.return_percent)::numeric, 2) AS median,
-       ROUND(STDDEV_SAMP(h.return_percent), 2) AS stdev
-FROM paper_horizon_returns h JOIN paper_trades t ON t.id = h.paper_trade_id
-WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
-  AND t.txns_h1 >= 50
-GROUP BY 1, 2 ORDER BY 1, 2;
+-- barrier results pointed at. Token-weighted for the same reason as 5.
+WITH marks AS (
+    SELECT h.horizon_minutes AS mins, t.cohort, t.token_address AS token,
+           h.return_percent AS ret
+    FROM paper_horizon_returns h
+    JOIN paper_trades t ON t.id = h.paper_trade_id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
+      AND t.txns_h1 >= 50
+),
+per_token AS (
+    SELECT mins, cohort, token, AVG(ret) AS ret, COUNT(*) AS marks
+    FROM marks GROUP BY 1, 2, 3
+)
+SELECT mins, cohort,
+       COUNT(*) AS tokens, SUM(marks) AS marks,
+       ROUND(AVG(ret), 2) AS mean,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ret)::numeric, 2) AS median,
+       ROUND(STDDEV_SAMP(ret), 2) AS stdev,
+       ROUND((STDDEV_SAMP(ret) / NULLIF(SQRT(COUNT(*)), 0))::numeric, 2) AS se
+FROM per_token GROUP BY 1, 2 ORDER BY 1, 2;
 
-\echo ''
 \echo '=== 6. FEATURE CORRELATIONS (Spearman) -- hypotheses, not findings ==='
 -- Ranked, not raw: memecoin returns are fat-tailed enough that one 40x
 -- runner dictates a Pearson coefficient entirely.
@@ -212,3 +307,96 @@ SELECT horizon AS mins, name AS feature,
 FROM ranked
 GROUP BY horizon, name
 ORDER BY horizon, ABS(CORR(r_ret, r_val)) DESC NULLS LAST;
+
+\echo ''
+\echo '=== 7. WHY CANDIDATES ARE REFUSED -- per gate, and within F_ATLAS ==='
+-- The funnel, by distinct token rather than by row. F_ATLAS is split by
+-- reason because its two refusals are opposite problems: concentration over
+-- the ceiling is the gate working, concentration that could not be measured
+-- is a data-coverage failure, and roughly two thirds of its rejections have
+-- been the latter. `reject_reason` is what makes that separable -- before it
+-- existed both recorded rejected_by='F_ATLAS'.
+SELECT COALESCE(rejected_by, '(approved)') AS gate,
+       CASE
+         WHEN reject_reason ILIKE '%unavailable%' OR reject_reason ILIKE '%could not be measured%'
+           THEN 'unmeasurable'
+         WHEN reject_reason IS NULL THEN ''
+         ELSE 'failed the rule'
+       END AS kind,
+       COUNT(DISTINCT token_address) AS tokens,
+       ROUND(100.0 * COUNT(DISTINCT token_address)
+             / NULLIF(SUM(COUNT(DISTINCT token_address)) OVER (), 0), 1) AS pct
+FROM paper_trades
+WHERE entry_model = 'IMMEDIATE'
+GROUP BY 1, 2 ORDER BY tokens DESC;
+
+\echo ''
+\echo '=== 8. HOLDER CONCENTRATION: how far apart are the three definitions? ==='
+-- The calibration that decides which definition the 30% ceiling should be
+-- applied to. Measurement only -- no gate reads the chain columns yet.
+--
+-- ONE ROW PER TOKEN (its most recent evaluation). Counting rows would weight
+-- a token that lingered in the discovery list all day five times against one
+-- seen once -- the same row-vs-token error section 5 exists to correct, and
+-- it would bias this calibration toward whatever the persistent tokens look
+-- like.
+--
+-- chain_covered_pct against provider_covered_pct is the coverage argument:
+-- if chain measures tokens the provider cannot, moving the gate onto a chain
+-- definition recovers candidates currently refused for no reason other than
+-- absence. median_raw_minus_wallet is the size of the LP-pool distortion; a
+-- large gap means raw chain concentration cannot reuse the 30% ceiling. A
+-- small median_wallet_minus_provider means the wallet definition can.
+WITH latest AS (
+    SELECT DISTINCT ON (token_address)
+           token_address, holder_pct_provider, holder_pct_chain_raw,
+           holder_pct_chain_wallet, holder_pct_chain_program
+    FROM paper_trades
+    WHERE entry_model = 'IMMEDIATE'
+    ORDER BY token_address, evaluated_at DESC
+)
+SELECT COUNT(*) AS tokens,
+       ROUND(100.0 * COUNT(holder_pct_provider) / NULLIF(COUNT(*), 0)) AS provider_covered_pct,
+       ROUND(100.0 * COUNT(holder_pct_chain_wallet) / NULLIF(COUNT(*), 0)) AS chain_covered_pct,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY holder_pct_provider)::numeric, 1) AS median_provider,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY holder_pct_chain_wallet)::numeric, 1) AS median_wallet,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY holder_pct_chain_raw)::numeric, 1) AS median_raw,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (
+             ORDER BY holder_pct_chain_raw - holder_pct_chain_wallet)::numeric, 1)
+             AS median_raw_minus_wallet,
+       -- Computed only where BOTH exist, which is the only place the
+       -- comparison means anything -- and note that those tokens are the
+       -- ones the provider already covers, so this gap says nothing about
+       -- the tokens it does not.
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (
+             ORDER BY holder_pct_chain_wallet - holder_pct_provider)::numeric, 1)
+             AS median_wallet_minus_provider
+FROM latest;
+
+\echo ''
+\echo '=== 8b. How many tokens would each definition reject at the ceiling? ==='
+-- The funnel consequence of the choice, per token. A definition that rejects
+-- almost everything is not a stricter gate, it is a mismeasured one -- and
+-- that is the expected shape for chain_raw, which counts the liquidity pool
+-- as a holder.
+WITH latest AS (
+    SELECT DISTINCT ON (token_address)
+           token_address, holder_pct_provider, holder_pct_chain_raw,
+           holder_pct_chain_wallet
+    FROM paper_trades
+    WHERE entry_model = 'IMMEDIATE'
+    ORDER BY token_address, evaluated_at DESC
+),
+defs AS (
+    SELECT 'provider' AS definition, holder_pct_provider AS pct FROM latest
+    UNION ALL SELECT 'chain_wallet', holder_pct_chain_wallet FROM latest
+    UNION ALL SELECT 'chain_raw', holder_pct_chain_raw FROM latest
+)
+SELECT definition,
+       COUNT(pct) AS measured,
+       COUNT(*) FILTER (WHERE pct IS NULL) AS unmeasurable,
+       COUNT(*) FILTER (WHERE pct > :ceiling) AS over_ceiling,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE pct IS NULL OR pct > :ceiling)
+             / NULLIF(COUNT(*), 0)) AS would_refuse_pct
+FROM defs GROUP BY definition
+ORDER BY would_refuse_pct;

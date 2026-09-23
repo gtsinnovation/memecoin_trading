@@ -44,6 +44,8 @@ from typing import Optional, Dict, Any, List
 
 import httpx
 
+import holder_concentration
+
 logger = logging.getLogger("market_data")
 
 
@@ -124,7 +126,20 @@ async def jupiter_throttle() -> None:
 # repeatedly banned.
 JUPITER_CACHE_TTL_S = float(os.environ.get("JUPITER_CACHE_TTL_S", "120"))
 _slippage_cache: Dict[str, Any] = {}
-SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet.solana.com")
+# RPC endpoint and auth are defined in holder_concentration.py -- the module
+# that actually talks to the chain -- and re-exported here so every existing
+# reference to market_data.SOLANA_RPC_URL still resolves, and so there is
+# exactly ONE place the endpoint is configured.
+#
+# The credential goes in a header, never in the URL: Triton offers a
+# path-style URL with the token embedded, and SOLANA_RPC_URL is printed
+# verbatim in at least one error message (signer_service/main.py), which
+# would land the credential in logs and alert rows.
+from holder_concentration import (  # noqa: E402
+    SOLANA_RPC_URL,
+    SOLANA_RPC_X_TOKEN,
+    rpc_headers as _rpc_headers,
+)
 LUNARCRUSH_API_KEY = os.environ.get("LUNARCRUSH_API_KEY", "")
 
 # Used as the "buy with" side when probing Jupiter for a price-impact
@@ -496,42 +511,23 @@ async def fetch_price_impact_pct(client: httpx.AsyncClient, token_address: str,
 
 
 async def fetch_top10_holder_pct(client: httpx.AsyncClient, token_address: str) -> Optional[float]:
-    """Top-10 holder concentration (percent of total supply) via Solana's
-    native getTokenLargestAccounts + getTokenSupply RPC methods. Returns
-    None on any RPC failure -- the default public endpoint is rate-limited
-    and explicitly not meant for production use (see module docstring)."""
-    try:
-        largest_resp = await client.post(SOLANA_RPC_URL, json={
-            "jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts",
-            "params": [token_address],
-        }, timeout=10.0)
-        largest_resp.raise_for_status()
-        largest = largest_resp.json()
-        if "error" in largest:
-            logger.warning(f"Solana RPC getTokenLargestAccounts error for {token_address}: {largest['error']}")
-            return None
-        accounts = (largest.get("result") or {}).get("value") or []
-        if not accounts:
-            return None
-        top10_amount = sum(float(a.get("uiAmount") or 0.0) for a in accounts[:10])
+    """Top-10 holder concentration from chain, RAW -- every one of the ten
+    largest token accounts, including the AMM pool and the bonding curve.
 
-        supply_resp = await client.post(SOLANA_RPC_URL, json={
-            "jsonrpc": "2.0", "id": 2, "method": "getTokenSupply",
-            "params": [token_address],
-        }, timeout=10.0)
-        supply_resp.raise_for_status()
-        supply_data = supply_resp.json()
-        if "error" in supply_data:
-            logger.warning(f"Solana RPC getTokenSupply error for {token_address}: {supply_data['error']}")
-            return None
-        total_supply = float((supply_data.get("result") or {}).get("value", {}).get("uiAmount") or 0.0)
-        if total_supply <= 0:
-            return None
+    Delegates to holder_concentration so this provider and the "free"
+    provider cannot drift into computing different quantities for the same
+    30% ceiling. Returns None on any failure; a 0% concentration does not
+    exist, and the caller's `_holder_data_missing` flag is what F_ATLAS
+    reads to refuse rather than to treat an unmeasured token as clean.
 
-        return round((top10_amount / total_supply) * 100.0, 2)
-    except Exception as e:
-        logger.warning(f"Solana RPC holder lookup failed for {token_address}: {e}")
-        return None
+    NOTE the definition: this is the raw number. It is NOT comparable with
+    RugCheck's wallet-based figure -- see holder_concentration's docstring.
+    """
+    chain = await holder_concentration.fetch_chain_concentration(client, token_address)
+    if chain.raw_percent is None:
+        logger.warning(
+            f"Chain holder lookup failed for {token_address}: {chain.error}")
+    return chain.raw_percent
 
 
 async def fetch_social_volume_score(client: httpx.AsyncClient, token_symbol: str) -> float:
@@ -589,11 +585,15 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
     if dex_data is None:
         return None
 
-    price_impact, holder_pct, social_score = await asyncio.gather(
+    price_impact, chain, social_score = await asyncio.gather(
         fetch_price_impact_pct(client, token_address),
-        fetch_top10_holder_pct(client, token_address),
+        holder_concentration.fetch_chain_concentration(client, token_address),
         fetch_social_volume_score(client, dex_data["token_symbol"]),
     )
+    # This provider's historic number IS the raw chain figure, so it is what
+    # gets offered as the "provider" reading. The wallet-only split rides
+    # alongside it unused until the definition is chosen deliberately.
+    holder_fields = holder_concentration.snapshot_fields(chain.raw_percent, chain)
 
     return {
         "token_symbol": dex_data["token_symbol"],
@@ -602,7 +602,6 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
         "pool_liquidity_usd": dex_data["liquidity_usd"],
         "social_volume_score": social_score,
         "onchain_flow_velocity": onchain_flow_velocity_proxy(dex_data["volume_h1"], dex_data["liquidity_usd"]),
-        "top_10_holder_percentage": holder_pct if holder_pct is not None else 0.0,
         "estimated_slippage_percent": price_impact if price_impact is not None else 0.0,
         "onchain_volume_increasing": dex_data["volume_h1"] * 24.0 > dex_data["volume_h24"],
         # DexScreener reports total value locked (both sides of the pool),
@@ -631,7 +630,7 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
         "freeze_authority_renounced": None,
         "token_age_hours": None,
         "launchpad": None,
-        "_holder_data_missing": holder_pct is None,
+        **holder_fields,
         "_slippage_data_missing": price_impact is None,
         "_depth_data_missing": not dex_data["liquidity_usd"],
         "_price_disagreement": False,

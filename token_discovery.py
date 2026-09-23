@@ -69,6 +69,99 @@ GECKOTERMINAL_BASE = os.environ.get("GECKOTERMINAL_API_BASE", "https://api.gecko
 BIRDEYE_BASE = os.environ.get("BIRDEYE_API_BASE", "https://public-api.birdeye.so")
 BIRDEYE_API_KEY = os.environ.get("BIRDEYE_API_KEY", "").strip()
 
+# --- Jupiter ---------------------------------------------------------------
+#
+# The primary discovery source, and the reason Birdeye is no longer load
+# bearing. Birdeye's free tier answers every endpoint with
+# {"success":false,"message":"Compute units usage limit exceeded"} once the
+# monthly budget is spent -- as a 400, which reads as a malformed request --
+# and a discovery cycle every three minutes spends that budget reliably. A
+# source that stops working on a schedule is not a source.
+#
+# lite-api is the keyless host. api.jup.ag is the metered one and answers 429
+# without a key, so it is not a useful fallback for this.
+#
+# Jupiter's /tokens/v2 rows carry liquidity, createdAt, holderCount, mint and
+# freeze authority under `audit`, and an organicScore -- strictly more than
+# Birdeye supplied, and enough to keep the liquidity floor that the
+# GeckoTerminal pool walk cannot.
+JUPITER_TOKENS_BASE = os.environ.get("JUPITER_TOKENS_API_BASE", "https://lite-api.jup.ag")
+
+# The same floor Birdeye applied server-side. Jupiter has no min_liquidity
+# parameter, so it is applied here -- but from a field already in the
+# response, so it costs no extra request.
+JUPITER_MIN_LIQUIDITY_USD = float(os.environ.get("JUPITER_MIN_LIQUIDITY_USD", "25000"))
+
+# A SEPARATE, lower floor for newly listed tokens.
+#
+# Birdeye and Jupiter do not mean the same thing by "recent". Birdeye filtered
+# by liquidity server-side and THEN sorted by listing time, so a page was "the
+# most recent tokens that already have $25k" and reached back hours. Jupiter's
+# /tokens/v2/recent returns the newest mints unfiltered, and a token fifteen
+# minutes old does not have $25,000 in its pool -- so the same floor applied
+# to that list admits nothing, which is exactly what jupiter-recent=0 was.
+#
+# The two floors are not a convenience. A single floor low enough to catch new
+# mints would also drag the breadth sources down into the launchpad band,
+# where a "price" is one trade old. Separating them keeps each source sampling
+# the population it is meant to.
+JUPITER_NEW_LISTING_MIN_LIQUIDITY_USD = float(
+    os.environ.get("JUPITER_NEW_LISTING_MIN_LIQUIDITY_USD", "8000"))
+
+# --- The bounds any user-set floor is held to ------------------------------
+#
+# The floor is a FRAME, not a gate, and both bounds are load bearing.
+#
+# Above DISCOVERY_FLOOR_MAX_USD the sampler only ever offers tokens that
+# already clear B_SENTINEL's depth bar, so approval becomes a tautology, the
+# REJECTED arm from that source disappears, and the cohort comparison goes
+# with it. That failure is invisible: discovery keeps reporting healthy counts
+# while the experiment stops being an experiment. The number is derived rather
+# than typed -- B_SENTINEL judges tradeable depth, which is at most half of
+# pool liquidity, so its $20,000 depth bar sits at $40,000 of LIQUIDITY.
+#
+# Below DISCOVERY_FLOOR_MIN_USD the control arm fills with tokens whose
+# rejection is a foregone conclusion, and with pools too thin for a quoted
+# price to mean anything -- at roughly 190 evaluation slots an hour, those are
+# slots spent on noise.
+_B_SENTINEL_DEPTH_BAR_USD = 20000.0   # engine.py node_B_SENTINEL, min_depth
+_LIQUIDITY_PER_DEPTH = 2.0            # depth <= TVL / 2
+DISCOVERY_TAUTOLOGY_FLOOR_USD = _B_SENTINEL_DEPTH_BAR_USD * _LIQUIDITY_PER_DEPTH
+DISCOVERY_FLOOR_MAX_USD = DISCOVERY_TAUTOLOGY_FLOOR_USD * 0.95
+DISCOVERY_FLOOR_MIN_USD = float(os.environ.get("DISCOVERY_FLOOR_MIN_USD", "5000"))
+
+
+def clamp_liquidity_floor(value) -> Optional[tuple]:
+    """(clamped_floor, note) for a user-supplied floor, or None if unusable.
+
+    Returns the note so the caller can TELL the user their number was moved.
+    Silently clamping a setting is how someone ends up believing they are
+    sampling a population they are not.
+    """
+    try:
+        floor = float(value)
+    except (TypeError, ValueError):
+        return None
+    if floor != floor or floor in (float("inf"), float("-inf")):
+        return None
+    if floor < DISCOVERY_FLOOR_MIN_USD:
+        return DISCOVERY_FLOOR_MIN_USD, (
+            f"raised to ${DISCOVERY_FLOOR_MIN_USD:,.0f}: below that the sample fills "
+            f"with pools too thin for a quoted price to mean anything, and the "
+            f"evaluation slots are spent on noise")
+    if floor > DISCOVERY_FLOOR_MAX_USD:
+        return DISCOVERY_FLOOR_MAX_USD, (
+            f"lowered to ${DISCOVERY_FLOOR_MAX_USD:,.0f}: at ${DISCOVERY_TAUTOLOGY_FLOOR_USD:,.0f} "
+            f"every token offered would already clear the depth gate, so approval "
+            f"becomes a tautology and the rejected control arm disappears")
+    return floor, None
+
+# Same evaluation window as the Birdeye recency source: old enough that some
+# provider has priced it, young enough to still be the population this
+# experiment is about.
+JUPITER_MIN_AGE_MINUTES = float(os.environ.get("JUPITER_MIN_AGE_MINUTES", "15"))
+JUPITER_MAX_AGE_MINUTES = float(os.environ.get("JUPITER_MAX_AGE_MINUTES", "90"))
+
 # Discovery lists move on the order of minutes and every source is rate
 # limited. Refreshing once every few minutes and serving many ticks from the
 # cache keeps us far under every provider's limit.
@@ -171,10 +264,14 @@ DISCOVERY_PAGE_SPACING_S = float(os.environ.get("DISCOVERY_PAGE_SPACING_S", "0.4
 # second with no burst allowance, hence 1.1s.
 GECKOTERMINAL_MIN_INTERVAL_S = float(os.environ.get("GECKOTERMINAL_MIN_INTERVAL_S", "2.5"))
 BIRDEYE_MIN_INTERVAL_S = float(os.environ.get("BIRDEYE_MIN_INTERVAL_S", "1.1"))
+# lite-api is keyless and correspondingly metered. Three calls per refresh
+# at this spacing is nowhere near any published limit, and the throttle is
+# per provider so it never delays anything else.
+JUPITER_MIN_INTERVAL_S = float(os.environ.get("JUPITER_MIN_INTERVAL_S", "1.1"))
 
 HEADERS = {"User-Agent": "memecoin-trading-agent/1.0", "Accept": "application/json"}
 
-_cache: Dict[str, Any] = {"candidates": [], "fetched_at": 0.0}
+_cache: Dict[str, Any] = {"candidates": [], "fetched_at": 0.0, "floors": None}
 
 # Provider -> monotonic time before which no further call to it may start.
 _next_allowed: Dict[str, float] = {}
@@ -192,12 +289,15 @@ def _provider_of(url: str) -> Optional[str]:
         return "birdeye"
     if url.startswith(GECKOTERMINAL_BASE):
         return "geckoterminal"
+    if url.startswith(JUPITER_TOKENS_BASE):
+        return "jupiter"
     return None
 
 
 def _interval_for(provider: str) -> float:
     return {"birdeye": BIRDEYE_MIN_INTERVAL_S,
-            "geckoterminal": GECKOTERMINAL_MIN_INTERVAL_S}.get(provider, 0.0)
+            "geckoterminal": GECKOTERMINAL_MIN_INTERVAL_S,
+            "jupiter": JUPITER_MIN_INTERVAL_S}.get(provider, 0.0)
 
 
 async def _throttle(provider: str) -> None:
@@ -281,8 +381,32 @@ async def _get(client: httpx.AsyncClient, name: str, url: str,
                                 params=params, timeout=20.0)
         resp.raise_for_status()
         return resp.json()
+    except httpx.HTTPStatusError as e:
+        # The status line alone is not actionable. A 400 from Birdeye means
+        # the request was malformed or the endpoint is not on this plan, and
+        # those want opposite fixes -- the body says which, and without it
+        # the only way to tell them apart is guessing at parameters.
+        body = ""
+        try:
+            body = (e.response.text or "")[:300].replace("\n", " ")
+        except Exception:
+            pass
+        # Birdeye answers an exhausted compute-unit budget with a 400 and a
+        # body saying so. A 400 normally means "you sent something wrong",
+        # which sent us looking at parameters and headers for an hour; it is
+        # worth naming the real cause where it will be read.
+        if "compute unit" in body.lower() or "usage limit" in body.lower():
+            logger.warning(
+                f"Token discovery source {name} is OUT OF QUOTA, not misconfigured: "
+                f"{body}. This resets on the provider's billing window; the keyless "
+                f"sources carry discovery until it does.")
+        else:
+            logger.warning(
+                f"Token discovery source {name} failed: {e.response.status_code} "
+                f"{e.request.url} -- {body or '(no response body)'}")
+        return None
     except Exception as e:
-        logger.warning(f"Token discovery source {name} failed: {e}")
+        logger.warning(f"Token discovery source {name} failed: {type(e).__name__}: {e}")
         return None
 
 
@@ -383,6 +507,148 @@ async def _from_birdeye_trending(client: httpx.AsyncClient) -> List[str]:
         headers=_birdeye_headers())
     # data.tokens[] here, not data.items[] -- see _birdeye_rows().
     return _mints_from([r for r in _birdeye_rows(payload) if isinstance(r, dict)])
+
+
+# --- Jupiter sources -------------------------------------------------------
+
+def _jupiter_created_epoch(row: Dict[str, Any]) -> Optional[float]:
+    """Listing time as epoch seconds, or None if it cannot be read.
+
+    Two shapes are accepted because Jupiter publishes both across its
+    endpoints: an ISO-8601 string ("2026-07-23T19:06:57Z") and a numeric
+    epoch. Neither is guessed at -- an unrecognised value returns None and
+    the caller SKIPS the row, exactly as the Birdeye source skips an undated
+    listing. Admitting a token whose age cannot be established risks
+    evaluating it before any provider has priced it, which burns a slot for
+    nothing; treating an unparseable date as "new" would do that silently.
+
+    `firstPool.createdAt` is preferred over the token's own `createdAt` when
+    present: the experiment's window is about how long the token has been
+    TRADEABLE, and a mint can exist well before it has a pool.
+    """
+    candidates = []
+    pool = row.get("firstPool")
+    if isinstance(pool, dict):
+        candidates.append(pool.get("createdAt"))
+    candidates.append(row.get("createdAt"))
+
+    for value in candidates:
+        if isinstance(value, (int, float)) and value > 0:
+            # Milliseconds if it is far beyond a plausible epoch in seconds.
+            return float(value) / 1000.0 if value > 1e11 else float(value)
+        if isinstance(value, str) and value.strip():
+            text = value.strip().replace("Z", "+00:00")
+            try:
+                from datetime import datetime
+                parsed = datetime.fromisoformat(text)
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                from datetime import timezone
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+    return None
+
+
+async def _jupiter_tokens(client: httpx.AsyncClient, name: str,
+                          path: str) -> List[Dict[str, Any]]:
+    payload = await _get(client, name, f"{JUPITER_TOKENS_BASE}/tokens/v2/{path}")
+    rows = payload if isinstance(payload, list) else _rows(payload)
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def _jupiter_liquid(rows: List[Dict[str, Any]], name: str,
+                    floor: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Applies the liquidity floor Birdeye used to apply server-side.
+
+    A row whose liquidity is absent or unreadable is DROPPED, not admitted.
+    The floor exists to keep the sample tradeable, and a token that cannot
+    state its own liquidity is precisely the case the floor is for -- letting
+    it through would reintroduce, one row at a time, the unfiltered sample
+    the GeckoTerminal fallback warns about.
+    """
+    floor = JUPITER_MIN_LIQUIDITY_USD if floor is None else float(floor)
+    kept, unpriced = [], 0
+    for row in rows:
+        liquidity = _as_float(row.get("liquidity"))
+        if liquidity is None:
+            unpriced += 1
+            continue
+        if liquidity >= floor:
+            kept.append(row)
+    if unpriced:
+        logger.info(f"{name} dropped {unpriced} row(s) with no readable liquidity.")
+    return kept
+
+
+async def _from_jupiter_recent(client: httpx.AsyncClient,
+                               floor: Optional[float] = None) -> List[str]:
+    """Newly listed tokens carrying real liquidity -- the experiment's
+    population, and the source Birdeye's quota took away.
+
+    /tokens/v2/recent returns the most recent listings unfiltered, so both
+    the liquidity floor and the age window are applied here. The endpoint
+    returns ~30 rows, which is a much shallower page than Birdeye's 100, so
+    the truncation warning below matters more rather than less: if listings
+    arrive faster than 30 rows cover the window, the old end of the window
+    silently falls off and every count still looks plausible.
+    """
+    rows = await _jupiter_tokens(client, "jupiter-recent", "recent")
+    if not rows:
+        return []
+
+    now = time.time()
+    out, ages, undated = [], [], 0
+    floor = JUPITER_NEW_LISTING_MIN_LIQUIDITY_USD if floor is None else float(floor)
+    for row in _jupiter_liquid(rows, "jupiter-recent", floor):
+        created = _jupiter_created_epoch(row)
+        if created is None:
+            undated += 1
+            continue
+        age_min = (now - created) / 60.0
+        ages.append(age_min)
+        if JUPITER_MIN_AGE_MINUTES <= age_min <= JUPITER_MAX_AGE_MINUTES:
+            mint = row.get("id")
+            if isinstance(mint, str) and mint:
+                out.append(mint)
+
+    if ages and max(ages) < JUPITER_MAX_AGE_MINUTES:
+        logger.warning(
+            f"Jupiter recency page reaches only {max(ages):.0f} min, short of the "
+            f"{JUPITER_MAX_AGE_MINUTES:.0f} min window -- listings are arriving faster "
+            f"than one page covers, so the oldest part of the window is being missed.")
+    if undated:
+        logger.info(f"Jupiter recency skipped {undated} row(s) with no readable listing time.")
+    return out
+
+
+async def _from_jupiter_toptraded(client: httpx.AsyncClient,
+                                  floor: Optional[float] = None) -> List[str]:
+    """Breadth: the busiest tokens, above the liquidity floor.
+
+    The counterpart to birdeye-market. Sorted by traded volume rather than by
+    liquidity for the same reason: sorting by liquidity returns wrapped SOL
+    and the stablecoins, which is correct and the opposite of a memecoin
+    sample.
+    """
+    rows = await _jupiter_tokens(client, "jupiter-toptraded", "toptraded/24h")
+    return _mints_from(_jupiter_liquid(rows, "jupiter-toptraded", floor), field="id")
+
+
+async def _from_jupiter_organic(client: httpx.AsyncClient,
+                                floor: Optional[float] = None) -> List[str]:
+    """Trending, by Jupiter's organic-activity score.
+
+    This is the one source in the stack that is ranked by something other
+    than raw volume. Jupiter's organicScore is its own estimate of how much
+    of a token's activity is real rather than wash traded -- the same
+    question market_microstructure.check_turnover() asks from a different
+    angle. Ranking by it is not the same as gating on it, and nothing here
+    gates on it: it selects which tokens get evaluated, and the gates still
+    decide.
+    """
+    rows = await _jupiter_tokens(client, "jupiter-organic", "toporganicscore/24h")
+    return _mints_from(_jupiter_liquid(rows, "jupiter-organic", floor), field="id")
 
 
 async def _from_rugcheck(client: httpx.AsyncClient) -> List[str]:
@@ -498,21 +764,48 @@ async def _from_geckoterminal_pools(client: httpx.AsyncClient) -> List[str]:
 # Birdeye's floor makes them rare instead, so the ordering follows scarcity.)
 # Market breadth goes last because it is the most plentiful and the cheapest
 # to lose.
+# Jupiter's recency source leads Birdeye's: it is keyless, so it is the one
+# that still works when Birdeye's monthly compute budget is spent -- which is
+# not an edge case but the steady state of a three-minute refresh on a free
+# tier.
 _SOURCES: List[Any] = [
+    ("jupiter-recent", _from_jupiter_recent),
     ("birdeye-recent", _from_birdeye_recent),
     ("rugcheck", _from_rugcheck),
     ("dexscreener-boosts", _from_dexscreener_boosts),
+    ("jupiter-organic", _from_jupiter_organic),
     ("birdeye-trending", _from_birdeye_trending),
     ("geckoterminal-trending", _from_geckoterminal),
+    ("jupiter-toptraded", _from_jupiter_toptraded),
     ("birdeye-market", _from_birdeye_market),
 ]
 
 _BIRDEYE_SOURCES = {"birdeye-recent", "birdeye-trending", "birdeye-market"}
+
+# The sources that apply a liquidity floor. The GeckoTerminal pool walk is a
+# fallback for ALL of them failing together, not for Birdeye specifically --
+# that distinction is the whole point of adding Jupiter, and wiring the
+# fallback to Birdeye alone would have kept the unfiltered pool walk running
+# permanently while a perfectly good filtered source sat beside it.
+_LIQUIDITY_FILTERED_SOURCES = _BIRDEYE_SOURCES | {
+    "jupiter-recent", "jupiter-organic", "jupiter-toptraded"}
+
+# Which floor each source is held to. A source absent from this map takes no
+# floor argument at all -- Birdeye applies its own server-side, and the
+# keyless supplements have none to apply.
+_SOURCE_FLOOR_KIND = {
+    "jupiter-recent": "new_listing",
+    "jupiter-organic": "general",
+    "jupiter-toptraded": "general",
+}
 _warned_no_key = False
 
 
 async def discover_candidates(client: httpx.AsyncClient,
-                              force_refresh: bool = False) -> List[str]:
+                              force_refresh: bool = False,
+                              min_liquidity_usd: Optional[float] = None,
+                              new_listing_min_liquidity_usd: Optional[float] = None,
+                              pen_supplier: Optional[Callable[[], Awaitable[List[str]]]] = None) -> List[str]:
     """Merged, de-duplicated candidate mint addresses. Cached for
     DISCOVERY_CACHE_TTL_S.
 
@@ -522,6 +815,24 @@ async def discover_candidates(client: httpx.AsyncClient,
     """
     global _warned_no_key
     now = time.monotonic()
+
+    floors = (
+        JUPITER_MIN_LIQUIDITY_USD if min_liquidity_usd is None else float(min_liquidity_usd),
+        (JUPITER_NEW_LISTING_MIN_LIQUIDITY_USD if new_listing_min_liquidity_usd is None
+         else float(new_listing_min_liquidity_usd)),
+    )
+    # A floor change invalidates the cache. Without this, editing the setting
+    # appears to do nothing for up to DISCOVERY_CACHE_TTL_S -- which reads as
+    # a broken setting, and is the kind of thing someone "fixes" by changing
+    # it again.
+    if _cache["floors"] is not None and _cache["floors"] != floors:
+        logger.info(
+            f"Discovery liquidity floors changed from ${_cache['floors'][0]:,.0f}/"
+            f"${_cache['floors'][1]:,.0f} to ${floors[0]:,.0f}/${floors[1]:,.0f} "
+            f"(general/new-listing) -- refreshing now. The population being sampled "
+            f"has changed, so results either side of this point are not one sample.")
+        force_refresh = True
+
     if not force_refresh and _cache["candidates"] and (now - _cache["fetched_at"]) < DISCOVERY_CACHE_TTL_S:
         return _cache["candidates"]
 
@@ -530,39 +841,69 @@ async def discover_candidates(client: httpx.AsyncClient,
         # Warn once, not every three minutes: without a key the Birdeye
         # sources contribute nothing and the GeckoTerminal fallback carries
         # the load, which is a degraded but working configuration.
-        logger.warning(
-            "BIRDEYE_API_KEY is not set -- the recency, market and trending sources "
-            "are unavailable and discovery is running on the keyless sources plus the "
-            "GeckoTerminal pool fallback. Set it in the project-root .env AND list it "
-            "in docker-compose.yml's web environment block; compose forwards only what "
-            "it names.")
+        logger.info(
+            "BIRDEYE_API_KEY is not set -- Birdeye's three sources are skipped. This "
+            "is no longer a degraded configuration: Jupiter supplies the same three "
+            "jobs (recency, trending, breadth) keylessly and applies the same "
+            "liquidity floor. To enable Birdeye anyway, set the key in the "
+            "project-root .env AND list it in docker-compose.yml's web environment "
+            "block; compose forwards only what it names.")
         _warned_no_key = True
 
     merged: List[str] = []
     per_source: Dict[str, int] = {}
-    birdeye_total = 0
+    filtered_total = 0
+
+    # The holding pen leads, because it is the only source that can supply the
+    # evaluation window at all -- every newest-first endpoint spans one or two
+    # minutes on Solana. It is INJECTED rather than fetched here so this module
+    # stays free of the database: it is the one place that ingests
+    # attacker-chosen identifiers, and it should not need the rest of the
+    # project loaded to do so safely. See discovery_pen.py.
+    # A SUPPLIER, not a list. Draining the pen is destructive -- examining a
+    # token marks it, once, forever -- so it must happen only on a refresh
+    # that actually uses the result. Passing a pre-drained list meant the
+    # caller emptied the pen on every pipeline tick while this function served
+    # a three-minute cache, so all but one batch in forty-five was marked
+    # examined and then discarded.
+    if pen_supplier is not None:
+        try:
+            supplied = await pen_supplier() or []
+        except Exception as e:
+            logger.warning(f"Pen supplier raised: {type(e).__name__}: {e}")
+            supplied = []
+        pen = [m for m in supplied if _plausible_mint(m)]
+        per_source["holding-pen"] = len(pen)
+        filtered_total += len(pen)
+        merged.extend(pen)
     for name, fetch in _SOURCES:
         if name in _BIRDEYE_SOURCES and not have_key:
             continue
         try:
-            found = await fetch(client)
+            kind = _SOURCE_FLOOR_KIND.get(name)
+            if kind is None:
+                found = await fetch(client)
+            else:
+                found = await fetch(client, floors[1] if kind == "new_listing" else floors[0])
         except Exception as e:
             logger.warning(f"Discovery source {name} raised unexpectedly: {e}")
             found = []
         per_source[name] = len(found)
-        if name in _BIRDEYE_SOURCES:
-            birdeye_total += len(found)
+        if name in _LIQUIDITY_FILTERED_SOURCES:
+            filtered_total += len(found)
         merged.extend(found)
 
     # Fallback, not a routine source. Engaging it means Birdeye gave us
     # nothing at all -- a missing key, an exhausted quota, or a vendor outage
     # -- and it is worth a WARNING rather than a silent substitution, because
     # the population being sampled changes when it happens.
-    if birdeye_total == 0:
+    if filtered_total == 0:
         logger.warning(
-            "Birdeye contributed no candidates; falling back to the GeckoTerminal "
-            "pool walk. The sample is no longer liquidity-filtered at the source "
-            "while this is happening.")
+            "No liquidity-filtered source produced candidates (pen, Jupiter and Birdeye "
+            "both empty); falling back to the GeckoTerminal pool walk. The sample is "
+            "no longer liquidity-filtered while this is happening, so the population "
+            "being measured has changed -- check the source counts below before "
+            "reading any result collected during this period.")
         try:
             fallback = await _from_geckoterminal_pools(client)
         except Exception as e:
@@ -600,6 +941,7 @@ async def discover_candidates(client: httpx.AsyncClient,
 
     _cache["candidates"] = candidates
     _cache["fetched_at"] = now
+    _cache["floors"] = floors
     # The per-source breakdown matters more than the total. The total is
     # pinned near the sum of the sources' fixed page sizes and barely moves
     # even when every member has changed, so it cannot tell you whether the
@@ -607,5 +949,7 @@ async def discover_candidates(client: httpx.AsyncClient,
     # source silently dropping to zero is the failure this project has hit
     # three times.
     detail = ", ".join(f"{k}={v}" for k, v in per_source.items())
-    logger.info(f"Token discovery refreshed: {len(candidates)} candidates ({detail}).")
+    logger.info(
+        f"Token discovery refreshed: {len(candidates)} candidates ({detail}) "
+        f"[floors: general ${floors[0]:,.0f}, new-listing ${floors[1]:,.0f}].")
     return candidates

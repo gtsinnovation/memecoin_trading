@@ -14,6 +14,7 @@ from langgraph.graph import StateGraph, START, END
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("graph_engine")
 from fill_accounting import round_significant
+import holder_concentration
 import market_microstructure
 
 DB_DSN = os.environ.get("DATABASE_URL", "postgresql://postgres:secret@localhost:5432/memecoin_trading")
@@ -67,6 +68,18 @@ class AgentNetworkState(TypedDict):
     # for every gate that reads it. These booleans are how a gate tells
     # "measured zero" apart from "never measured".
     holder_data_missing: bool
+    # Holder concentration, every way it was measured. MEASUREMENT ONLY --
+    # no node reads these; they are declared because the provider snapshot IS
+    # the graph input, so a key the state does not declare is a key LangGraph
+    # rejects. paper_trading.record_candidate persists them, and section 8 of
+    # stage2_check.sql is what they exist for: choosing which definition the
+    # concentration ceiling should be applied to. See holder_concentration.py.
+    holder_concentration_source: Optional[str]
+    holder_concentration_provider_pct: Optional[float]
+    holder_concentration_raw_pct: Optional[float]
+    holder_concentration_wallet_pct: Optional[float]
+    holder_concentration_program_pct: Optional[float]
+    holder_concentration_burn_pct: Optional[float]
     slippage_data_missing: bool
     onchain_volume_increasing: bool
     is_liquidity_safe: bool
@@ -917,8 +930,14 @@ def node_E_BREADTH(state: AgentNetworkState) -> Dict[str, Any]:
 
 
 def node_F_ATLAS(state: AgentNetworkState) -> Dict[str, Any]:
-    # Rule validation: Top holder concentration threshold check
-    max_concentration = 30.0
+    # The ceiling comes from holder_concentration, which is also where the
+    # thing being thresholded is DEFINED. They used to live in different
+    # files: the number 30.0 was a literal here while three providers
+    # computed three incompatible quantities to compare against it (raw
+    # chain including the LP pool, RugCheck's wallet figure, and GMGN's).
+    # A threshold is meaningless apart from its definition, so they are now
+    # one import away from each other.
+    max_concentration = holder_concentration.TOP10_CONCENTRATION_CEILING_PERCENT
 
     # FAIL CLOSED on unmeasured concentration. free_market_data's own
     # fetch_rugcheck_report() docstring spells out why: a token RugCheck has

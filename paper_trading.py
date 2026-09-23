@@ -279,9 +279,15 @@ def record_candidate(conn, snapshot: Dict[str, Any], final_state: Dict[str, Any]
     termination = final_state.get("termination_reason")
     cohort = "REJECTED" if termination else "APPROVED"
     rejected_by = None
+    reject_reason = None
     if termination:
         # Reasons are formatted "<GATE>: Short-circuit. ..." by each node.
         rejected_by = str(termination).split(":", 1)[0].strip()[:40]
+        # The gate name alone cannot separate "concentration is 61%" from
+        # "concentration could not be measured" -- both are F_ATLAS, and they
+        # are opposite problems. The full text is kept so the rejected cohort
+        # can be segmented without joining system_alerts by timestamp.
+        reject_reason = str(termination)
 
     token_address = snapshot.get("token_address")
     if not token_address:
@@ -334,6 +340,17 @@ def record_candidate(conn, snapshot: Dict[str, Any], final_state: Dict[str, Any]
     if snapshot.get("slippage_data_missing"):
         slippage = None
 
+    # Holder concentration as measured every available way. Recorded, never
+    # gated on: the chain columns exist so the definition behind the 30%
+    # ceiling can be chosen from this agent's own token population rather
+    # than from a one-off probe. See holder_concentration.py.
+    holder_source = snapshot.get("holder_concentration_source")
+    holder_provider = _num("holder_concentration_provider_pct")
+    holder_raw = _num("holder_concentration_raw_pct")
+    holder_wallet = _num("holder_concentration_wallet_pct")
+    holder_program = _num("holder_concentration_program_pct")
+    holder_burn = _num("holder_concentration_burn_pct")
+
     volume_h1 = _num("volume_h1_usd")
     depth = _num("tradeable_depth_usd")
     buys, sells = _num("txns_h1_buys"), _num("txns_h1_sells")
@@ -375,11 +392,17 @@ def record_candidate(conn, snapshot: Dict[str, Any], final_state: Dict[str, Any]
                     volume_h1_usd, txns_h1, txns_h1_buys, txns_h1_sells,
                     tradeable_depth_usd,
                     volume_m5_usd, txns_m5_buys, txns_m5_sells,
-                    price_change_m5, price_change_h1
+                    price_change_m5, price_change_h1,
+                    reject_reason,
+                    holder_concentration_source, holder_pct_provider,
+                    holder_pct_chain_raw, holder_pct_chain_wallet,
+                    holder_pct_chain_program, holder_pct_chain_burn
                 ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                           CASE WHEN %s IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END,
                           %s, CURRENT_TIMESTAMP, %s, %s, %s, %s, %s,
-                          %s, %s, %s, %s, %s);
+                          %s, %s, %s, %s, %s,
+                          %s,
+                          %s, %s, %s, %s, %s, %s);
                 """, (
                     token_address, snapshot.get("token_symbol"),
                     cohort, rejected_by, entry_model, status,
@@ -393,10 +416,30 @@ def record_candidate(conn, snapshot: Dict[str, Any], final_state: Dict[str, Any]
                     int(m5_buys) if m5_buys is not None else None,
                     int(m5_sells) if m5_sells is not None else None,
                     chg_m5, chg_h1,
+                    reject_reason,
+                    holder_source, holder_provider,
+                    holder_raw, holder_wallet, holder_program, holder_burn,
                 ))
             except Exception as e:
                 cur.execute("ROLLBACK TO SAVEPOINT paper_row;")
-                logger.debug(f"Skipped duplicate paper row for {token_address} {entry_model}: {e}")
+                # A unique violation means "already recorded", which is the
+                # expected race and is not worth a log line. ANYTHING ELSE is
+                # not: an unapplied migration makes every insert fail with
+                # UndefinedColumn, and swallowing that at debug level would
+                # stop the experiment recording ANY data while the dashboard
+                # kept saying the pipeline was running. That is the single
+                # most expensive failure this file can have, so it is loud.
+                pgcode = getattr(e, "pgcode", None)
+                if pgcode == "23505":          # unique_violation
+                    logger.debug(
+                        f"Skipped duplicate paper row for {token_address} "
+                        f"{entry_model}: {e}")
+                else:
+                    logger.error(
+                        f"PAPER ROW NOT RECORDED for {token_address} {entry_model} "
+                        f"({type(e).__name__} pgcode={pgcode}): {e}. If this is "
+                        f"UndefinedColumn (42703), migrate.sql has not been applied "
+                        f"to this database -- nothing is being recorded until it is.")
             else:
                 cur.execute("RELEASE SAVEPOINT paper_row;")
 

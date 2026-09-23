@@ -250,3 +250,105 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_active_positions_one_per_token
 
 
 
+
+-- ---------------------------------------------------------------------------
+-- Why a candidate was refused, in full, on the candidate's own row.
+--
+-- `rejected_by` records the GATE ('F_ATLAS'), which is not enough to act on.
+-- F_ATLAS refuses for two unrelated reasons -- concentration above the
+-- ceiling, and concentration that could not be measured at all -- and those
+-- want opposite responses: the first is the gate working, the second is a
+-- data-coverage problem. They were indistinguishable in paper_trades, so
+-- separating them meant joining system_alerts.message by timestamp, which is
+-- guesswork once two tokens are evaluated in the same second.
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS reject_reason TEXT;
+
+-- Holder concentration, every way it was measured, recorded for MEASUREMENT
+-- ONLY -- no gate reads these.
+--
+-- The gate compares ONE number against a 30% ceiling. Which number depended
+-- on the provider, and the three providers computed three incompatible
+-- quantities (see holder_concentration.py). Choosing a single definition
+-- requires knowing how far apart they are ON THE TOKENS THIS AGENT ACTUALLY
+-- SEES, and that cannot be answered from RugCheck, because the tokens
+-- RugCheck has no record of are exactly the ones in question -- they are 67%
+-- of everything F_ATLAS rejects.
+--
+-- holder_pct_provider is what the gate saw. The chain columns are the
+-- alternative definitions observed alongside it. A NULL is a failed
+-- measurement, never a zero: 0% concentration does not exist.
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS holder_concentration_source VARCHAR(20);
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS holder_pct_provider NUMERIC;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS holder_pct_chain_raw NUMERIC;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS holder_pct_chain_wallet NUMERIC;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS holder_pct_chain_program NUMERIC;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS holder_pct_chain_burn NUMERIC;
+
+-- Segmenting the rejected cohort by reason is the query this was added for,
+-- and it runs over the whole table.
+CREATE INDEX IF NOT EXISTS ix_paper_trades_rejected_by ON paper_trades(rejected_by);
+
+-- ---------------------------------------------------------------------------
+-- Discovery liquidity floors, editable from the settings page.
+--
+-- TWO floors, not one. Birdeye applied its floor server-side and then sorted
+-- by listing time, so a page was "the newest tokens that already have $25k".
+-- Jupiter's /tokens/v2/recent returns the newest mints unfiltered, and a
+-- fifteen-minute-old token does not have $25,000 in its pool -- the same
+-- floor applied to that list admitted nothing at all. A single floor low
+-- enough to catch new mints would drag the breadth sources into the launchpad
+-- band, where a quoted price is one trade old.
+--
+-- NULL means "use the configured default", so adding these columns changes no
+-- behaviour until someone sets one.
+--
+-- Both are clamped on write (token_discovery.clamp_liquidity_floor). The
+-- upper bound is not arbitrary: B_SENTINEL passes tokens with $20,000 of
+-- tradeable depth, which is $40,000 of pool liquidity, so a floor at or above
+-- that only ever offers tokens that already clear the gate -- approval
+-- becomes a tautology and the REJECTED control arm disappears, with every log
+-- line still looking healthy.
+ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS discovery_min_liquidity_usd NUMERIC;
+ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS discovery_new_listing_min_liquidity_usd NUMERIC;
+
+-- ---------------------------------------------------------------------------
+-- The holding pen: newly created pools, held until they age into the
+-- evaluation window.
+--
+-- Solana creates ~30 pools a minute, so every newest-first endpoint spans one
+-- or two minutes -- measured: GeckoTerminal new_pools 60 rows over 2 minutes,
+-- Jupiter /tokens/v2/recent 30 rows over 1. Fifteen minutes ago is ~450
+-- tokens back. Birdeye could reach the window only because it filtered by
+-- liquidity server-side BEFORE sorting by listing time; nothing free does
+-- that, so the join between "new" and "liquid" has to be held in memory.
+--
+-- pool_created_at is the CHAIN's timestamp and is what ageing uses.
+-- first_seen_at is diagnostic only. If capture stalls, rows captured late
+-- must still know their true age -- otherwise a ten-minute outage releases
+-- the whole backlog at once, all of it looking fifteen minutes old, and
+-- nothing in the data would show it.
+CREATE TABLE IF NOT EXISTS discovery_pen (
+    token_address VARCHAR(128) PRIMARY KEY,
+    pool_created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    first_seen_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    source VARCHAR(40),
+    -- Set when the token was examined at release, whether or not it passed.
+    released_at TIMESTAMP WITH TIME ZONE,
+    -- Liquidity measured at release. NULL means it was examined and did not
+    -- clear the floor, or could not be read -- never that it had none.
+    liquidity_at_release NUMERIC
+);
+
+-- The release query: unreleased rows inside an age band, oldest first.
+CREATE INDEX IF NOT EXISTS ix_discovery_pen_due
+    ON discovery_pen(pool_created_at) WHERE released_at IS NULL;
+
+-- Did the token clear the floor when it was examined?
+--
+-- liquidity_at_release is now recorded for EVERY examined token, passing or
+-- not, so this flag is what separates them. Recording it only for the winners
+-- threw away exactly the data needed to choose a floor: the distribution that
+-- matters includes the failures, and without them the only observable is
+-- "N of M passed at whatever floor is configured" -- which cannot distinguish
+-- a floor set too high from a market that is genuinely thin.
+ALTER TABLE discovery_pen ADD COLUMN IF NOT EXISTS qualified BOOLEAN;

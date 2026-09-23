@@ -31,7 +31,9 @@ def run(token_discovery) -> Suite:
         "BIRDEYE_MAX_AGE_MINUTES", "BIRDEYE_PAGE_LIMIT",
         "DISCOVERY_MAX_CANDIDATES", "DISCOVERY_PAGE_SPACING_S",
         "BIRDEYE_MIN_INTERVAL_S", "GECKOTERMINAL_MIN_INTERVAL_S",
-        "BIRDEYE_API_KEY")}
+        "BIRDEYE_API_KEY",
+        "JUPITER_MIN_LIQUIDITY_USD", "JUPITER_MIN_AGE_MINUTES",
+        "JUPITER_MAX_AGE_MINUTES", "JUPITER_MIN_INTERVAL_S")}
 
     def client_for(handler):
         return httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -39,15 +41,23 @@ def run(token_discovery) -> Suite:
     def fresh():
         td._cache["candidates"] = []
         td._cache["fetched_at"] = 0.0
+        td._cache["floors"] = None
         td._next_allowed.clear()
         td.BIRDEYE_API_KEY = "test-key"
         td.DISCOVERY_PAGE_SPACING_S = 0
         td.BIRDEYE_MIN_INTERVAL_S = 0.0
         td.GECKOTERMINAL_MIN_INTERVAL_S = 0.0
+        td.JUPITER_MIN_INTERVAL_S = 0.0
 
     def discover(handler):
         return asyncio.get_event_loop().run_until_complete(
             td.discover_candidates(client_for(handler), force_refresh=True))
+
+    def discover_with_floors(handler, general=None, new_listing=None):
+        return asyncio.get_event_loop().run_until_complete(
+            td.discover_candidates(client_for(handler), force_refresh=True,
+                                   min_liquidity_usd=general,
+                                   new_listing_min_liquidity_usd=new_listing))
 
     def be(payload_rows, key="items"):
         """A Birdeye envelope. The wrapper key differs per endpoint."""
@@ -67,14 +77,33 @@ def run(token_discovery) -> Suite:
         return {"attributes": {"name": "X/SOL", "reserve_in_usd": "50000"},
                 "relationships": {"base_token": {"data": {"id": f"solana_{addr}"}}}}
 
+    def jup(seed, age_min=30.0, liquidity=50000.0, **extra):
+        """A Jupiter /tokens/v2 row. Note `id`, not `address` -- reading the
+        wrong key is the single most likely way this provider breaks, and it
+        would fail silently as an empty source rather than as an error."""
+        from datetime import datetime, timedelta, timezone
+        created = datetime.now(timezone.utc) - timedelta(minutes=age_min)
+        row = {"id": make_address(seed), "symbol": f"J{seed}",
+               "liquidity": liquidity,
+               "createdAt": created.strftime("%Y-%m-%dT%H:%M:%SZ")}
+        row.update(extra)
+        return row
+
     def router(recent=None, market=None, trending=None, gt_trending=None,
-               gt_pools=None, rugcheck=None, boosts=None, on_call=None):
+               gt_pools=None, rugcheck=None, boosts=None, on_call=None,
+               jup_recent=None, jup_traded=None, jup_organic=None):
         """One handler for every endpoint, so a test only names what it cares
         about and everything else returns an empty-but-valid response."""
         def handler(request):
             url = str(request.url)
             if on_call is not None:
                 on_call(url)
+            if "/tokens/v2/recent" in url:
+                return httpx.Response(200, json=jup_recent or [])
+            if "/tokens/v2/toptraded" in url:
+                return httpx.Response(200, json=jup_traded or [])
+            if "/tokens/v2/toporganicscore" in url:
+                return httpx.Response(200, json=jup_organic or [])
             if "/defi/v3/token/list" in url:
                 sort_by = dict(request.url.params).get("sort_by", "")
                 rows = recent if sort_by == "recent_listing_time" else market
@@ -492,4 +521,267 @@ def run(token_discovery) -> Suite:
     td._next_allowed.clear()
     td._cache["candidates"] = []
     td._cache["fetched_at"] = 0.0
+
+    # ================================================================ JUPITER
+    # Jupiter exists in this module because Birdeye's free tier answers every
+    # endpoint with a 400 carrying "Compute units usage limit exceeded" once
+    # its monthly budget is spent, and a three-minute refresh spends it. The
+    # liquidity-filtered sample cannot depend on a source that stops on a
+    # schedule.
+
+    print("\n[JUPITER] the mint is read from `id`, not `address`")
+    fresh()
+    a, b = make_address(700), make_address(701)
+    got = discover(router(jup_recent=[jup(700)], jup_traded=[jup(701)]))
+    s.check_true("a Jupiter recency row is offered", a in got)
+    s.check_true("a Jupiter top-traded row is offered", b in got)
+    # The failure mode this guards: reading `address` returns nothing at all,
+    # and an empty source is indistinguishable from a quiet market.
+    fresh()
+    wrong_key = dict(jup(702)); wrong_key["address"] = wrong_key.pop("id")
+    s.check("a row without `id` contributes nothing",
+            discover(router(jup_recent=[wrong_key])), [])
+
+    print("\n[JUPITER] the liquidity floor Birdeye applied server-side")
+    fresh()
+    rich, poor = make_address(710), make_address(711)
+    got = discover(router(jup_traded=[
+        jup(710, liquidity=td.JUPITER_MIN_LIQUIDITY_USD + 1),
+        jup(711, liquidity=td.JUPITER_MIN_LIQUIDITY_USD - 1)]))
+    s.check_true("a token above the floor survives", rich in got)
+    s.check_true("a token below the floor is dropped", poor not in got)
+
+    fresh()
+    exactly = make_address(712)
+    s.check_true("the floor itself is inclusive",
+                 exactly in discover(router(jup_traded=[
+                     jup(712, liquidity=td.JUPITER_MIN_LIQUIDITY_USD)])))
+
+    # Unreadable liquidity is DROPPED, not admitted. Admitting it would
+    # reinstate the unfiltered sample one row at a time -- exactly what the
+    # GeckoTerminal fallback warns about, but without the warning.
+    fresh()
+    for label, value in (("missing", None), ("null", "__NULL__"),
+                         ("non-numeric", "lots")):
+        row = dict(jup(713))
+        if value == "__NULL__":
+            row["liquidity"] = None
+        elif value is None:
+            row.pop("liquidity")
+        else:
+            row["liquidity"] = value
+        fresh()
+        s.check(f"{label} liquidity is dropped, never admitted",
+                discover(router(jup_traded=[row])), [])
+
+    print("\n[JUPITER] the age window, across the timestamp shapes Jupiter ships")
+    fresh()
+    new, ok, old_tok = make_address(720), make_address(721), make_address(722)
+    got = discover(router(jup_recent=[
+        jup(720, age_min=2), jup(721, age_min=30), jup(722, age_min=400)]))
+    s.check("only the in-window listing survives", got, [ok])
+
+    # The same row, dated three different legal ways. An ISO string is what
+    # /tokens/v2 returns today; epoch seconds and milliseconds are accepted
+    # because Jupiter publishes those elsewhere and a format change would
+    # otherwise silently empty this source.
+    import time as _time
+    for label, value in (
+            ("epoch seconds", _time.time() - 30 * 60),
+            ("epoch milliseconds", (_time.time() - 30 * 60) * 1000.0)):
+        fresh()
+        row = dict(jup(730)); row["createdAt"] = value
+        s.check(f"a createdAt in {label} is understood",
+                discover(router(jup_recent=[row])), [make_address(730)])
+
+    # An unreadable date is SKIPPED, not treated as new. Treating it as new
+    # would evaluate a token before any provider has priced it.
+    for label, value in (("garbage", "not-a-date"), ("null", None),
+                         ("empty", ""), ("zero", 0)):
+        fresh()
+        row = dict(jup(731)); row["createdAt"] = value
+        s.check(f"an unreadable createdAt ({label}) is skipped, not admitted",
+                discover(router(jup_recent=[row])), [])
+
+    print("\n[JUPITER] pool creation time wins over mint creation time")
+    # The window is about how long a token has been TRADEABLE. A mint can
+    # exist for months before it has a pool, and dating it from the mint
+    # would put every such token outside the window forever.
+    fresh()
+    from datetime import datetime, timedelta, timezone
+    pooled = dict(jup(740, age_min=5000))     # mint is ancient
+    pooled["firstPool"] = {"createdAt": (datetime.now(timezone.utc)
+                                         - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    s.check("an old mint with a new pool is in the window",
+            discover(router(jup_recent=[pooled])), [make_address(740)])
+    fresh()
+    stale_pool = dict(jup(741, age_min=5))    # mint is new
+    stale_pool["firstPool"] = {"createdAt": (datetime.now(timezone.utc)
+                                             - timedelta(minutes=5000)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    s.check("a new mint with an old pool is OUT of the window",
+            discover(router(jup_recent=[stale_pool])), [])
+
+    print("\n[JUPITER] the pool-walk fallback needs EVERY filtered source empty")
+    # Previously this keyed on Birdeye alone. Left that way, an exhausted
+    # Birdeye quota would have kept the unfiltered GeckoTerminal walk running
+    # permanently while Jupiter sat beside it working fine.
+    fresh()
+    gt_only = make_address(750)
+    got = discover(router(jup_traded=[jup(751)],
+                          gt_pools={1: [gt_pool(gt_only)]}))
+    s.check_true("Jupiter alone prevents the unfiltered fallback",
+                 make_address(751) in got)
+    s.check_true("and the pool walk does not run", gt_only not in got)
+
+    fresh()
+    got = discover(router(gt_pools={1: [gt_pool(gt_only)]}))
+    s.check_true("with every filtered source empty the fallback does run",
+                 gt_only in got)
+
+    print("\n[JUPITER] throttled as its own provider")
+    fresh()
+    s.check("jupiter urls are attributed to jupiter",
+            td._provider_of(f"{td.JUPITER_TOKENS_BASE}/tokens/v2/recent"), "jupiter")
+    td.JUPITER_MIN_INTERVAL_S = 0.7
+    s.check("jupiter uses its own interval", td._interval_for("jupiter"), 0.7)
+    s.check_true("and not Birdeye's",
+                 td._interval_for("jupiter") != td._interval_for("birdeye"))
+    td.JUPITER_MIN_INTERVAL_S = 0.0
+
+    print("\n[JUPITER] an exhausted quota is reported as quota, not as a bug")
+    fresh()
+    seen = []
+    def quota_handler(request):
+        url = str(request.url)
+        if "birdeye" in url:
+            return httpx.Response(400, json={
+                "success": False, "message": "Compute units usage limit exceeded"})
+        if "/tokens/v2/recent" in url:
+            return httpx.Response(200, json=[jup(760)])
+        return httpx.Response(200, json={"data": []})
+    got = discover(quota_handler)
+    s.check_true("a quota-exhausted Birdeye does not fail the cycle",
+                 make_address(760) in got)
+    s.check_true("and the keyless source still carries it", len(got) >= 1)
+
+    print("\n[JUPITER] the shipped configuration is a real one")
+    s.check_true("the liquidity floor matches Birdeye's, so the population "
+                 "does not change with the provider",
+                 SHIPPED["JUPITER_MIN_LIQUIDITY_USD"] == SHIPPED["BIRDEYE_MIN_LIQUIDITY_USD"])
+    s.check_true("the age window matches Birdeye's too",
+                 SHIPPED["JUPITER_MIN_AGE_MINUTES"] == SHIPPED["BIRDEYE_MIN_AGE_MINUTES"]
+                 and SHIPPED["JUPITER_MAX_AGE_MINUTES"] == SHIPPED["BIRDEYE_MAX_AGE_MINUTES"])
+    s.check_true("Jupiter is throttled at all", SHIPPED["JUPITER_MIN_INTERVAL_S"] > 0)
+    s.check_true("the keyless host is configured, not the metered one "
+                 "(api.jup.ag answers 429 without a key)",
+                 "lite-api" in td.JUPITER_TOKENS_BASE)
+    names = [n for n, _ in td._SOURCES]
+    s.check_true("a Jupiter source leads, so a spent Birdeye quota is not fatal",
+                 names[0].startswith("jupiter"))
+    s.check_true("all three Jupiter sources are registered",
+                 len([n for n in names if n.startswith("jupiter")]) == 3)
+
+    # =========================================== USER-ADJUSTABLE FLOORS
+    print("\n[FLOOR] the bounds are derived from the gate, not typed in")
+    # If B_SENTINEL's depth bar ever moves, the ceiling on a user-set floor
+    # has to move with it, or the tautology this bound prevents comes back
+    # quietly. Read statically so this needs no engine import.
+    import ast as _ast
+    import os as _os
+    engine_src = open(_os.path.join(_os.path.dirname(_os.path.dirname(
+        _os.path.abspath(__file__))), "engine.py"), encoding="utf-8").read()
+    bar = None
+    for node in _ast.walk(_ast.parse(engine_src)):
+        if (isinstance(node, _ast.Assign)
+                and any(isinstance(t, _ast.Name) and t.id == "min_depth" for t in node.targets)
+                and isinstance(node.value, _ast.Constant)):
+            bar = float(node.value.value)
+            break
+    s.check_true("B_SENTINEL's depth bar was found in engine.py", bar is not None)
+    s.check("the tautology line tracks that bar, doubled for TVL",
+            td.DISCOVERY_TAUTOLOGY_FLOOR_USD, (bar or 0) * 2.0)
+    s.check_true("the settable ceiling stays strictly under it",
+                 td.DISCOVERY_FLOOR_MAX_USD < td.DISCOVERY_TAUTOLOGY_FLOOR_USD)
+    s.check_true("the settable minimum clears the launchpad band",
+                 td.DISCOVERY_FLOOR_MIN_USD > 2500.0)
+    s.check_true("the range is not empty",
+                 td.DISCOVERY_FLOOR_MIN_USD < td.DISCOVERY_FLOOR_MAX_USD)
+
+    print("\n[FLOOR] a user value is clamped, and the move is REPORTED")
+    mid = (td.DISCOVERY_FLOOR_MIN_USD + td.DISCOVERY_FLOOR_MAX_USD) / 2.0
+    value, note = td.clamp_liquidity_floor(mid)
+    s.check("an in-range floor passes through untouched", value, mid)
+    s.check("and carries no note", note, None)
+
+    value, note = td.clamp_liquidity_floor(50_000)
+    s.check("a floor above the tautology line is pulled down",
+            value, td.DISCOVERY_FLOOR_MAX_USD)
+    s.check_true("and says why, so it is not a silent edit", bool(note))
+    s.check_true("the reason names the actual failure, not just the number",
+                 "tautology" in (note or "").lower())
+
+    value, note = td.clamp_liquidity_floor(100)
+    s.check("a floor below the minimum is pulled up", value, td.DISCOVERY_FLOOR_MIN_USD)
+    s.check_true("and says why", bool(note))
+
+    s.check("the boundary itself is allowed, not clamped",
+            td.clamp_liquidity_floor(td.DISCOVERY_FLOOR_MAX_USD)[0], td.DISCOVERY_FLOOR_MAX_USD)
+    s.check("the lower boundary is allowed too",
+            td.clamp_liquidity_floor(td.DISCOVERY_FLOOR_MIN_USD)[0], td.DISCOVERY_FLOOR_MIN_USD)
+
+    for bad in (None, "", "lots", float("nan"), float("inf")):
+        s.check(f"an unusable floor {bad!r} is refused outright",
+                td.clamp_liquidity_floor(bad), None)
+
+    print("\n[FLOOR] the two floors reach the sources they belong to")
+    fresh()
+    # Same liquidity on both rows. Only the new-listing source should admit
+    # it, because only that floor was lowered.
+    LOW, HIGH = 6000.0, 30000.0
+    got = discover(router(
+        jup_recent=[jup(800, liquidity=LOW)],
+        jup_traded=[jup(801, liquidity=LOW)],
+        jup_organic=[jup(802, liquidity=LOW)]))
+    s.check_true("with default floors a thin new listing is excluded too",
+                 make_address(800) not in got)
+
+    fresh()
+    got = discover_with_floors(router(
+        jup_recent=[jup(810, liquidity=LOW)],
+        jup_traded=[jup(811, liquidity=LOW)],
+        jup_organic=[jup(812, liquidity=LOW)]),
+        general=HIGH, new_listing=LOW)
+    s.check_true("a thin NEW LISTING is admitted by the lowered floor",
+                 make_address(810) in got)
+    s.check_true("the same thinness is still refused on top-traded",
+                 make_address(811) not in got)
+    s.check_true("and on organic", make_address(812) not in got)
+
+    print("\n[FLOOR] changing a floor invalidates the cache")
+    # Without this a settings edit appears to do nothing for up to the cache
+    # TTL, which reads as a broken control -- and gets 'fixed' by changing it
+    # again.
+    fresh()
+    handler = router(jup_traded=[jup(820, liquidity=LOW)])
+    first = asyncio.get_event_loop().run_until_complete(
+        td.discover_candidates(client_for(handler), min_liquidity_usd=HIGH))
+    s.check("the high floor excludes it", first, [])
+    second = asyncio.get_event_loop().run_until_complete(
+        td.discover_candidates(client_for(handler), min_liquidity_usd=LOW))
+    s.check_true("lowering the floor takes effect WITHOUT force_refresh",
+                 make_address(820) in second)
+    third = asyncio.get_event_loop().run_until_complete(
+        td.discover_candidates(client_for(handler), min_liquidity_usd=LOW))
+    s.check("an unchanged floor still serves the cache", third, second)
+
+    print("\n[FLOOR] absent settings mean the DEFAULT floor, never no floor")
+    fresh()
+    got = discover_with_floors(router(jup_traded=[jup(830, liquidity=100.0)]),
+                               general=None, new_listing=None)
+    s.check("a $100 pool is refused when settings are unreadable", got, [])
+
+    for name in ("JUPITER_MIN_LIQUIDITY_USD", "JUPITER_MIN_AGE_MINUTES",
+                 "JUPITER_MAX_AGE_MINUTES", "JUPITER_MIN_INTERVAL_S"):
+        setattr(td, name, SHIPPED[name])
+
     return s

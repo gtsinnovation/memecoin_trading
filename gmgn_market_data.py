@@ -55,6 +55,8 @@ from typing import Optional, Dict, Any, List
 
 import httpx
 
+import holder_concentration
+
 from market_data import (
     sanitize_external_text,
     onchain_flow_velocity_proxy,
@@ -334,10 +336,13 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
     if info is None:
         return None
 
-    social_score, price_impact = await asyncio.gather(
+    social_score, price_impact, chain = await asyncio.gather(
         fetch_social_volume_score(client, token_address),
         fetch_price_impact_pct(client, token_address),
+        holder_concentration.observe_chain(client, token_address),
     )
+    holder_fields = holder_concentration.snapshot_fields(
+        info["top_10_holder_percentage"], chain)
 
     return {
         "token_symbol": info["token_symbol"],
@@ -346,7 +351,6 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
         "pool_liquidity_usd": info["liquidity_usd"],
         "social_volume_score": social_score if social_score is not None else 0.0,
         "onchain_flow_velocity": onchain_flow_velocity_proxy(info["volume_h1"], info["liquidity_usd"]),
-        "top_10_holder_percentage": info["top_10_holder_percentage"] if info["top_10_holder_percentage"] is not None else 0.0,
         "estimated_slippage_percent": price_impact if price_impact is not None else 0.0,
         "onchain_volume_increasing": info["volume_h1"] * 24.0 > info["volume_h24"],
         # GMGN reports pool TVL like DexScreener, so the tradeable side is
@@ -364,7 +368,7 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
         "freeze_authority_renounced": None,
         "token_age_hours": None,
         "launchpad": None,
-        "_holder_data_missing": info["top_10_holder_percentage"] is None,
+        **holder_fields,
         "_slippage_data_missing": price_impact is None,
         "_social_data_missing": social_score is None,
         "_depth_data_missing": not info["liquidity_usd"],

@@ -78,6 +78,13 @@ CREATE TABLE IF NOT EXISTS app_settings (
     run_status VARCHAR(30) NOT NULL DEFAULT 'RUNNING',  -- RUNNING, PAUSED_MANUAL, PAUSED_KILL_SWITCH, PAUSED_DURATION_ELAPSED, SHUTDOWN_WATCHDOG
     run_status_reason TEXT,
     run_started_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    -- Discovery liquidity floors. NULL = use the configured default. Two of
+    -- them because newly-listed tokens and established ones cannot share a
+    -- floor: a 15-minute-old mint has no $25k pool, and a floor low enough to
+    -- catch one drags the breadth sources into the launchpad band. Clamped on
+    -- write -- see token_discovery.clamp_liquidity_floor and migrate.sql.
+    discovery_min_liquidity_usd NUMERIC,
+    discovery_new_listing_min_liquidity_usd NUMERIC,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT app_settings_singleton CHECK (id = 1)
 );
@@ -167,7 +174,23 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     txns_m5_buys INTEGER,
     txns_m5_sells INTEGER,
     price_change_m5 NUMERIC,
-    price_change_h1 NUMERIC
+    price_change_h1 NUMERIC,
+    -- Full refusal text. `rejected_by` above records only the gate, and
+    -- F_ATLAS refuses both for concentration over the ceiling and for
+    -- concentration it could not measure -- opposite problems. See
+    -- migrate.sql.
+    reject_reason TEXT,
+    -- Holder concentration, every way it was measured. Measurement only --
+    -- no gate reads these. holder_pct_provider is what the gate saw; the
+    -- chain columns are the alternative definitions observed alongside it.
+    -- NULL means the measurement failed; 0% concentration does not exist.
+    -- See holder_concentration.py and migrate.sql.
+    holder_concentration_source VARCHAR(20),
+    holder_pct_provider NUMERIC,
+    holder_pct_chain_raw NUMERIC,
+    holder_pct_chain_wallet NUMERIC,
+    holder_pct_chain_program NUMERIC,
+    holder_pct_chain_burn NUMERIC
 );
 CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades(status);
 CREATE INDEX IF NOT EXISTS idx_paper_trades_cohort ON paper_trades(cohort, entry_model);
@@ -242,3 +265,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_active_positions_one_per_token
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON trading_sessions(session_status);
 CREATE INDEX IF NOT EXISTS idx_alerts_dispatch ON system_alerts(is_dispatched) WHERE is_dispatched = FALSE;
 CREATE INDEX IF NOT EXISTS idx_closed_positions_closed_at ON closed_positions(closed_at);
+
+-- The holding pen for newly created pools. See migrate.sql for why it exists:
+-- Solana mints faster than any newest-first endpoint can span, so "new" and
+-- "liquid" have to be joined in memory. Ageing uses the CHAIN's timestamp,
+-- never our own clock.
+CREATE TABLE IF NOT EXISTS discovery_pen (
+    token_address VARCHAR(128) PRIMARY KEY,
+    pool_created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    first_seen_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    source VARCHAR(40),
+    released_at TIMESTAMP WITH TIME ZONE,
+    -- Recorded for EVERY examined token, passing or not: the distribution
+    -- that sets the floor includes the failures. See migrate.sql.
+    liquidity_at_release NUMERIC,
+    qualified BOOLEAN
+);
+CREATE INDEX IF NOT EXISTS ix_discovery_pen_due
+    ON discovery_pen(pool_created_at) WHERE released_at IS NULL;

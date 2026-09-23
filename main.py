@@ -31,6 +31,7 @@ try:
     )
     import market_data
     import token_discovery
+    import discovery_pen
     import paper_trading
     import app_time
 except Exception as import_error:
@@ -263,6 +264,7 @@ async def auth_logout(request: Request):
 NUMERIC_SETTINGS_FIELDS = {
     "max_total_capital_usd", "kill_switch_max_drawdown_pct",
     "kill_switch_max_loss_usd", "agent_timeout_seconds",
+    "discovery_min_liquidity_usd", "discovery_new_listing_min_liquidity_usd",
 }
 INT_SETTINGS_FIELDS = {"run_duration_minutes", "kill_switch_max_consecutive_losses"}
 
@@ -278,6 +280,12 @@ class SettingsUpdate(BaseModel):
     kill_switch_max_drawdown_pct: Optional[float] = None
     kill_switch_max_loss_usd: Optional[float] = None
     kill_switch_max_consecutive_losses: Optional[int] = None
+    # Discovery liquidity floors. Clamped on write rather than rejected, with
+    # the adjustment reported back -- see token_discovery.clamp_liquidity_floor.
+    discovery_min_liquidity_usd: Optional[float] = None
+    discovery_new_listing_min_liquidity_usd: Optional[float] = None
+    clear_discovery_min_liquidity_usd: bool = False
+    clear_discovery_new_listing_min_liquidity_usd: bool = False
     clear_max_total_capital_usd: bool = False
     clear_run_duration_minutes: bool = False
     clear_kill_switch_max_drawdown_pct: bool = False
@@ -353,6 +361,8 @@ async def api_update_settings(request: Request, payload: SettingsUpdate):
         "clear_kill_switch_max_drawdown_pct": "kill_switch_max_drawdown_pct",
         "clear_kill_switch_max_loss_usd": "kill_switch_max_loss_usd",
         "clear_kill_switch_max_consecutive_losses": "kill_switch_max_consecutive_losses",
+        "clear_discovery_min_liquidity_usd": "discovery_min_liquidity_usd",
+        "clear_discovery_new_listing_min_liquidity_usd": "discovery_new_listing_min_liquidity_usd",
     }
     cleared_fields = set()
     for clear_flag, target_field in clear_map.items():
@@ -365,12 +375,45 @@ async def api_update_settings(request: Request, payload: SettingsUpdate):
         "pnl_wallet_label", "show_realtime_balances", "agent_unresponsive_action",
         "agent_timeout_seconds", "kill_switch_max_drawdown_pct",
         "kill_switch_max_loss_usd", "kill_switch_max_consecutive_losses",
+        "discovery_min_liquidity_usd", "discovery_new_listing_min_liquidity_usd",
     ]
     for f in settable_fields:
         if f in cleared_fields:
             continue
         if data.get(f) is not None:
             fields[f] = data[f]
+
+    # Clamp the discovery floors to the range that keeps them a FRAME rather
+    # than a gate, and report any adjustment instead of applying it silently.
+    # A floor at or above $40,000 only offers tokens that already clear
+    # B_SENTINEL, so approval becomes a tautology and the rejected control arm
+    # disappears -- with every count still looking healthy. Someone who set
+    # 50000 and was never told needs to know the sample is no longer an
+    # experiment.
+    floor_notes = {}
+    for field in ("discovery_min_liquidity_usd", "discovery_new_listing_min_liquidity_usd"):
+        if field not in fields or fields[field] is None:
+            continue
+        clamped = token_discovery.clamp_liquidity_floor(fields[field])
+        if clamped is None:
+            return JSONResponse(
+                {"error": f"{field} must be a number"}, status_code=400)
+        value, note = clamped
+        fields[field] = value
+        if note:
+            floor_notes[field] = note
+
+    # The new-listing floor above the general one is not an error, but it is
+    # almost certainly not what was meant: it would hold brand-new tokens to a
+    # HARDER standard than established ones, which is the opposite of why the
+    # two floors exist.
+    general = fields.get("discovery_min_liquidity_usd")
+    new_listing = fields.get("discovery_new_listing_min_liquidity_usd")
+    if general is not None and new_listing is not None and new_listing > general:
+        floor_notes["discovery_new_listing_min_liquidity_usd"] = (
+            f"note: the new-listing floor (${new_listing:,.0f}) is ABOVE the general "
+            f"floor (${general:,.0f}), so newly listed tokens are held to a stricter "
+            f"standard than established ones -- the reverse of what the split is for")
 
     if not fields:
         return JSONResponse({"error": "no fields to update"}, status_code=400)
@@ -391,7 +434,10 @@ async def api_update_settings(request: Request, payload: SettingsUpdate):
     # this change on its very next tick rather than up to ~3s later.
     await asyncio.get_running_loop().run_in_executor(None, lambda: get_app_settings(force_refresh=True))
 
-    return JSONResponse(_serialize_settings_row(dict(row)))
+    out = _serialize_settings_row(dict(row))
+    if floor_notes:
+        out["notes"] = floor_notes
+    return JSONResponse(out)
 
 
 @app.post("/api/settings/resume")
@@ -490,6 +536,78 @@ def signer_request_or_reason(final_state: dict, enabled: bool):
     return {"token_address": token_address,
             "token_symbol": state.get("token_symbol"),
             "requested_usd": amount}, None
+
+
+def discovery_floors_from(settings_snapshot) -> tuple:
+    """(general_floor, new_listing_floor) from a settings row, or Nones.
+
+    None means "use the configured default", never "no floor at all". That
+    distinction is the whole point: an unreadable settings row must not
+    silently remove the frame that keeps the sample tradeable.
+
+    Values are clamped on the way OUT as well as on the way in, because a row
+    written before the bounds existed -- or edited directly in psql -- would
+    otherwise bypass them entirely.
+    """
+    if not settings_snapshot:
+        return None, None
+    out = []
+    for field in ("discovery_min_liquidity_usd", "discovery_new_listing_min_liquidity_usd"):
+        raw = None
+        try:
+            raw = settings_snapshot.get(field)
+        except AttributeError:
+            raw = None
+        if raw is None:
+            out.append(None)
+            continue
+        clamped = token_discovery.clamp_liquidity_floor(raw)
+        out.append(clamped[0] if clamped else None)
+    return tuple(out)
+
+
+async def _release_from_pen(client, new_listing_floor) -> list:
+    """Pen releases for this refresh. Never raises -- an empty pen must
+    degrade discovery, not stop the tick.
+
+    Passed to discover_candidates as a CALLABLE so it runs only when that
+    function actually refreshes. Draining the pen is destructive: examining a
+    token marks it once and forever, so doing it on every tick while
+    discovery served a cached list meant tokens were spent without ever being
+    offered."""
+    floor = (new_listing_floor if new_listing_floor is not None
+             else token_discovery.JUPITER_NEW_LISTING_MIN_LIQUIDITY_USD)
+    conn = None
+    try:
+        conn = await asyncpg.connect(dsn=DB_DSN)
+        return await discovery_pen.release_due(
+            conn, client,
+            # Examined partway INTO the window, not at its lower edge -- see
+            # PEN_EXAMINE_AGE_MINUTES. Measuring at the earliest eligible
+            # moment asks whether a token has grown before it has had time to.
+            min_age_minutes=discovery_pen.PEN_EXAMINE_AGE_MINUTES,
+            max_age_minutes=token_discovery.JUPITER_MAX_AGE_MINUTES,
+            floor_usd=float(floor))
+    except Exception as e:
+        logger.warning(f"Pen release failed: {type(e).__name__}: {e}")
+        return []
+    finally:
+        if conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+
+def _discovery_floors() -> tuple:
+    """Blocking settings read, for the executor. Never raises."""
+    try:
+        return discovery_floors_from(get_app_settings())
+    except Exception as e:
+        logger.warning(
+            f"Could not read discovery liquidity floors from settings ({e}) -- "
+            f"falling back to the configured defaults.")
+        return None, None
 
 
 def run_state_payload(settings_snapshot, run_duration_remaining_minutes=None) -> dict:
@@ -670,7 +788,28 @@ async def pipeline_executor_worker():
         try:
             candidates = WATCHLIST_TOKEN_ADDRESSES
             if not candidates and ENABLE_TOKEN_DISCOVERY:
-                candidates = await token_discovery.discover_candidates(http_client)
+                # The liquidity floors are read from settings on every tick
+                # rather than at import, so an edit on the settings page takes
+                # effect on the next refresh. discover_candidates() invalidates
+                # its own cache when the floors change -- without that, a
+                # change would appear to do nothing for up to the cache TTL,
+                # which reads as a broken setting.
+                #
+                # An unreadable settings row leaves both None, which means
+                # "use the configured default" -- NOT "no floor". A floor that
+                # silently disappeared would fill the sample with the
+                # launchpad band and nothing would look wrong.
+                floors = await asyncio.get_running_loop().run_in_executor(
+                    None, _discovery_floors)
+                # Tokens that have aged into the window AND grown into the
+                # floor. Released before the fetch so they lead the merged
+                # list -- they are the scarcest source and the only one that
+                # samples newly listed tokens at all.
+                candidates = await token_discovery.discover_candidates(
+                    http_client,
+                    min_liquidity_usd=floors[0],
+                    new_listing_min_liquidity_usd=floors[1],
+                    pen_supplier=lambda: _release_from_pen(http_client, floors[1]))
             if not candidates:
                 if not warned_empty_watchlist:
                     logger.warning(
@@ -932,9 +1071,45 @@ async def pipeline_executor_worker():
 
         await asyncio.sleep(3.0)
 
+async def discovery_pen_worker():
+    """Sweeps newly created pools into the pen on its own cadence.
+
+    Separate from the pipeline tick on purpose. Capture has to keep up with
+    the CHAIN's launch rate (~30 pools a minute, so one page of 60 spans two
+    minutes), while discovery refreshes every three. Sharing the tick's
+    cadence would punch holes in coverage that nothing downstream could see:
+    the pen would simply contain fewer tokens and still look healthy.
+    """
+    await asyncio.sleep(8.0)
+    client = httpx.AsyncClient()
+    while True:
+        conn = None
+        try:
+            conn = await asyncpg.connect(dsn=DB_DSN)
+            got = await discovery_pen.capture(conn, client)
+            removed = await discovery_pen.prune(conn)
+            info = await discovery_pen.stats(conn)
+            if info:
+                logger.info(
+                    f"Pen: {info.get('waiting', 0)} waiting, {info.get('total', 0)} held "
+                    f"(+{got['stored']}/{got['seen']} this sweep, -{removed} pruned, "
+                    f"oldest {float(info.get('oldest_minutes') or 0):.0f} min).")
+        except Exception as e:
+            logger.warning(f"Pen capture cycle failed: {type(e).__name__}: {e}")
+        finally:
+            if conn is not None:
+                try:
+                    await conn.close()
+                except Exception:
+                    pass
+        await asyncio.sleep(discovery_pen.PEN_CAPTURE_INTERVAL_S)
+
+
 @app.on_event("startup")
 def start_pipeline_loops():
     asyncio.create_task(pipeline_executor_worker())
+    if ENABLE_TOKEN_DISCOVERY:
+        asyncio.create_task(discovery_pen_worker())
 
 @app.websocket("/ws/metrics")
 async def websocket_route(websocket: WebSocket):
@@ -1169,6 +1344,44 @@ async def get_dashboard_interface(request: Request):
                         </div>
                     </div>
 
+                    <div class="border-t border-slate-800 pt-3 mt-1">
+                        <div class="text-slate-300 font-medium mb-1">Discovery liquidity floors</div>
+                        <p class="text-slate-500 text-[10px] leading-relaxed mb-2">
+                            The minimum pool liquidity a token needs to enter the sample. This is a
+                            frame, not a gate &mdash; the agent&rsquo;s own gates still decide. Newly
+                            listed tokens get their own, lower floor, because a coin fifteen minutes
+                            old has not built a $25,000 pool yet and the general floor admits none of
+                            them. Both are clamped to a safe range on save; if a value is moved you
+                            will be told why.
+                        </p>
+                        <div class="space-y-2">
+                            <div class="flex items-center justify-between gap-2">
+                                <label class="text-slate-400">General (trending, top-traded)</label>
+                                <div class="flex items-center gap-1">
+                                    <span class="text-slate-500">$</span>
+                                    <input id="set-liq-floor" type="number" min="5000" max="38000" step="500"
+                                           class="w-28 bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-slate-100"
+                                           placeholder="Default">
+                                </div>
+                            </div>
+                            <div class="flex items-center justify-between gap-2">
+                                <label class="text-slate-400">New listings (memecoins, fresh mints)</label>
+                                <div class="flex items-center gap-1">
+                                    <span class="text-slate-500">$</span>
+                                    <input id="set-liq-floor-new" type="number" min="5000" max="38000" step="500"
+                                           class="w-28 bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-slate-100"
+                                           placeholder="Default">
+                                </div>
+                            </div>
+                            <p class="text-slate-600 text-[10px]">
+                                Leave blank for the configured defaults. Changing either restarts the
+                                population being sampled, so results from before and after are not
+                                one experiment.
+                            </p>
+                        </div>
+                    </div>
+
+                    <div id="settings-note" class="hidden text-amber-400 text-[10px] leading-relaxed"></div>
                     <div id="settings-error" class="hidden text-rose-400 text-[10px]"></div>
                 </div>
                 <div class="flex justify-end gap-2 p-5 border-t border-slate-800">
@@ -1268,10 +1481,13 @@ async def get_dashboard_interface(request: Request):
                 document.getElementById('set-kill-loss-nolimit').checked = s.kill_switch_max_loss_usd == null;
                 document.getElementById('set-kill-streak').value = s.kill_switch_max_consecutive_losses ?? '';
                 document.getElementById('set-kill-streak-nolimit').checked = s.kill_switch_max_consecutive_losses == null;
+                document.getElementById('set-liq-floor').value = s.discovery_min_liquidity_usd ?? '';
+                document.getElementById('set-liq-floor-new').value = s.discovery_new_listing_min_liquidity_usd ?? '';
             }
 
             function openSettingsModal() {
                 document.getElementById('settings-error').classList.add('hidden');
+                document.getElementById('settings-note').classList.add('hidden');
                 fetchSettings().then(s => { if (s) populateSettingsForm(s); });
                 document.getElementById('settings-modal').classList.remove('hidden');
             }
@@ -1311,6 +1527,23 @@ async def get_dashboard_interface(request: Request):
                     clear_kill_switch_max_consecutive_losses: noStreak,
                 };
 
+                // An empty box means "use the configured default", which is a
+                // CLEAR, not a zero. Sending 0 would be a floor of zero -- no
+                // frame at all -- and the server would clamp it up to the
+                // minimum, which is not what an empty box asked for.
+                const liqRaw = document.getElementById('set-liq-floor').value.trim();
+                const liqNewRaw = document.getElementById('set-liq-floor-new').value.trim();
+                if (liqRaw === '') {
+                    payload.clear_discovery_min_liquidity_usd = true;
+                } else {
+                    payload.discovery_min_liquidity_usd = parseFloat(liqRaw);
+                }
+                if (liqNewRaw === '') {
+                    payload.clear_discovery_new_listing_min_liquidity_usd = true;
+                } else {
+                    payload.discovery_new_listing_min_liquidity_usd = parseFloat(liqNewRaw);
+                }
+
                 try {
                     const res = await fetch('/api/settings', {
                         method: 'POST',
@@ -1326,6 +1559,20 @@ async def get_dashboard_interface(request: Request):
                     currentSettings = body;
                     balanceVisibilityTouched = true;
                     applyBalanceVisibility(!!body.show_realtime_balances);
+                    // A clamped floor is NOT an error, but it means the saved
+                    // value is not the typed one. Closing the dialog on a
+                    // silent adjustment would leave someone believing they are
+                    // sampling a population they are not, so the dialog stays
+                    // open with the reason until they have seen it.
+                    if (body.notes && Object.keys(body.notes).length) {
+                        const noteEl = document.getElementById('settings-note');
+                        noteEl.innerHTML = Object.values(body.notes)
+                            .map(t => '&bull; ' + t).join('<br>');
+                        noteEl.classList.remove('hidden');
+                        populateSettingsForm(body);
+                        return;
+                    }
+                    document.getElementById('settings-note').classList.add('hidden');
                     closeSettingsModal();
                 } catch (e) {
                     errEl.innerText = 'Failed to save settings: ' + e;

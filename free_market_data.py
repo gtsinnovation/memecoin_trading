@@ -49,6 +49,8 @@ from typing import Optional, Dict, Any, List
 
 import httpx
 
+import holder_concentration
+
 from market_data import (
     sanitize_external_text,
     onchain_flow_velocity_proxy,
@@ -248,10 +250,11 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
     if dex_data is None:
         return None
 
-    rug, jup, price_impact = await asyncio.gather(
+    rug, jup, price_impact, chain = await asyncio.gather(
         fetch_rugcheck_report(client, token_address),
         fetch_jupiter_token_data(client, token_address),
         fetch_price_impact_pct(client, token_address),
+        holder_concentration.observe_chain(client, token_address),
     )
     rug = rug or {}
     jup = jup or {}
@@ -276,7 +279,14 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
                 f"that's the pool the slippage estimate is quoted against."
             )
 
+    # RugCheck's figure is this provider's reading. The chain measurements
+    # ride alongside it, unused by any gate, so the wallet-vs-RugCheck gap
+    # accumulates on the real token population -- that comparison is what
+    # decides whether the 30% ceiling can be reused under a chain
+    # definition, and it cannot be answered from RugCheck alone because the
+    # tokens RugCheck has no record of are precisely the ones in question.
     holder_pct = rug.get("top_10_holder_percentage")
+    holder_fields = holder_concentration.snapshot_fields(holder_pct, chain)
 
     return {
         # --- the original contract, unchanged ---
@@ -286,7 +296,6 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
         "pool_liquidity_usd": tvl_usd,
         "social_volume_score": 0.0,   # still unsolved by any free source
         "onchain_flow_velocity": onchain_flow_velocity_proxy(dex_data["volume_h1"], tvl_usd),
-        "top_10_holder_percentage": holder_pct if holder_pct is not None else 0.0,
         "estimated_slippage_percent": price_impact if price_impact is not None else 0.0,
         "onchain_volume_increasing": dex_data["volume_h1"] * 24.0 > dex_data["volume_h24"],
 
@@ -324,7 +333,7 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
         "launchpad": jup.get("launchpad"),
 
         # --- flags: main.py pops these before the agent network sees them ---
-        "_holder_data_missing": holder_pct is None,
+        **holder_fields,
         "_slippage_data_missing": price_impact is None,
         "_social_data_missing": True,   # no free source; see README
         "_depth_data_missing": tradeable_depth is None,

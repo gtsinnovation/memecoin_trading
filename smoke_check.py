@@ -71,6 +71,44 @@ try:
 except Exception as e:
     check(f"shared modules import ({type(e).__name__}: {e})", False)
 
+print("\nHolder concentration: one definition, one ceiling")
+try:
+    import holder_concentration as hc
+    check("holder_concentration imports in this image", True)
+    check("the ceiling is the gate's ceiling",
+          hc.TOP10_CONCENTRATION_CEILING_PERCENT > 0,
+          f"{hc.TOP10_CONCENTRATION_CEILING_PERCENT}%")
+    check("the gate reads the shared ceiling, not a literal",
+          engine.node_F_ATLAS.__code__.co_consts is not None
+          and "holder_concentration" in engine.node_F_ATLAS.__globals__,
+          f"source={hc.CONCENTRATION_SOURCE}")
+    # The failure this pairing prevents: an unmeasured token reading as
+    # perfectly distributed.
+    absent = hc.snapshot_fields(None, None)
+    check("an unmeasured concentration is flagged, never passed as 0",
+          absent["_holder_data_missing"] is True)
+    check("F_ATLAS refuses an unmeasured token",
+          bool(engine.node_F_ATLAS({"token_symbol": "S", "holder_data_missing": True})
+               .get("termination_reason")))
+    # Every provider key must be declared in the graph state or invoke() dies.
+    import typing
+    declared = set(typing.get_type_hints(engine.AgentNetworkState).keys())
+    emitted = {k for k in hc.snapshot_fields(1.0, None) if not k.startswith("_")}
+    check("every provider key is declared in the graph state",
+          not (emitted - declared), f"undeclared: {sorted(emitted - declared)}")
+    # The distinction the wallet definition rests on: a PDA is off the
+    # ed25519 curve, so a signer-only pool authority with no account cannot
+    # be mistaken for a never-written-to wallet.
+    check("a program-derived address is not counted as a wallet",
+          not hc.is_on_curve("1nc1nerator11111111111111111111111111111111"))
+    check("a keypair address is counted as a wallet",
+          hc.is_on_curve("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"))
+    check("the RPC credential is not in the URL",
+          "token" not in hc.SOLANA_RPC_URL.lower(),
+          "x-token header set" if hc.SOLANA_RPC_X_TOKEN else "no x-token configured")
+except Exception as e:
+    check(f"holder_concentration wiring ({type(e).__name__}: {e})", False)
+
 print("\n" + "=" * 70)
 if FAILURES:
     print(f"{len(FAILURES)} FIX(ES) NOT LIVE IN THIS BUILD:")

@@ -59,6 +59,11 @@ services:
       # The :- default stops compose warning on every command.
       - WATCHLIST_TOKEN_ADDRESSES=${WATCHLIST_TOKEN_ADDRESSES:-}
       - SOLANA_RPC_URL=${SOLANA_RPC_URL:-https://api.mainnet.solana.com}
+      # Header auth for a paid RPC. Use the plain hostname in
+      # SOLANA_RPC_URL and put the credential here -- never a
+      # path-style URL with the token embedded, which would be
+      # echoed into logs and alert rows.
+      - SOLANA_RPC_X_TOKEN=${SOLANA_RPC_X_TOKEN:-}
       - JUPITER_API_BASE=${JUPITER_API_BASE:-https://api.jup.ag}
       - DEXSCREENER_API_BASE=${DEXSCREENER_API_BASE:-https://api.dexscreener.com}
       - SLIPPAGE_PROBE_USD=${SLIPPAGE_PROBE_USD:-500}
@@ -70,6 +75,15 @@ services:
       # or "gmgn" (bot-blocked in practice). All are read-only: no signing
       # key, no wallet, no custody. See .env.example.
       - MARKET_DATA_PROVIDER=${MARKET_DATA_PROVIDER:-free}
+      # Which holder-concentration measurement F_ATLAS gates on. Defaults
+      # to 'provider' -- exactly the behaviour that has been running -- so
+      # wiring holder_concentration.py in changes no verdict. Move it to
+      # chain_wallet or chain_raw only against the calibration data, and
+      # recheck the ceiling when you do: the ceiling is calibrated to one
+      # definition and means nothing applied to another.
+      - HOLDER_CONCENTRATION_SOURCE=${HOLDER_CONCENTRATION_SOURCE:-provider}
+      - HOLDER_CONCENTRATION_OBSERVE=${HOLDER_CONCENTRATION_OBSERVE:-true}
+      - TOP10_CONCENTRATION_CEILING_PERCENT=${TOP10_CONCENTRATION_CEILING_PERCENT:-30.0}
       - GMGN_API_KEY=${GMGN_API_KEY:-}
       - GMGN_HOT_SEARCH_INTERVAL=${GMGN_HOT_SEARCH_INTERVAL:-1h}
       - GMGN_HOT_SEARCH_CACHE_TTL_S=${GMGN_HOT_SEARCH_CACHE_TTL_S:-300}
@@ -80,6 +94,29 @@ services:
       # forwards only what it names: omit this line and the key is invisible
       # inside the container, which looks identical to a rejected key.
       - BIRDEYE_API_KEY=${BIRDEYE_API_KEY:-}
+      # Jupiter: the keyless primary discovery source. Birdeye's free tier
+      # exhausts its compute-unit budget under a three-minute refresh and then
+      # 400s every endpoint, so the liquidity-filtered sample cannot depend on
+      # it. See token_discovery.py.
+      - JUPITER_TOKENS_API_BASE=${JUPITER_TOKENS_API_BASE:-https://lite-api.jup.ag}
+      - JUPITER_MIN_LIQUIDITY_USD=${JUPITER_MIN_LIQUIDITY_USD:-25000}
+      # The separate, lower floor for newly listed tokens, and the hard
+      # lower bound any user-set floor is clamped to. Both are read by
+      # token_discovery, so both must be named here -- compose forwards
+      # only what it lists, and a knob that silently keeps its code
+      # default is a setting that appears to do nothing.
+      - JUPITER_NEW_LISTING_MIN_LIQUIDITY_USD=${JUPITER_NEW_LISTING_MIN_LIQUIDITY_USD:-8000}
+      - DISCOVERY_FLOOR_MIN_USD=${DISCOVERY_FLOOR_MIN_USD:-5000}
+      # The holding pen. Capture has to keep up with the chain's launch
+      # rate, not with the discovery refresh -- one page of new_pools spans
+      # about two minutes, so a 60s sweep of two pages is ~4x redundancy.
+      - PEN_CAPTURE_INTERVAL_S=${PEN_CAPTURE_INTERVAL_S:-60}
+      - PEN_CAPTURE_PAGES=${PEN_CAPTURE_PAGES:-4}
+      - PEN_BATCH_SIZE=${PEN_BATCH_SIZE:-30}
+      - PEN_RETENTION_MINUTES=${PEN_RETENTION_MINUTES:-360}
+      - JUPITER_MIN_AGE_MINUTES=${JUPITER_MIN_AGE_MINUTES:-15}
+      - JUPITER_MAX_AGE_MINUTES=${JUPITER_MAX_AGE_MINUTES:-90}
+      - JUPITER_MIN_INTERVAL_S=${JUPITER_MIN_INTERVAL_S:-1.1}
       - BIRDEYE_API_BASE=${BIRDEYE_API_BASE:-https://public-api.birdeye.so}
       # Triton One (read-only Solana RPC). NOT a discovery source -- it has no
       # trending or new-listing endpoint. It is the layer underneath the

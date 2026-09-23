@@ -168,6 +168,86 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
         # True median of {1800, 100} is 950. Fanned out it would be pulled to 1800.
         s.check("median is over trades, not over marks", med, 950.0)
         s.check_true("not dragged to the marked token's value", med != 1800.0)
+
+        print("\n[REJECT REASON] the gate name alone cannot say WHY")
+        # F_ATLAS refuses for two unrelated reasons and both record
+        # rejected_by='F_ATLAS'. One is the gate working; the other is a
+        # data-coverage problem. Separating them used to require joining
+        # system_alerts.message by timestamp, which is guesswork the moment two
+        # tokens are evaluated in the same second.
+        conc = make_address(510)
+        unmeasured = make_address(511)
+        over = ("F_ATLAS: Short-circuit. Top 10 wallets hold 61.4%, "
+                "violating the 30.0% ceiling.")
+        absent = ("F_ATLAS: Short-circuit. Holder-concentration data unavailable -- "
+                  "refusing rather than treating an unmeasured token as well distributed.")
+        rec(_snap(conc), {"termination_reason": over})
+        rec(_snap(unmeasured), {"termination_reason": absent})
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT rejected_by FROM paper_trades "
+                        "WHERE token_address IN (%s, %s);", (conc, unmeasured))
+            s.check("both refusals are the same gate", sorted(r[0] for r in cur.fetchall()),
+                    ["F_ATLAS"])
+            cur.execute("SELECT reject_reason FROM paper_trades WHERE token_address=%s "
+                        "LIMIT 1;", (conc,))
+            s.check("the concentration refusal keeps its full text", cur.fetchone()[0], over)
+            cur.execute("SELECT count(*) FROM paper_trades "
+                        "WHERE token_address IN (%s, %s) AND rejected_by = 'F_ATLAS' "
+                        "AND reject_reason LIKE %s;",
+                        (conc, unmeasured, "%unavailable%"))
+            # Two rows: record_candidate writes one per entry model, and only the
+            # unmeasured token's reason matches.
+            s.check("the two F_ATLAS refusals are now separable by reason",
+                    int(cur.fetchone()[0]), 2)
+
+        ok = make_address(512)
+        rec(_snap(ok))
+        with conn.cursor() as cur:
+            cur.execute("SELECT cohort, reject_reason FROM paper_trades "
+                        "WHERE token_address=%s LIMIT 1;", (ok,))
+            row = cur.fetchone()
+            s.check("an approved candidate is APPROVED", row[0], "APPROVED")
+            s.check("an approved candidate carries no reason", row[1], None)
+
+        print("\n[CONCENTRATION] every measurement is recorded, absences as NULL")
+        obs = make_address(520)
+        snap = _snap(obs)
+        snap.update({"holder_concentration_source": "provider",
+                     "holder_concentration_provider_pct": 12.5,
+                     "holder_concentration_raw_pct": 70.0,
+                     "holder_concentration_wallet_pct": 20.0,
+                     "holder_concentration_program_pct": 40.0,
+                     "holder_concentration_burn_pct": 10.0})
+        rec(snap)
+        with conn.cursor() as cur:
+            cur.execute("SELECT holder_concentration_source, holder_pct_provider, "
+                        "holder_pct_chain_raw, holder_pct_chain_wallet, "
+                        "holder_pct_chain_program, holder_pct_chain_burn "
+                        "FROM paper_trades WHERE token_address=%s LIMIT 1;", (obs,))
+            row = cur.fetchone()
+            s.check("the source the gate used is recorded", row[0], "provider")
+            s.check("what the gate saw is recorded", float(row[1]), 12.5)
+            s.check("the raw chain alternative is recorded", float(row[2]), 70.0)
+            s.check("the wallet-only alternative is recorded", float(row[3]), 20.0)
+            s.check_true("the gap the definition decision rests on is computable",
+                         abs(float(row[2]) - float(row[3]) - 50.0) < 1e-9)
+
+        # A failed chain measurement must land as NULL. Stored as 0 it would read
+        # as a perfectly distributed token in every query that ever averages
+        # these columns -- the same fabrication the gate's missing-data branch
+        # exists to prevent, one layer down.
+        nochain = make_address(521)
+        snap = _snap(nochain)
+        snap.update({"holder_concentration_source": "provider",
+                     "holder_concentration_provider_pct": 9.0,
+                     "holder_concentration_raw_pct": None,
+                     "holder_concentration_wallet_pct": None})
+        rec(snap)
+        with conn.cursor() as cur:
+            cur.execute("SELECT holder_pct_chain_raw, holder_pct_chain_wallet "
+                        "FROM paper_trades WHERE token_address=%s LIMIT 1;", (nochain,))
+            s.check("an unmeasured chain figure is NULL, not 0", list(cur.fetchone()),
+                    [None, None])
     finally:
         conn.close()
     
