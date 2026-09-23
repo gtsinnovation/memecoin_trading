@@ -105,8 +105,21 @@ JUPITER_MIN_LIQUIDITY_USD = float(os.environ.get("JUPITER_MIN_LIQUIDITY_USD", "2
 # mints would also drag the breadth sources down into the launchpad band,
 # where a "price" is one trade old. Separating them keeps each source sampling
 # the population it is meant to.
+# $20,000, chosen from the pen's own measurements rather than guessed. The
+# 8000 that sat here before was picked before any data existed.
+#
+# The floor does NOT select the approved cohort -- B_SENTINEL needs $20,000 of
+# tradeable depth, which is $40,000 of liquidity, so everything below that is
+# rejected downstream whatever discovery admits. What the floor selects is the
+# CONTROL arm, and that is why it matters: a rejected cohort made of tokens
+# with $3 in the pool is not a counterfactual, it is noise that never traded.
+#
+# Measured on 239 newly created pools at thirty minutes old: p25 $3, median
+# $2,161, p75 $33,835. Half of them are corpses. A floor at $20,000 puts the
+# control arm at $20k-$40k -- live tokens refused on depth -- and keeps the
+# dead mass out of a sample that only has ~190 evaluation slots an hour.
 JUPITER_NEW_LISTING_MIN_LIQUIDITY_USD = float(
-    os.environ.get("JUPITER_NEW_LISTING_MIN_LIQUIDITY_USD", "8000"))
+    os.environ.get("JUPITER_NEW_LISTING_MIN_LIQUIDITY_USD", "20000"))
 
 # --- The bounds any user-set floor is held to ------------------------------
 #

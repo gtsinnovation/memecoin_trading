@@ -105,7 +105,7 @@ services:
       # token_discovery, so both must be named here -- compose forwards
       # only what it lists, and a knob that silently keeps its code
       # default is a setting that appears to do nothing.
-      - JUPITER_NEW_LISTING_MIN_LIQUIDITY_USD=${JUPITER_NEW_LISTING_MIN_LIQUIDITY_USD:-8000}
+      - JUPITER_NEW_LISTING_MIN_LIQUIDITY_USD=${JUPITER_NEW_LISTING_MIN_LIQUIDITY_USD:-20000}
       - DISCOVERY_FLOOR_MIN_USD=${DISCOVERY_FLOOR_MIN_USD:-5000}
       # The holding pen. Capture has to keep up with the chain's launch
       # rate, not with the discovery refresh -- one page of new_pools spans
