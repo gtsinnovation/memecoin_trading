@@ -1,0 +1,159 @@
+
+=== 1. PLUMBING: is anything being recorded, and is dedup holding? ===
+ rows | tokens | rows_per_token | rows_per_token_per_hour |       first_seen        |        last_seen        
+------+--------+----------------+-------------------------+-------------------------+-------------------------
+ 1390 |    422 |           3.29 |                    0.30 | 2026-09-22 22:48:10 EDT | 2026-09-23 09:38:54 EDT
+(1 row)
+
+
+=== 2. PLUMBING: are the new columns actually populating? ===
+ immediate_rows | pct_vol_h1 | pct_txns_h1 | pct_txns_m5 | pct_vol_m5 | pct_chg_m5 | pct_depth 
+----------------+------------+-------------+-------------+------------+------------+-----------
+            695 |        100 |         100 |         100 |        100 |         81 |       100
+(1 row)
+
+
+=== 3. CANDIDATE QUALITY: are these tokens actually trading? ===
+  cohort  | tokens | no_txns | txns_unknown | no_txn_pct | median_txns_h1 | median_vol_h1 | median_depth 
+----------+--------+---------+--------------+------------+----------------+---------------+--------------
+ APPROVED |     96 |       1 |            0 |          1 |            310 |         78451 |       139805
+ REJECTED |    347 |       5 |            0 |          1 |            285 |         41375 |        26043
+(2 rows)
+
+
+=== 3b. DROPOUT: trades abandoned because the token stopped pricing ===
+  cohort  | entry_model | abandoned | tokens 
+----------+-------------+-----------+--------
+ APPROVED | IMMEDIATE   |        12 |     12
+ REJECTED | IMMEDIATE   |        52 |     52
+ REJECTED | LIMIT       |         2 |      2
+(3 rows)
+
+
+=== 4. STALENESS: how much of the sample is a repeated stale quote? ===
+  cohort  | marks | zero_returns | zero_pct 
+----------+-------+--------------+----------
+ APPROVED |   447 |            6 |        1
+ REJECTED |  1435 |          144 |       10
+(2 rows)
+
+
+=== 5. HORIZON RETURNS by cohort -- the measurement that matters ===
+ mins |  cohort  | tokens | marks |   mean   | median |   stdev   |    se    |   net    | pct_assumed | pct_up 
+------+----------+--------+-------+----------+--------+-----------+----------+----------+-------------+--------
+   30 | APPROVED |     95 |   158 |    81.78 |   0.79 |    689.17 |    70.71 |    79.44 |           0 |     71
+   30 | REJECTED |    334 |   508 | 39094.95 |   0.09 | 714310.35 | 39085.32 | 39065.66 |          12 |     51
+   60 | APPROVED |     95 |   155 |    84.54 |   1.06 |    690.61 |    70.86 |    82.20 |           0 |     69
+   60 | REJECTED |    324 |   494 |    31.81 |   0.00 |    329.73 |    18.32 |     1.78 |          12 |     47
+  120 | APPROVED |     88 |   134 |    99.55 |   2.31 |    716.84 |    76.42 |    97.19 |           0 |     75
+  120 | REJECTED |    305 |   433 |  3386.68 |   0.00 |  58466.94 |  3347.81 |  3356.41 |          11 |     47
+(6 rows)
+
+
+=== 5c. THE DECISION NUMBER: approved minus rejected, against its error ===
+ mins | approved_tokens | rejected_tokens | approved_minus_rejected | se_of_gap | t_stat | verdict 
+------+-----------------+-----------------+-------------------------+-----------+--------+---------
+   30 |              95 |             334 |               -39013.17 |  39085.39 |  -1.00 | noise
+   60 |              95 |             324 |                   52.72 |     73.18 |   0.72 | noise
+  120 |              88 |             305 |                -3287.13 |   3348.68 |  -0.98 | noise
+(3 rows)
+
+
+=== 5b. Same as 5, but LIVE tokens only (>= 50 txns in the hour) ===
+ mins |  cohort  | tokens | marks |  mean   | median |  stdev   |   se    
+------+----------+--------+-------+---------+--------+----------+---------
+   30 | APPROVED |     90 |   144 |   86.30 |   0.96 |   707.99 |   74.63
+   30 | REJECTED |    264 |   406 |   12.55 |   2.40 |    98.72 |    6.08
+   60 | APPROVED |     90 |   141 |   89.21 |   1.15 |   709.45 |   74.78
+   60 | REJECTED |    255 |   393 |   41.15 |   1.28 |   371.18 |   23.24
+  120 | APPROVED |     84 |   125 |  104.20 |   2.34 |   733.58 |   80.04
+  120 | REJECTED |    238 |   344 | 4341.09 |   2.49 | 66186.08 | 4290.21
+(6 rows)
+
+=== 6. FEATURE CORRELATIONS (Spearman) -- hypotheses, not findings ===
+ mins |     feature     |  n  | tokens |  rho   | verdict 
+------+-----------------+-----+--------+--------+---------
+   30 | m5_buy_share    | 580 |    348 |  0.232 | maybe
+   30 | h1_buy_share    | 657 |    405 |  0.225 | maybe
+   30 | price_chg_h1    | 615 |    375 |  0.160 | maybe
+   30 | depth_usd       | 666 |    408 | -0.128 | maybe
+   30 | price_chg_m5    | 539 |    335 |  0.125 | maybe
+   30 | slippage_pct    | 592 |    385 | -0.114 | maybe
+   30 | txns_m5_total   | 666 |    408 |  0.087 | noise
+   30 | volume_m5_usd   | 666 |    408 |  0.076 | noise
+   30 | capital_per_txn | 657 |    405 | -0.061 | noise
+   30 | txns_h1         | 666 |    408 |  0.027 | noise
+   60 | h1_buy_share    | 640 |    395 |  0.233 | maybe
+   60 | m5_buy_share    | 563 |    338 |  0.190 | maybe
+   60 | slippage_pct    | 577 |    376 | -0.170 | maybe
+   60 | price_chg_m5    | 522 |    325 |  0.137 | maybe
+   60 | price_chg_h1    | 598 |    365 |  0.127 | maybe
+   60 | depth_usd       | 649 |    398 | -0.076 | noise
+   60 | volume_m5_usd   | 649 |    398 |  0.047 | noise
+   60 | capital_per_txn | 640 |    395 |  0.020 | noise
+   60 | txns_m5_total   | 649 |    398 |  0.013 | noise
+   60 | txns_h1         | 649 |    398 | -0.012 | noise
+  120 | h1_buy_share    | 560 |    371 |  0.253 | maybe
+  120 | m5_buy_share    | 492 |    317 |  0.179 | maybe
+  120 | slippage_pct    | 512 |    356 | -0.177 | maybe
+  120 | price_chg_h1    | 525 |    343 |  0.093 | noise
+  120 | volume_m5_usd   | 567 |    375 |  0.087 | noise
+  120 | depth_usd       | 567 |    375 | -0.083 | noise
+  120 | price_chg_m5    | 458 |    303 |  0.072 | noise
+  120 | capital_per_txn | 560 |    371 |  0.061 | noise
+  120 | txns_m5_total   | 567 |    375 |  0.031 | noise
+  120 | txns_h1         | 567 |    375 |  0.011 | noise
+(30 rows)
+
+
+=== 7. WHY CANDIDATES ARE REFUSED -- per gate, and within F_ATLAS ===
+    gate    |      kind       | tokens | pct  
+------------+-----------------+--------+------
+ B_SENTINEL | failed the rule |    201 | 44.4
+ (approved) |                 |     96 | 21.2
+ G_ANCHOR   | failed the rule |     48 | 10.6
+ F_ATLAS    | failed the rule |     42 |  9.3
+ E_BREADTH  | failed the rule |     40 |  8.8
+ G_ANCHOR   | unmeasurable    |     24 |  5.3
+ F_ATLAS    | unmeasurable    |      1 |  0.2
+ C_VECTOR   | failed the rule |      1 |  0.2
+(8 rows)
+
+
+=== 8. HOLDER CONCENTRATION: how far apart are the three definitions? ===
+ tokens | provider_covered_pct | chain_covered_pct | median_provider | median_wallet | median_raw | median_raw_minus_wallet | median_wallet_minus_provider 
+--------+----------------------+-------------------+-----------------+---------------+------------+-------------------------+------------------------------
+    422 |                   43 |               100 |            57.9 |          16.8 |       71.8 |                    18.0 |                        -15.9
+(1 row)
+
+
+=== 8b. How many tokens would each definition reject at the ceiling? ===
+  definition  | measured | unmeasurable | over_ceiling | would_refuse_pct 
+--------------+----------+--------------+--------------+------------------
+ chain_wallet |      421 |            1 |          114 |               27
+ chain_raw    |      421 |            1 |          307 |               73
+ provider     |      183 |          239 |          123 |               86
+(3 rows)
+
+
+=== 9. THE TWO POPULATIONS -- never pool these ===
+ population  |  cohort  | tokens | median_depth | median_txns_h1 
+-------------+----------+--------+--------------+----------------
+ breadth     | APPROVED |     40 |       210381 |            221
+ breadth     | REJECTED |     80 |       137306 |            222
+ holding-pen | APPROVED |     56 |        79460 |           2660
+ holding-pen | REJECTED |    269 |        14837 |           1783
+(4 rows)
+
+
+=== 9b. THE DECISION NUMBER, PER POPULATION ===
+ population  | mins | approved_tokens | rejected_tokens | approved_minus_rejected | se_of_gap | verdict 
+-------------+------+-----------------+-----------------+-------------------------+-----------+---------
+ breadth     |   30 |              40 |              79 |                   -0.06 |      1.21 | noise
+ breadth     |   60 |              40 |              79 |                    0.72 |      1.19 | noise
+ breadth     |  120 |              39 |              75 |                    1.33 |      2.29 | noise
+ holding-pen |   30 |              55 |             256 |               -50865.39 |  50994.27 | noise
+ holding-pen |   60 |              55 |             246 |                  104.05 |    124.53 | noise
+ holding-pen |  120 |              49 |             231 |                -4292.69 |   4422.32 | noise
+(6 rows)
+

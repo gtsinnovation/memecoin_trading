@@ -190,7 +190,10 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     holder_pct_chain_raw NUMERIC,
     holder_pct_chain_wallet NUMERIC,
     holder_pct_chain_program NUMERIC,
-    holder_pct_chain_burn NUMERIC
+    holder_pct_chain_burn NUMERIC,
+    -- 'holding-pen' (a newly created pool) or 'breadth' (an established
+    -- token from a trending list). Different populations; see migrate.sql.
+    discovery_source VARCHAR(20)
 );
 CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades(status);
 CREATE INDEX IF NOT EXISTS idx_paper_trades_cohort ON paper_trades(cohort, entry_model);

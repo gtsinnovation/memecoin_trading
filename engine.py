@@ -80,6 +80,10 @@ class AgentNetworkState(TypedDict):
     holder_concentration_wallet_pct: Optional[float]
     holder_concentration_program_pct: Optional[float]
     holder_concentration_burn_pct: Optional[float]
+    # 'holding-pen' or 'breadth'. Measurement only -- no node reads it, but
+    # the provider snapshot IS the graph input, so an undeclared key is one
+    # LangGraph rejects and that kills every tick.
+    discovery_source: Optional[str]
     slippage_data_missing: bool
     onchain_volume_increasing: bool
     is_liquidity_safe: bool

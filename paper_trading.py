@@ -396,13 +396,15 @@ def record_candidate(conn, snapshot: Dict[str, Any], final_state: Dict[str, Any]
                     reject_reason,
                     holder_concentration_source, holder_pct_provider,
                     holder_pct_chain_raw, holder_pct_chain_wallet,
-                    holder_pct_chain_program, holder_pct_chain_burn
+                    holder_pct_chain_program, holder_pct_chain_burn,
+                    discovery_source
                 ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                           CASE WHEN %s IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END,
                           %s, CURRENT_TIMESTAMP, %s, %s, %s, %s, %s,
                           %s, %s, %s, %s, %s,
                           %s,
-                          %s, %s, %s, %s, %s, %s);
+                          %s, %s, %s, %s, %s, %s,
+                          %s);
                 """, (
                     token_address, snapshot.get("token_symbol"),
                     cohort, rejected_by, entry_model, status,
@@ -419,6 +421,7 @@ def record_candidate(conn, snapshot: Dict[str, Any], final_state: Dict[str, Any]
                     reject_reason,
                     holder_source, holder_provider,
                     holder_raw, holder_wallet, holder_program, holder_burn,
+                    snapshot.get("discovery_source"),
                 ))
             except Exception as e:
                 cur.execute("ROLLBACK TO SAVEPOINT paper_row;")

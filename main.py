@@ -3,6 +3,7 @@ import os
 import secrets
 import asyncio
 import json
+import collections
 import random
 import logging
 import sys
@@ -784,6 +785,19 @@ async def pipeline_executor_worker():
     pool = None
     http_client = httpx.AsyncClient()
     warned_empty_watchlist = False
+    # Tokens released by the pen, waiting to be evaluated.
+    #
+    # They are held in a queue rather than merged into the candidate list
+    # because selection is random.choice() over that list: the pen supplies
+    # ~3 tokens per refresh against ~80 from the breadth sources, so a
+    # uniform draw evaluates a newly listed token under 4% of the time --
+    # under one an hour. The pen would fill, release, and its output would
+    # be statistically invisible in the cohort it exists to create.
+    #
+    # Pen tokens are also PERISHABLE in a way breadth tokens are not: they
+    # age out of the 15-90 minute window and cannot be recovered. Breadth
+    # tokens are still there next tick.
+    pen_queue: "collections.deque" = collections.deque(maxlen=400)
     while True:
         try:
             candidates = WATCHLIST_TOKEN_ADDRESSES
@@ -805,11 +819,21 @@ async def pipeline_executor_worker():
                 # floor. Released before the fetch so they lead the merged
                 # list -- they are the scarcest source and the only one that
                 # samples newly listed tokens at all.
+                released: list = []
+
+                async def _supplier():
+                    got = await _release_from_pen(http_client, floors[1])
+                    released.extend(got or [])
+                    return got
+
                 candidates = await token_discovery.discover_candidates(
                     http_client,
                     min_liquidity_usd=floors[0],
                     new_listing_min_liquidity_usd=floors[1],
-                    pen_supplier=lambda: _release_from_pen(http_client, floors[1]))
+                    pen_supplier=_supplier)
+                for mint in released:
+                    if mint not in pen_queue:
+                        pen_queue.append(mint)
             if not candidates:
                 if not warned_empty_watchlist:
                     logger.warning(
@@ -905,7 +929,17 @@ async def pipeline_executor_worker():
                 elif "F_ATLAS" in brief: funnel_data["F_ATLAS"] += row["count"]
                 elif "G_ANCHOR" in brief: funnel_data["G_ANCHOR"] += row["count"]
 
-            target_address = random.choice(candidates)
+            # A pen token if one is waiting, otherwise a random candidate.
+            #
+            # This is what makes the recency arm exist. It is not a
+            # preference for better tokens -- the pen's output is not
+            # better, it is SCARCE and PERISHABLE, and a uniform draw over a
+            # list the breadth sources dominate would evaluate fewer than
+            # one an hour. The queue drains within a few ticks of each
+            # refresh, so breadth still fills the great majority of
+            # evaluations; the pen simply stops being invisible.
+            from_pen = bool(pen_queue)
+            target_address = pen_queue.popleft() if from_pen else random.choice(candidates)
             snapshot = await market_data.get_snapshot(http_client, target_address)
             if snapshot is None:
                 # No indexed trading pair for this token right now (e.g. a
@@ -962,6 +996,11 @@ async def pipeline_executor_worker():
                     conn, target_address, snapshot.get("total_holders")
                 )
             snapshot["holders_added_per_hour"] = inputs_holder_velocity
+            # Recorded so the two populations can be told apart afterwards.
+            # A run in which the pen went quiet is a run about established
+            # tokens, and that must be visible in the data rather than
+            # remembered.
+            snapshot["discovery_source"] = "holding-pen" if from_pen else "breadth"
 
             inputs = snapshot
 

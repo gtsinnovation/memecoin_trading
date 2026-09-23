@@ -352,3 +352,13 @@ CREATE INDEX IF NOT EXISTS ix_discovery_pen_due
 -- "N of M passed at whatever floor is configured" -- which cannot distinguish
 -- a floor set too high from a market that is genuinely thin.
 ALTER TABLE discovery_pen ADD COLUMN IF NOT EXISTS qualified BOOLEAN;
+
+-- Which discovery source offered this token.
+--
+-- 'holding-pen' means a newly created pool that aged into the evaluation
+-- window; 'breadth' means one of the trending/top-traded lists, which are
+-- established tokens. These are DIFFERENT POPULATIONS and results cannot be
+-- pooled across them. Without this column the mix is invisible: the pen can
+-- go quiet for six hours and the cohort silently becomes a study of
+-- established tokens while every count still looks healthy.
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS discovery_source VARCHAR(20);

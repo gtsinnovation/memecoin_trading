@@ -400,3 +400,231 @@ SELECT definition,
              / NULLIF(COUNT(*), 0)) AS would_refuse_pct
 FROM defs GROUP BY definition
 ORDER BY would_refuse_pct;
+
+\echo ''
+\echo '=== 9. THE TWO POPULATIONS -- never pool these ==='
+-- 'holding-pen' is a newly created pool that aged into the 15-90 minute
+-- window. 'breadth' is an established token off a trending or top-traded
+-- list. They are different populations and a gap measured across both is not
+-- one result -- it is two, averaged.
+--
+-- This is also the health check for the recency arm. If holding-pen tokens
+-- stop appearing, the run quietly became a study of established tokens, and
+-- that fact needs to be visible here rather than remembered.
+SELECT COALESCE(discovery_source, '(pre-instrumentation)') AS population,
+       cohort,
+       COUNT(DISTINCT token_address) AS tokens,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY tradeable_depth_usd)::numeric, 0) AS median_depth,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY txns_h1)::numeric, 0) AS median_txns_h1
+FROM paper_trades
+WHERE entry_model = 'IMMEDIATE'
+GROUP BY 1, 2 ORDER BY 1, 2;
+
+\echo ''
+\echo '=== 9b. THE DECISION NUMBER, PER POPULATION ==='
+-- Section 5c, split. Token-weighted, with the standard error of the gap.
+-- Read the verdict column, and read `tokens` before the verdict: below 30 per
+-- arm nothing here means anything, and a 'noise' verdict at small n is not
+-- evidence the gates are worthless -- only that the question is unanswered.
+WITH marks AS (
+    SELECT COALESCE(t.discovery_source, '(pre-instrumentation)') AS population,
+           h.horizon_minutes AS mins, t.cohort, t.token_address AS token,
+           h.return_percent AS ret
+    FROM paper_horizon_returns h
+    JOIN paper_trades t ON t.id = h.paper_trade_id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
+),
+per_token AS (
+    SELECT population, mins, cohort, token, AVG(ret) AS ret
+    FROM marks GROUP BY 1, 2, 3, 4
+),
+per_cohort AS (
+    SELECT population, mins, cohort, COUNT(*) AS tokens, AVG(ret) AS mean,
+           COALESCE(VAR_SAMP(ret), 0) AS var
+    FROM per_token GROUP BY 1, 2, 3
+),
+gap AS (
+    SELECT a.population, a.mins,
+           a.tokens AS approved_tokens, r.tokens AS rejected_tokens,
+           a.mean - r.mean AS diff,
+           SQRT(a.var / NULLIF(a.tokens, 0) + r.var / NULLIF(r.tokens, 0)) AS se_diff
+    FROM per_cohort a
+    JOIN per_cohort r ON r.mins = a.mins AND r.population = a.population
+                     AND r.cohort = 'REJECTED'
+    WHERE a.cohort = 'APPROVED'
+)
+SELECT population, mins, approved_tokens, rejected_tokens,
+       ROUND(diff::numeric, 2) AS approved_minus_rejected,
+       ROUND(se_diff::numeric, 2) AS se_of_gap,
+       CASE
+         WHEN LEAST(approved_tokens, rejected_tokens) < 30 THEN 'too few tokens'
+         WHEN ABS(diff) > 2 * se_diff THEN 'signal'
+         ELSE 'noise'
+       END AS verdict
+FROM gap ORDER BY population, mins;
+
+\echo ''
+\echo '=== 10. THE ROBUST DECISION NUMBER -- rank-based, outlier-proof ==='
+-- Sections 5c and 9b compare MEANS, and on this data that is the wrong tool.
+-- One mark printed +13,054,508% on a token with twenty transactions in an
+-- hour; another showed an identical +6,711% at 30, 60 AND 120 minutes, which
+-- is a price that moved once and froze. Those are not observations the mean
+-- should be allowed to weigh, and they inflate the standard error until every
+-- verdict reads 'noise' regardless of what the sample says.
+--
+-- Section 6 already reasoned this out for the correlations -- ranked, not
+-- raw, because "one 40x runner dictates a Pearson coefficient entirely" --
+-- and then the section that actually decides things used means anyway.
+--
+-- This is Mann-Whitney U on TOKEN-LEVEL MEDIANS. Each token contributes the
+-- median of its own marks (robust to one bad print within a token), those are
+-- ranked across tokens, and the test asks whether approved tokens sit higher
+-- in the ranking than chance allows. The magnitude of a runner is irrelevant
+-- to a rank; only its position matters. No trimming, no winsorising, no
+-- judgement call about which outliers are "real".
+WITH marks AS (
+    SELECT COALESCE(t.discovery_source, '(pre)') AS population,
+           h.horizon_minutes AS mins, t.cohort, t.token_address AS token,
+           h.return_percent AS ret
+    FROM paper_horizon_returns h
+    JOIN paper_trades t ON t.id = h.paper_trade_id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
+),
+per_token AS (
+    SELECT population, mins, cohort, token,
+           PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ret) AS ret
+    FROM marks GROUP BY 1, 2, 3, 4
+),
+-- MID-ranks: ties get the average of the positions they span. A large block
+-- of tokens tied at exactly 0.00 return -- dead ones -- would otherwise be
+-- min-ranked, which manufactures separation between cohorts whose only
+-- shared property is being stale.
+ranked AS (
+    SELECT population, mins, cohort, token,
+           AVG(rk) OVER (PARTITION BY population, mins, ret) AS r
+    FROM (SELECT population, mins, cohort, token, ret,
+                 ROW_NUMBER() OVER (PARTITION BY population, mins ORDER BY ret) AS rk
+          FROM per_token) n
+),
+agg AS (
+    SELECT population, mins,
+           COUNT(*) FILTER (WHERE cohort = 'APPROVED') AS n1,
+           COUNT(*) FILTER (WHERE cohort = 'REJECTED') AS n2,
+           SUM(r) FILTER (WHERE cohort = 'APPROVED') AS r1
+    FROM ranked GROUP BY 1, 2
+),
+u AS (
+    SELECT population, mins, n1, n2,
+           r1 - (n1 * (n1 + 1) / 2.0) AS u1,
+           n1 * n2 / 2.0 AS mu,
+           SQRT(n1 * n2 * (n1 + n2 + 1) / 12.0) AS sigma
+    FROM agg WHERE n1 > 0 AND n2 > 0
+)
+SELECT population, mins, n1 AS approved, n2 AS rejected,
+       -- Probability a randomly chosen approved token outranks a randomly
+       -- chosen rejected one. 0.50 is no edge. This is the effect size, and
+       -- unlike a mean it cannot be moved by how big the biggest winner was.
+       ROUND((u1 / (n1 * n2))::numeric, 3) AS p_outrank,
+       ROUND(((u1 - mu) / NULLIF(sigma, 0))::numeric, 2) AS z,
+       CASE
+         WHEN LEAST(n1, n2) < 30 THEN 'too few tokens'
+         WHEN ABS((u1 - mu) / NULLIF(sigma, 0)) > 1.96 THEN 'SIGNAL'
+         ELSE 'noise'
+       END AS verdict
+FROM u ORDER BY population, mins;
+
+\echo ''
+\echo '=== 10b. UP-RATE: the other robust statistic, and the larger gap ==='
+-- "How often was this token up at the horizon" cannot be distorted by a
+-- 13,000,000% print -- it counts as one success, the same as +0.01%. On the
+-- 16-hour sample this showed 71% for approved against 51% for rejected,
+-- which is a bigger separation than anything in the return columns.
+--
+-- Two-proportion z-test on TOKENS, not marks: repeated marks on one token
+-- are correlated observations and counting them as independent is how a
+-- 60-minute re-entry cooldown turns 19 coins into "154 trades".
+WITH marks AS (
+    SELECT COALESCE(t.discovery_source, '(pre)') AS population,
+           h.horizon_minutes AS mins, t.cohort, t.token_address AS token,
+           h.return_percent AS ret
+    FROM paper_horizon_returns h
+    JOIN paper_trades t ON t.id = h.paper_trade_id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
+),
+per_token AS (
+    SELECT population, mins, cohort, token,
+           (PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ret) > 0)::int AS up
+    FROM marks GROUP BY 1, 2, 3, 4
+),
+agg AS (
+    SELECT population, mins,
+           COUNT(*) FILTER (WHERE cohort = 'APPROVED') AS n1,
+           SUM(up) FILTER (WHERE cohort = 'APPROVED') AS k1,
+           COUNT(*) FILTER (WHERE cohort = 'REJECTED') AS n2,
+           SUM(up) FILTER (WHERE cohort = 'REJECTED') AS k2
+    FROM per_token GROUP BY 1, 2
+),
+z AS (
+    SELECT *, k1::numeric / NULLIF(n1, 0) AS p1, k2::numeric / NULLIF(n2, 0) AS p2,
+           (k1 + k2)::numeric / NULLIF(n1 + n2, 0) AS p
+    FROM agg WHERE n1 > 0 AND n2 > 0
+)
+SELECT population, mins, n1 AS approved, n2 AS rejected,
+       ROUND(100 * p1, 0) AS pct_up_approved,
+       ROUND(100 * p2, 0) AS pct_up_rejected,
+       ROUND((100 * (p1 - p2))::numeric, 1) AS gap_pp,
+       ROUND(((p1 - p2) / NULLIF(SQRT(p * (1 - p) * (1.0/n1 + 1.0/n2)), 0))::numeric, 2) AS z,
+       CASE
+         WHEN LEAST(n1, n2) < 30 THEN 'too few tokens'
+         WHEN ABS((p1 - p2) / NULLIF(SQRT(p * (1 - p) * (1.0/n1 + 1.0/n2)), 0)) > 1.96
+           THEN 'SIGNAL'
+         ELSE 'noise'
+       END AS verdict
+FROM z ORDER BY population, mins;
+
+\echo ''
+\echo '=== 10c. THE LIVENESS CONFOUND -- is the edge just "not dead"? ==='
+-- Section 5b showed the median gap REVERSING once tokens with fewer than 50
+-- hourly transactions were excluded, and section 4 showed the rejected cohort
+-- carrying ten times the stale-quote rate. A gate that mostly selects tokens
+-- that are still trading will look like alpha and is not.
+--
+-- Same rank test, run inside activity bands. If p_outrank stays above 0.5
+-- WITHIN a band, the gates are picking something beyond liveness. If it
+-- collapses to 0.5 in every band, they are not, and no threshold tuning
+-- changes that.
+WITH marks AS (
+    SELECT h.horizon_minutes AS mins, t.cohort, t.token_address AS token,
+           h.return_percent AS ret,
+           CASE WHEN t.txns_h1 IS NULL THEN 'unknown'
+                WHEN t.txns_h1 < 50 THEN 'a. <50 txns (near dead)'
+                WHEN t.txns_h1 < 500 THEN 'b. 50-500 txns'
+                ELSE 'c. 500+ txns (busy)' END AS activity
+    FROM paper_horizon_returns h
+    JOIN paper_trades t ON t.id = h.paper_trade_id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
+),
+per_token AS (
+    SELECT activity, mins, cohort, token,
+           PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ret) AS ret
+    FROM marks GROUP BY 1, 2, 3, 4
+),
+ranked AS (
+    SELECT activity, mins, cohort,
+           AVG(rk) OVER (PARTITION BY activity, mins, ret) AS r
+    FROM (SELECT activity, mins, cohort, ret,
+                 ROW_NUMBER() OVER (PARTITION BY activity, mins ORDER BY ret) AS rk
+          FROM per_token) n
+),
+agg AS (
+    SELECT activity, mins,
+           COUNT(*) FILTER (WHERE cohort = 'APPROVED') AS n1,
+           COUNT(*) FILTER (WHERE cohort = 'REJECTED') AS n2,
+           SUM(r) FILTER (WHERE cohort = 'APPROVED') AS r1
+    FROM ranked GROUP BY 1, 2
+)
+SELECT activity, mins, n1 AS approved, n2 AS rejected,
+       ROUND(((r1 - (n1 * (n1 + 1) / 2.0)) / NULLIF(n1 * n2, 0))::numeric, 3) AS p_outrank,
+       CASE WHEN LEAST(n1, n2) < 20 THEN 'too few' ELSE '' END AS note
+FROM agg WHERE n1 > 0 AND n2 > 0 AND mins = 60
+ORDER BY activity, mins;
