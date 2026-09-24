@@ -40,7 +40,7 @@ def run(token_discovery) -> Suite:
 
     def fresh():
         td._cache["candidates"] = []
-        td._cache["fetched_at"] = 0.0
+        td._cache["fetched_at"] = None   # never fetched; see the sentinel note in token_discovery
         td._cache["floors"] = None
         td._next_allowed.clear()
         td.BIRDEYE_API_KEY = "test-key"
@@ -685,6 +685,24 @@ def run(token_discovery) -> Suite:
                  names[0].startswith("jupiter"))
     s.check_true("all three Jupiter sources are registered",
                  len([n for n in names if n.startswith("jupiter")]) == 3)
+
+    print("\n[RESTART] a fresh process must refresh, not serve an empty cache")
+    # time.monotonic() counts from an arbitrary origin that is NEAR ZERO at
+    # process start. A 0.0 sentinel for "never fetched" therefore reads as
+    # "fetched at second zero", which is inside the TTL for the first
+    # DISCOVERY_CACHE_TTL_S of every process -- so discovery returned an EMPTY
+    # candidate list for three minutes after each restart and logged nothing.
+    # Simulated by putting the clock where it actually is just after boot.
+    fresh()
+    real_monotonic = td.time.monotonic
+    td.time.monotonic = lambda: 5.0          # five seconds into the process
+    try:
+        handler = router(jup_recent=[jup(910)])
+        got = asyncio.run(td.discover_candidates(client_for(handler)))
+        s.check_true("a just-booted process refreshes rather than serving []",
+                     make_address(910) in got)
+    finally:
+        td.time.monotonic = real_monotonic
 
     print("\n[FAILURE] a refresh where everything failed must not retry instantly")
     # Refreshing is DESTRUCTIVE -- it drains the holding pen, and examining a

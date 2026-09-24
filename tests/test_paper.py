@@ -411,29 +411,83 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
         print("\n[PATH] the extremes accumulate; they are not overwritten")
         # 10f and 10g are built entirely on these two columns, so a silent
         # defect here produces confident, plausible, wrong answers about
-        # whether the stop or the gates are losing the money -- the exact
-        # failure this project keeps having to dig out. LEAST/GREATEST over
-        # the STORED value is what makes them accumulate; take that away and
-        # min_price_seen becomes "the most recent price", which still looks
+        # whether the stop or the gates are losing the money. LEAST/GREATEST
+        # over the STORED value is what makes them accumulate; take that away
+        # and min_price_seen becomes "the most recent price", which still looks
         # like a number and is never obviously wrong.
+        #
+        # EVERY PRICE HERE SITS INSIDE BOTH BARRIERS, and that is not
+        # incidental. The first version of this test walked 1.00 / 0.88 / 1.19
+        # / 1.05 on a basis of 1.0 -- but the stop sits at 0.9247, so 0.88
+        # CLOSED the trade on the second mark, and mark_to_market only selects
+        # PENDING_FILL and OPEN. The last two prices were never applied and the
+        # test failed against correct code. Accumulation and barrier behaviour
+        # are separate claims and have to be exercised separately.
         with conn.cursor() as cur:
             cur.execute("TRUNCATE paper_trades CASCADE;")
         path = make_address(46)
         rec(_snap(path, price=1.0))
-        # Down, then up past the start, then back to the middle.
-        for px in (1.00, 0.88, 1.19, 1.05):
-            paper_trading.mark_to_market(conn, {path: px})
         with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT min_price_seen, max_price_seen, last_price "
+            cur.execute("SELECT invalidation_level_price, target_exit_price "
                         "FROM paper_trades WHERE token_address=%s "
                         "AND entry_model='IMMEDIATE';", (path,))
-            lo, hi, last = cur.fetchone()
-        s.check("the LOW is the lowest price seen, not the latest", float(lo), 0.88)
-        s.check("the HIGH is the highest price seen, not the latest", float(hi), 1.19)
-        s.check("last_price is still the latest, and is neither extreme",
-                float(last), 1.05)
-        s.check_true("the low is strictly below the last mark", float(lo) < float(last))
-        s.check_true("the high is strictly above the last mark", float(hi) > float(last))
+            stop_px, target_px = [float(x) for x in cur.fetchone()]
+        # Down, then up past the start, then back to the middle -- all inside.
+        walk = (1.00, 0.95, 1.12, 1.05)
+        for px in walk:
+            assert stop_px < px < target_px, (
+                f"fixture price {px} is outside the barriers "
+                f"({stop_px:.4f} .. {target_px:.4f}) and would close the trade")
+            paper_trading.mark_to_market(conn, {path: px})
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT status FROM paper_trades "
+                        "WHERE token_address=%s AND entry_model='IMMEDIATE';",
+                        (path,))
+            s.check("the trade stayed open for every mark",
+                    cur.fetchone()[0], "OPEN")
+            cur.execute("SELECT min_price_seen, max_price_seen, last_price "
+                        "FROM paper_trades WHERE token_address=%s "
+                        "AND entry_model='IMMEDIATE';", (path,))
+            lo, hi, last = [float(x) for x in cur.fetchone()]
+        s.check("the LOW is the lowest price seen, not the latest", lo, 0.95)
+        s.check("the HIGH is the highest price seen, not the latest", hi, 1.12)
+        s.check("last_price is still the latest, and is neither extreme", last, 1.05)
+        s.check_true("the low is strictly below the last mark", lo < last)
+        s.check_true("the high is strictly above the last mark", hi > last)
+
+        print("\n[PATH] a CLOSED trade keeps accruing its path via mark_horizons")
+        # This is the behaviour 10f's stopped_but_rose depends on. Once a stop
+        # fires, mark_to_market drops the row from its query forever -- so if
+        # nothing else updated the extremes, the recorded high would always be
+        # the pre-stop high and "the token recovered afterwards" would be
+        # unobservable by construction. mark_horizons keeps pricing a token for
+        # the whole horizon window regardless of barrier state, which is why
+        # the path update lives there too.
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE paper_trades CASCADE;")
+        recov = make_address(48)
+        rec(_snap(recov, price=1.0))
+        paper_trading.mark_to_market(conn, {recov: 0.80})   # through the stop
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT status FROM paper_trades "
+                        "WHERE token_address=%s AND entry_model='IMMEDIATE';",
+                        (recov,))
+            s.check("the stop closed it", cur.fetchone()[0], "CLOSED")
+            cur.execute("SELECT max_price_seen FROM paper_trades "
+                        "WHERE token_address=%s AND entry_model='IMMEDIATE';",
+                        (recov,))
+            hi_before = float(cur.fetchone()[0])
+        # Age it so a horizon is due, then price it far ABOVE entry.
+        age(recov, paper_trading.HORIZONS_MINUTES[0] + 1)
+        paper_trading.mark_horizons(conn, {recov: 1.40})
+        with conn.cursor() as cur:
+            cur.execute("SELECT max_price_seen FROM paper_trades "
+                        "WHERE token_address=%s AND entry_model='IMMEDIATE';",
+                        (recov,))
+            hi_after = float(cur.fetchone()[0])
+        s.check_true("the post-close recovery raised the recorded high",
+                     hi_after > hi_before)
+        s.check("and it is the recovered price", hi_after, 1.40)
 
         print("\n[PATH] the first mark seeds both extremes")
         # Guards the seeding case regardless of HOW it is spelled. Postgres

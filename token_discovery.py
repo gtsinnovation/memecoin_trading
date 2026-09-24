@@ -290,7 +290,16 @@ JUPITER_MIN_INTERVAL_S = float(os.environ.get("JUPITER_MIN_INTERVAL_S", "1.1"))
 
 HEADERS = {"User-Agent": "memecoin-trading-agent/1.0", "Accept": "application/json"}
 
-_cache: Dict[str, Any] = {"candidates": [], "fetched_at": 0.0, "floors": None}
+# fetched_at is None until a refresh has actually happened, and NOT 0.0.
+# time.monotonic() counts from an arbitrary origin that is near zero at
+# process start, so a 0.0 sentinel does not mean "never fetched" -- it means
+# "fetched at second zero", which is inside the TTL for the first
+# DISCOVERY_CACHE_TTL_S of every process. That made discovery serve an EMPTY
+# candidate list for the first three minutes after each restart while
+# reporting nothing wrong. It was masked for a long time by a redundant
+# `and _cache["candidates"]` term in the TTL guard, which had to be removed
+# for the cold-start backoff to work at all -- removing the mask exposed it.
+_cache: Dict[str, Any] = {"candidates": [], "fetched_at": None, "floors": None}
 
 # Provider -> monotonic time before which no further call to it may start.
 _next_allowed: Dict[str, float] = {}
@@ -860,7 +869,12 @@ async def discover_candidates(client: httpx.AsyncClient,
     # drains the holding pen -- three seconds apart, with nothing to fall
     # back on. "Am I allowed to refresh yet" is a question about the clock,
     # not about whether the last answer happened to be non-empty.
-    if not force_refresh and (now - _cache["fetched_at"]) < DISCOVERY_CACHE_TTL_S:
+    # `is not None`, not a truthiness test: the failure backoff below stamps
+    # fetched_at with now - TTL + RETRY, which is legitimately NEGATIVE early
+    # in a process's life, and a falsy check would read that as never-fetched
+    # and defeat the backoff it exists to enforce.
+    if (not force_refresh and _cache["fetched_at"] is not None
+            and (now - _cache["fetched_at"]) < DISCOVERY_CACHE_TTL_S):
         return _cache["candidates"]
 
     have_key = bool(BIRDEYE_API_KEY)
