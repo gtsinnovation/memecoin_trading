@@ -408,6 +408,51 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
         s.check("the exit still happens", row[0], "TARGET_HIT")
         s.check("but carries no confirmation", row[1], None)
 
+        print("\n[PATH] the extremes accumulate; they are not overwritten")
+        # 10f and 10g are built entirely on these two columns, so a silent
+        # defect here produces confident, plausible, wrong answers about
+        # whether the stop or the gates are losing the money -- the exact
+        # failure this project keeps having to dig out. LEAST/GREATEST over
+        # the STORED value is what makes them accumulate; take that away and
+        # min_price_seen becomes "the most recent price", which still looks
+        # like a number and is never obviously wrong.
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE paper_trades CASCADE;")
+        path = make_address(46)
+        rec(_snap(path, price=1.0))
+        # Down, then up past the start, then back to the middle.
+        for px in (1.00, 0.88, 1.19, 1.05):
+            paper_trading.mark_to_market(conn, {path: px})
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT min_price_seen, max_price_seen, last_price "
+                        "FROM paper_trades WHERE token_address=%s "
+                        "AND entry_model='IMMEDIATE';", (path,))
+            lo, hi, last = cur.fetchone()
+        s.check("the LOW is the lowest price seen, not the latest", float(lo), 0.88)
+        s.check("the HIGH is the highest price seen, not the latest", float(hi), 1.19)
+        s.check("last_price is still the latest, and is neither extreme",
+                float(last), 1.05)
+        s.check_true("the low is strictly below the last mark", float(lo) < float(last))
+        s.check_true("the high is strictly above the last mark", float(hi) > float(last))
+
+        print("\n[PATH] the first mark seeds both extremes")
+        # Guards the seeding case regardless of HOW it is spelled. Postgres
+        # LEAST/GREATEST ignore nulls rather than propagating them, so this
+        # would pass with or without the COALESCE in the statement -- which is
+        # worth asserting precisely because that is an exception to the usual
+        # null rules and easy to "tidy up" wrongly later.
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE paper_trades CASCADE;")
+        seed = make_address(47)
+        rec(_snap(seed, price=1.0))
+        paper_trading.mark_to_market(conn, {seed: 0.5})
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT min_price_seen, max_price_seen FROM paper_trades "
+                        "WHERE token_address=%s AND entry_model='IMMEDIATE';", (seed,))
+            lo, hi = cur.fetchone()
+        s.check("one mark sets the low", float(lo), 0.5)
+        s.check("and the high", float(hi), 0.5)
+
     finally:
         conn.close()
     

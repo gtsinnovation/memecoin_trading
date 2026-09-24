@@ -771,10 +771,18 @@ def mark_to_market(conn, prices: Dict[str, float]) -> Dict[str, int]:
                 continue
 
             price = float(price)
-            # LEAST/GREATEST over the stored value, so the extremes accumulate
-            # across ticks rather than being overwritten by the latest mark.
-            # COALESCE seeds them on the first mark; a NULL would otherwise
-            # swallow every subsequent comparison.
+            # LEAST/GREATEST over the STORED value, so the extremes
+            # accumulate across ticks rather than being overwritten by the
+            # latest mark. Drop them and min_price_seen silently becomes "the
+            # most recent price" -- still a number, never obviously wrong, and
+            # 10f/10g are built entirely on it.
+            #
+            # The COALESCE is belt-and-braces, not load-bearing: unlike almost
+            # every other Postgres function, LEAST and GREATEST IGNORE nulls
+            # rather than propagating them, so LEAST(NULL, 0.5) is 0.5 and the
+            # first mark would seed correctly either way. It stays because the
+            # intent is clearer written down than inferred from an exception
+            # to the usual null rules.
             cur.execute("""
                 UPDATE paper_trades
                 SET last_price = %s, last_marked_at = CURRENT_TIMESTAMP,
