@@ -584,19 +584,36 @@ FROM z ORDER BY population, mins;
 
 \echo ''
 \echo '=== 10c. THE LIVENESS CONFOUND -- is the edge just "not dead"? ==='
--- Section 5b showed the median gap REVERSING once tokens with fewer than 50
--- hourly transactions were excluded, and section 4 showed the rejected cohort
--- carrying ten times the stale-quote rate. A gate that mostly selects tokens
--- that are still trading will look like alpha and is not.
+-- Section 4 shows the rejected cohort carrying EIGHT TIMES the stale-quote
+-- rate (8 percent of marks at exactly 0.0000 against 1 percent), and section
+-- 3b shows it losing four times as many tokens to abandonment. A gate that
+-- mostly selects tokens still trading will look like alpha and is not.
 --
--- Same rank test, run inside activity bands. If p_outrank stays above 0.5
--- WITHIN a band, the gates are picking something beyond liveness. If it
--- collapses to 0.5 in every band, they are not, and no threshold tuning
--- changes that.
+-- TWO CORRECTIONS over the first version of this section, both of which
+-- changed what it was capable of showing:
+--
+-- 1. SPLIT BY POPULATION. Breadth and holding-pen are different experiments
+--    with different cohort mixes (section 9). Pooling them meant the bands
+--    below mixed two samples, so a band could move because its population
+--    mix moved rather than because anything about liveness did.
+--
+-- 2. TEST UP-RATE, NOT JUST RANK. The signal claimed in 10b is an UP-RATE
+--    gap of 22 to 32 points. The first version tested p_outrank instead --
+--    a different statistic -- so it could not confirm or refute the thing
+--    it was written to interrogate. Both are reported here, because their
+--    DISAGREEMENT is itself informative: a large up-rate gap beside a
+--    p_outrank near 0.5 means approved tokens rise more OFTEN but not by
+--    MORE, i.e. reliable small drift and no tail.
+--
+-- Read it this way: if the up-rate gap survives inside every activity band,
+-- the gates are picking something beyond liveness. If it collapses to zero
+-- within bands and only exists pooled, they are a liveness filter and no
+-- threshold tuning changes that.
 WITH marks AS (
     SELECT h.horizon_minutes AS mins, t.cohort, t.token_address AS token,
+           COALESCE(t.discovery_source, 'unknown') AS population,
            h.return_percent AS ret,
-           CASE WHEN t.txns_h1 IS NULL THEN 'unknown'
+           CASE WHEN t.txns_h1 IS NULL THEN 'z. unknown'
                 WHEN t.txns_h1 < 50 THEN 'a. <50 txns (near dead)'
                 WHEN t.txns_h1 < 500 THEN 'b. 50-500 txns'
                 ELSE 'c. 500+ txns (busy)' END AS activity
@@ -605,29 +622,80 @@ WITH marks AS (
     WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
 ),
 per_token AS (
-    SELECT activity, mins, cohort, token,
+    SELECT population, activity, mins, cohort, token,
            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ret) AS ret
-    FROM marks GROUP BY 1, 2, 3, 4
+    FROM marks GROUP BY 1, 2, 3, 4, 5
 ),
 ranked AS (
-    SELECT activity, mins, cohort,
-           AVG(rk) OVER (PARTITION BY activity, mins, ret) AS r
-    FROM (SELECT activity, mins, cohort, ret,
-                 ROW_NUMBER() OVER (PARTITION BY activity, mins ORDER BY ret) AS rk
+    SELECT population, activity, mins, cohort, ret,
+           AVG(rk) OVER (PARTITION BY population, activity, mins, ret) AS r
+    FROM (SELECT population, activity, mins, cohort, ret,
+                 ROW_NUMBER() OVER (PARTITION BY population, activity, mins
+                                    ORDER BY ret) AS rk
           FROM per_token) n
 ),
 agg AS (
-    SELECT activity, mins,
+    SELECT population, activity, mins,
            COUNT(*) FILTER (WHERE cohort = 'APPROVED') AS n1,
            COUNT(*) FILTER (WHERE cohort = 'REJECTED') AS n2,
-           SUM(r) FILTER (WHERE cohort = 'APPROVED') AS r1
-    FROM ranked GROUP BY 1, 2
+           SUM(r)   FILTER (WHERE cohort = 'APPROVED') AS r1,
+           COUNT(*) FILTER (WHERE cohort = 'APPROVED' AND ret > 0) AS up1,
+           COUNT(*) FILTER (WHERE cohort = 'REJECTED' AND ret > 0) AS up2,
+           -- Tokens that MOVED AT ALL. A frozen quote returns exactly zero
+           -- and so reads as "not up", which hands the up-rate gap to the
+           -- cohort with fewer dead tokens for free. Excluding them is the
+           -- sharpest single test of the confound.
+           COUNT(*) FILTER (WHERE cohort = 'APPROVED' AND ret <> 0) AS mv1,
+           COUNT(*) FILTER (WHERE cohort = 'REJECTED' AND ret <> 0) AS mv2,
+           COUNT(*) FILTER (WHERE cohort = 'APPROVED' AND ret > 0) AS mvup1,
+           COUNT(*) FILTER (WHERE cohort = 'REJECTED' AND ret > 0) AS mvup2
+    FROM ranked GROUP BY 1, 2, 3
 )
-SELECT activity, mins, n1 AS approved, n2 AS rejected,
-       ROUND(((r1 - (n1 * (n1 + 1) / 2.0)) / NULLIF(n1 * n2, 0))::numeric, 3) AS p_outrank,
+SELECT population, activity, mins,
+       n1 AS appr, n2 AS rej,
+       ROUND(((r1 - (n1 * (n1 + 1) / 2.0)) / NULLIF(n1 * n2, 0))::numeric, 3)
+           AS p_outrank,
+       ROUND(100.0 * up1 / NULLIF(n1, 0), 0) AS up_appr,
+       ROUND(100.0 * up2 / NULLIF(n2, 0), 0) AS up_rej,
+       ROUND(100.0 * up1 / NULLIF(n1, 0) - 100.0 * up2 / NULLIF(n2, 0), 1)
+           AS up_gap_pp,
+       -- The same gap among tokens that actually moved.
+       ROUND(100.0 * mvup1 / NULLIF(mv1, 0) - 100.0 * mvup2 / NULLIF(mv2, 0), 1)
+           AS up_gap_moved_pp,
        CASE WHEN LEAST(n1, n2) < 20 THEN 'too few' ELSE '' END AS note
-FROM agg WHERE n1 > 0 AND n2 > 0 AND mins = 60
-ORDER BY activity, mins;
+FROM agg
+WHERE n1 > 0 AND n2 > 0 AND mins = 60
+ORDER BY population, activity;
+
+\echo ''
+\echo '--- 10d. THE OUTLIERS BEHIND THE MEANS -- real moonshots or a bug? ---'
+-- Section 5 reports a REJECTED mean of 29,482 percent with a standard
+-- deviation of 566,107. That is one or a few astronomical figures, and until
+-- they are identified every mean-based section (5, 5b, 5c, 9b) is reporting
+-- them rather than the cohort. A ~5,000x mark is not impossible on this asset
+-- class, but it is far likelier to be a price-scaling artefact -- a decimals
+-- mismatch, or a basis taken from a different pool than the mark.
+--
+-- The diagnostic is the RATIO of the two prices against the recorded return.
+-- If they disagree, the return is computed wrong. If they agree, the token
+-- really did move that far and the mean is simply the wrong statistic --
+-- which is why sections 10 and 10b exist.
+SELECT t.cohort, t.discovery_source, LEFT(t.token_address, 8) AS token,
+       h.horizon_minutes AS mins,
+       t.price_at_evaluation AS basis,
+       h.price AS mark_price,
+       ROUND(h.return_percent, 0) AS recorded_ret,
+       ROUND((100.0 * (h.price - t.price_at_evaluation)
+              / NULLIF(t.price_at_evaluation, 0))::numeric, 0) AS recomputed_ret,
+       CASE WHEN ABS(COALESCE(h.return_percent, 0)
+                     - (100.0 * (h.price - t.price_at_evaluation)
+                        / NULLIF(t.price_at_evaluation, 0))) > 1
+            THEN 'MISMATCH -- return does not follow from the two prices'
+            ELSE 'consistent' END AS check
+FROM paper_horizon_returns h
+JOIN paper_trades t ON t.id = h.paper_trade_id
+ORDER BY h.return_percent DESC NULLS LAST
+LIMIT 12;
 
 \echo ''
 \echo '=== 11. EXIT CONFIRMATION -- were the wins traded, or just quoted? ==='
