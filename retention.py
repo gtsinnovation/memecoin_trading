@@ -36,6 +36,12 @@ RETENTION_BATCH = int(os.environ.get("RETENTION_BATCH", "5000"))
 ALERT_RETENTION_HOURS = float(os.environ.get("ALERT_RETENTION_HOURS", "72"))
 AUDIT_RETENTION_HOURS = float(os.environ.get("AUDIT_RETENTION_HOURS", "336"))   # 14d
 HOLDER_SAMPLE_RETENTION_HOURS = float(os.environ.get("HOLDER_SAMPLE_RETENTION_HOURS", "168"))
+# The one genuinely high-volume table. At a 30-second sample and ~100 live
+# tokens this is ~290k rows a day. It is NOT the experiment -- it is the
+# instrument for replaying exit policies -- but a replay needs paths older
+# than the trades it is testing, so this is deliberately longer than the
+# longest hold (PAPER_MAX_HOLD_MINUTES, 6h) by a wide margin.
+PRICE_PATH_RETENTION_HOURS = float(os.environ.get("PRICE_PATH_RETENTION_HOURS", "336"))
 
 # (table, timestamp column, retention hours, extra predicate)
 #
@@ -46,6 +52,7 @@ _POLICIES = (
     ("system_alerts", "created_at", ALERT_RETENTION_HOURS, "is_dispatched = TRUE"),
     ("execution_audit_log", "created_at", AUDIT_RETENTION_HOURS, None),
     ("token_holder_samples", "sampled_at", HOLDER_SAMPLE_RETENTION_HOURS, None),
+    ("paper_price_path", "observed_at", PRICE_PATH_RETENTION_HOURS, None),
 )
 
 
@@ -100,6 +107,7 @@ async def retention_worker(dsn: str, connect=None) -> None:
         f"retention: every {RETENTION_INTERVAL_S}s | alerts {ALERT_RETENTION_HOURS}h "
         f"(dispatched only) | audit {AUDIT_RETENTION_HOURS}h | "
         f"holder samples {HOLDER_SAMPLE_RETENTION_HOURS}h | "
+        f"price path {PRICE_PATH_RETENTION_HOURS}h | "
         f"paper_trades + paper_horizon_returns NEVER")
     await asyncio.sleep(20.0)  # let startup settle before the first sweep
     while True:

@@ -68,7 +68,7 @@ def main() -> int:
         import engine
         import paper_trading
         import token_discovery
-        from tests import test_gates, test_paper, test_discovery, test_prices, test_microstructure, test_tx_verify, test_fill_accounting, test_dpulse, test_direction_agents, test_hardening, test_main, test_holder_concentration, test_pen, test_retention
+        from tests import test_gates, test_paper, test_discovery, test_prices, test_microstructure, test_tx_verify, test_fill_accounting, test_dpulse, test_direction_agents, test_hardening, test_main, test_holder_concentration, test_pen, test_retention, test_replay
 
         suites.append(test_gates.run(psycopg2, engine, dsn))
         suites.append(test_paper.run(psycopg2, paper_trading, dsn))
@@ -84,6 +84,7 @@ def main() -> int:
         suites.append(test_hardening.run())
         suites.append(test_holder_concentration.run())
         suites.append(test_retention.run())
+        suites.append(test_replay.run())
         # The pen is the only suite needing asyncpg: it is the one component
         # that both reads the database and is driven by an async worker.
         try:

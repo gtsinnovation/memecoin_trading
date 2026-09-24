@@ -49,7 +49,7 @@ def _stray_percent_signs():
 
 def _compose_coverage():
     """Every knob the RUNTIME modules read, minus what compose forwards."""
-    import os as _os, re as _re, glob as _glob
+    import ast as _ast, os as _os, glob as _glob
     root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
     compose = open(_os.path.join(root, "docker-compose.yml"), encoding="utf-8").read()
     # Probes, smoke scripts and one-off calibration tools are not shipped in
@@ -62,7 +62,33 @@ def _compose_coverage():
         if name.startswith(skip_prefix):
             continue
         text = open(path, encoding="utf-8").read()
-        for knob in _re.findall(r'os\.environ\.get\("([A-Z][A-Z0-9_]+)"', text):
+        # AST, not a regex. The regex required the opening quote to sit
+        # immediately after the paren, so a call wrapped across lines --
+        #     os.environ.get(
+        #         "REPLAY_STOPS", "...")
+        # -- was invisible to it. Two of three new knobs slipped past that way
+        # while the check still reported a clean sweep, which is worse than no
+        # check: it is a check that says yes.
+        try:
+            tree = _ast.parse(text)
+        except SyntaxError:
+            continue
+        for node in _ast.walk(tree):
+            if not (isinstance(node, _ast.Call)
+                    and isinstance(node.func, _ast.Attribute)
+                    and node.func.attr == "get"
+                    and isinstance(node.func.value, _ast.Attribute)
+                    and node.func.value.attr == "environ"):
+                continue
+            if not node.args:
+                continue
+            first = node.args[0]
+            if not (isinstance(first, _ast.Constant)
+                    and isinstance(first.value, str)):
+                continue
+            knob = first.value
+            if not knob or not knob[0].isupper() or knob.upper() != knob:
+                continue
             if knob not in compose:
                 missing.append(f"{name}:{knob}")
     return sorted(set(missing))

@@ -113,6 +113,13 @@ REENTRY_COOLDOWN_MINUTES = float(os.environ.get("PAPER_REENTRY_COOLDOWN_MINUTES"
 # runs through this whole module; leaving them live would keep the bias.
 # ABANDONED is excluded from the P&L averages AND counted separately, so the
 # dropout is visible instead of silent.
+# How often a token's price is written to paper_price_path. The pipeline marks
+# every ~3 seconds; storing every mark is ~3M rows a day to answer a question
+# 30-second resolution settles. Raising this loses resolution in the replay --
+# a barrier crossed and recrossed inside one sample is invisible -- so it
+# trades storage against how finely an exit policy can be tested.
+PATH_SAMPLE_SECONDS = float(os.environ.get("PATH_SAMPLE_SECONDS", "30"))
+
 UNPRICEABLE_ABANDON_MINUTES = float(os.environ.get("PAPER_UNPRICEABLE_ABANDON_MINUTES", "180"))
 
 # Elapsed times at which each evaluated token's actual return is recorded,
@@ -700,6 +707,57 @@ def classify_horizon_row(price: Optional[float], basis: Optional[float]) -> str:
     return "MARKABLE"
 
 
+def record_path_samples(conn, prices: Dict[str, Any]) -> int:
+    """Append each priced token to its ordered path, at a bounded cadence.
+
+    Returns the number of samples actually written.
+
+    The WHERE NOT EXISTS is the rate limit, and it lives in the DATABASE
+    rather than in a process-local timestamp on purpose: a restart clears an
+    in-memory cadence and re-samples everything, and two workers would each
+    keep their own. The table itself is the only thing that knows when a token
+    was last recorded.
+
+    Best-effort. A failure here loses replay resolution and must never take
+    down marking -- the barrier trades and horizon marks are the measurement;
+    this is the instrument for a later question.
+    """
+    if not prices:
+        return 0
+    rows = []
+    for addr, value in prices.items():
+        price, _, _ = _as_mark(value) if value is not None else (None, None, None)
+        if price is None or price <= 0:
+            continue
+        rows.append((addr, float(price)))
+    if not rows:
+        return 0
+
+    values = ",".join(["(%s,%s::numeric)"] * len(rows))
+    params: list = []
+    for addr, price in rows:
+        params.extend([addr, price])
+    params.append(PATH_SAMPLE_SECONDS)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                INSERT INTO paper_price_path (token_address, price)
+                SELECT v.addr, v.px
+                FROM (VALUES {values}) AS v(addr, px)
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM paper_price_path p
+                    WHERE p.token_address = v.addr
+                      AND p.observed_at > CURRENT_TIMESTAMP
+                                          - (%s * INTERVAL '1 second')
+                );
+            """, params)
+            return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    except Exception as exc:
+        logger.warning(f"Path sampling failed (replay resolution lost, "
+                       f"marking unaffected): {type(exc).__name__}: {exc}")
+        return 0
+
+
 def mark_to_market(conn, prices: Dict[str, float]) -> Dict[str, int]:
     """Advances every live paper trade against real prices.
 
@@ -713,6 +771,10 @@ def mark_to_market(conn, prices: Dict[str, float]) -> Dict[str, int]:
     # NOTE: no early return on an empty `prices`. A tick where NOTHING could be
     # priced is exactly when abandonment matters most -- returning early here
     # is what let unpriceable trades accumulate indefinitely.
+
+    # Record the ordered path BEFORE evaluating barriers, so a mark that
+    # closes a trade is still in the series the replay reads.
+    record_path_samples(conn, prices)
 
     with conn.cursor() as cur:
         cur.execute("""

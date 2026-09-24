@@ -324,3 +324,32 @@ CREATE INDEX IF NOT EXISTS ix_discovery_pen_due
 -- grew large enough to need pruning.
 CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON system_alerts(created_at);
 CREATE INDEX IF NOT EXISTS idx_holder_samples_sampled_at ON token_holder_samples(sampled_at);
+
+-- ---------------------------------------------------------------------------
+-- ORDERED PRICE PATH
+--
+-- min_price_seen / max_price_seen record HOW FAR a token moved each way but
+-- carry no ordering, so they cannot tell "rose, then fell through the stop"
+-- from "fell through the stop, then recovered" -- and only the second is the
+-- stop firing on noise. That ambiguity is what stopped section 10f being
+-- conclusive. Replaying an exit policy needs the sequence, not the extremes.
+--
+-- Keyed by TOKEN, not by trade: the IMMEDIATE and LIMIT arms of the same
+-- token see an identical price series, and storing it twice would double the
+-- write volume to record the same facts.
+--
+-- Sampled, not per-tick. The pipeline marks every ~3 seconds; at roughly a
+-- hundred live tokens that is ~3M rows a day to answer a question that
+-- 30-second resolution settles. PATH_SAMPLE_SECONDS bounds it, and retention
+-- prunes it -- this table is the only one here that is genuinely high-volume.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS paper_price_path (
+    id BIGSERIAL PRIMARY KEY,
+    token_address VARCHAR(64) NOT NULL,
+    price NUMERIC NOT NULL,
+    observed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+-- The replay reads one token's series in time order; the sampler asks whether
+-- a recent row exists for a token. Both are this index.
+CREATE INDEX IF NOT EXISTS idx_price_path_token_time
+    ON paper_price_path(token_address, observed_at);

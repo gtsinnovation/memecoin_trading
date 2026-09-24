@@ -376,3 +376,14 @@ ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS exit_txns_h1 INTEGER;
 ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS min_price_seen NUMERIC;
 ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS max_price_seen NUMERIC;
 
+-- Ordered price path, for replaying exit policies against observed sequences.
+-- See the table comment in schema.sql. High-volume: retention.py prunes it.
+CREATE TABLE IF NOT EXISTS paper_price_path (
+    id BIGSERIAL PRIMARY KEY,
+    token_address VARCHAR(64) NOT NULL,
+    price NUMERIC NOT NULL,
+    observed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_price_path_token_time
+    ON paper_price_path(token_address, observed_at);
+

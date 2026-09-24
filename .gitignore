@@ -36,3 +36,4 @@ _to_delete/
 # Analysis run outputs -- regenerated from stage2_check.sql on demand, and
 # they contain a snapshot of live measurements rather than source.
 run-*.txt
+run*.txt

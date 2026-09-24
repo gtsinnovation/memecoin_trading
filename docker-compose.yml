@@ -145,6 +145,14 @@ services:
       - ALERT_RETENTION_HOURS=${ALERT_RETENTION_HOURS:-72}
       - AUDIT_RETENTION_HOURS=${AUDIT_RETENTION_HOURS:-336}
       - HOLDER_SAMPLE_RETENTION_HOURS=${HOLDER_SAMPLE_RETENTION_HOURS:-168}
+      - PRICE_PATH_RETENTION_HOURS=${PRICE_PATH_RETENTION_HOURS:-336}
+      # Ordered price path: resolution of the exit-policy replay.
+      - PATH_SAMPLE_SECONDS=${PATH_SAMPLE_SECONDS:-30}
+      # Exit-policy replay grid (replay_exits.py). The live 7.53/15.06 is
+      # included on purpose so every cell has an anchor to compare against.
+      - REPLAY_STOPS=${REPLAY_STOPS:-3,5,7.53,10,15,20}
+      - REPLAY_TARGETS=${REPLAY_TARGETS:-3,5,7.5,10,15.06,25}
+      - REPLAY_MIN_SAMPLES=${REPLAY_MIN_SAMPLES:-3}
       - JUPITER_MIN_AGE_MINUTES=${JUPITER_MIN_AGE_MINUTES:-15}
       - JUPITER_MAX_AGE_MINUTES=${JUPITER_MAX_AGE_MINUTES:-90}
       - JUPITER_MIN_INTERVAL_S=${JUPITER_MIN_INTERVAL_S:-1.1}
