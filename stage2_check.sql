@@ -668,34 +668,119 @@ WHERE n1 > 0 AND n2 > 0 AND mins = 60
 ORDER BY population, activity;
 
 \echo ''
-\echo '--- 10d. THE OUTLIERS BEHIND THE MEANS -- real moonshots or a bug? ---'
--- Section 5 reports a REJECTED mean of 29,482 percent with a standard
--- deviation of 566,107. That is one or a few astronomical figures, and until
--- they are identified every mean-based section (5, 5b, 5c, 9b) is reporting
--- them rather than the cohort. A ~5,000x mark is not impossible on this asset
--- class, but it is far likelier to be a price-scaling artefact -- a decimals
--- mismatch, or a basis taken from a different pool than the mark.
+\echo '--- 10d. PRICE SANITY: could these moves physically have happened? ---'
+-- Section 5 reports a REJECTED mean of 29,438 percent. The first version of
+-- this section recomputed each extreme return from its own two recorded
+-- prices and reported "consistent" -- which proved only that the ARITHMETIC
+-- was right. It used the same two numbers that produced the return, so it
+-- could never have found a wrong PRICE. That is the failure mode here: a
+-- token recorded at 0.0000117 and then at 1.53 is a 130,000x move, and the
+-- likelier explanation is the wrong side or the wrong pool than a token that
+-- actually did that in thirty minutes.
 --
--- The diagnostic is the RATIO of the two prices against the recorded return.
--- If they disagree, the return is computed wrong. If they agree, the token
--- really did move that far and the mean is simply the wrong statistic --
--- which is why sections 10 and 10b exist.
-SELECT t.cohort, t.discovery_source, LEFT(t.token_address, 8) AS token,
-       h.horizon_minutes AS mins,
-       t.price_at_evaluation AS basis,
-       h.price AS mark_price,
-       ROUND(h.return_percent, 0) AS recorded_ret,
-       ROUND((100.0 * (h.price - t.price_at_evaluation)
-              / NULLIF(t.price_at_evaluation, 0))::numeric, 0) AS recomputed_ret,
-       CASE WHEN ABS(COALESCE(h.return_percent, 0)
-                     - (100.0 * (h.price - t.price_at_evaluation)
-                        / NULLIF(t.price_at_evaluation, 0))) > 1
-            THEN 'MISMATCH -- return does not follow from the two prices'
-            ELSE 'consistent' END AS check
-FROM paper_horizon_returns h
-JOIN paper_trades t ON t.id = h.paper_trade_id
-ORDER BY h.return_percent DESC NULLS LAST
-LIMIT 12;
+-- This version applies two tests that CAN fail.
+--
+-- TEST 1 -- PHYSICS. On a constant-product pool, moving the price by a factor
+-- r requires the quote reserve to grow by sqrt(r), so the buying needed is
+-- about (TVL / 2) * (sqrt(r) - 1). That capital has to come from somewhere,
+-- and we recorded the hour's actual volume at evaluation. If the move needed
+-- vastly more buying than the token saw, the move did not happen: the price
+-- is wrong. This is deliberately generous -- it compares against the WHOLE
+-- hour's volume, and uses depth at evaluation, which understates a pool that
+-- genuinely grew. A row still failing this margin is not a borderline case.
+--
+-- TEST 2 -- FROZEN MARKS. The same token reporting the IDENTICAL price at 30,
+-- 60 and 120 minutes did not moon three times; its quote stopped updating. A
+-- frozen quote at an absurd level is the signature of a bad read, not a rally.
+WITH x AS (
+    SELECT t.cohort, t.discovery_source,
+           LEFT(t.token_address, 8) AS token,
+           h.horizon_minutes AS mins,
+           t.price_at_evaluation AS basis,
+           h.price AS mark,
+           h.return_percent AS ret,
+           t.tradeable_depth_usd AS depth,
+           t.volume_h1_usd AS vol_h1,
+           h.price / NULLIF(t.price_at_evaluation, 0) AS ratio,
+           f.distinct_marks, f.n_marks
+    FROM paper_horizon_returns h
+    JOIN paper_trades t ON t.id = h.paper_trade_id
+    -- Per-token mark spread, as its own aggregate. Postgres has no
+    -- COUNT(DISTINCT ...) OVER (...), so this cannot be a window function.
+    JOIN (SELECT t2.token_address,
+                 COUNT(DISTINCT h2.price) AS distinct_marks,
+                 COUNT(*)                 AS n_marks
+          FROM paper_horizon_returns h2
+          JOIN paper_trades t2 ON t2.id = h2.paper_trade_id
+          GROUP BY t2.token_address) f ON f.token_address = t.token_address
+    WHERE h.return_percent > 1000          -- only the tail can distort a mean
+),
+y AS (
+    SELECT x.*,
+           CASE WHEN ratio > 1 THEN
+               (COALESCE(depth, 0) / 2.0) * (SQRT(ratio) - 1)
+           END AS buying_needed_usd
+    FROM x
+)
+SELECT cohort, token, mins,
+       basis, mark,
+       ROUND(ratio, 0)                              AS price_x,
+       ROUND(depth, 0)                              AS depth_usd,
+       ROUND(vol_h1, 0)                             AS volume_h1,
+       ROUND(buying_needed_usd, 0)                  AS buying_needed,
+       -- How many times the entire hour's observed volume would have had to
+       -- be spent, on this one token, to produce the recorded price.
+       ROUND(buying_needed_usd / NULLIF(vol_h1, 0), 0) AS x_of_hourly_volume,
+       CASE WHEN distinct_marks = 1 AND n_marks > 1
+                 THEN 'FROZEN -- one price repeated across every horizon'
+            WHEN buying_needed_usd > 10 * COALESCE(vol_h1, 0)
+                 THEN 'IMPOSSIBLE -- needs far more buying than the token saw'
+            ELSE 'plausible -- no test refutes it' END AS verdict
+FROM y
+ORDER BY ret DESC
+LIMIT 15;
+
+\echo ''
+\echo '--- 10e. WHAT THE MEANS BECOME WITHOUT THE REFUTED ROWS ---'
+-- The decision-relevant number. If dropping the rows that failed a physical
+-- test leaves the means roughly where they were, sections 5, 5b, 5c and 9b
+-- are readable and the tail was real. If the means collapse, those sections
+-- have been reporting a handful of bad reads all along and the rank-based
+-- sections 10 and 10b are the only trustworthy ones -- which is what they
+-- were built for.
+--
+-- Rows are dropped ONLY where a test refutes them, never for being large. A
+-- filter that removed returns for exceeding a threshold would be assuming the
+-- conclusion.
+WITH scored AS (
+    SELECT t.cohort, h.horizon_minutes AS mins, t.token_address AS token,
+           h.return_percent AS ret,
+           (h.return_percent > 1000
+            AND (COALESCE(t.tradeable_depth_usd, 0) / 2.0)
+                * (SQRT(h.price / NULLIF(t.price_at_evaluation, 0)) - 1)
+                > 10 * COALESCE(t.volume_h1_usd, 0))          AS refuted
+    FROM paper_horizon_returns h
+    JOIN paper_trades t ON t.id = h.paper_trade_id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
+      AND h.price > 0 AND t.price_at_evaluation > 0
+),
+per_token AS (
+    SELECT cohort, mins, token,
+           AVG(ret)                                  AS ret_all,
+           AVG(ret) FILTER (WHERE NOT refuted)       AS ret_kept,
+           COUNT(*) FILTER (WHERE refuted)           AS n_refuted
+    FROM scored GROUP BY 1, 2, 3
+)
+SELECT mins, cohort,
+       COUNT(*)                                        AS tokens,
+       SUM(n_refuted)                                  AS rows_refuted,
+       ROUND(AVG(ret_all), 2)                          AS mean_as_reported,
+       ROUND(AVG(ret_kept), 2)                         AS mean_refuted_dropped,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ret_all)::numeric, 2)
+                                                       AS median_unchanged
+FROM per_token
+GROUP BY mins, cohort
+ORDER BY mins, cohort;
 
 \echo ''
 \echo '=== 11. EXIT CONFIRMATION -- were the wins traded, or just quoted? ==='
