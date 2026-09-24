@@ -180,6 +180,12 @@ JUPITER_MAX_AGE_MINUTES = float(os.environ.get("JUPITER_MAX_AGE_MINUTES", "90"))
 # cache keeps us far under every provider's limit.
 DISCOVERY_CACHE_TTL_S = float(os.environ.get("DISCOVERY_CACHE_TTL_S", "180"))
 
+# How long to wait before retrying after EVERY source failed. Shorter than the
+# normal TTL so a transient outage recovers quickly, but not zero -- a failed
+# refresh still drains the pen, so retrying on every tick destroys the
+# experiment's scarcest input while the providers are down.
+DISCOVERY_FAILURE_RETRY_S = float(os.environ.get("DISCOVERY_FAILURE_RETRY_S", "30"))
+
 # Ceiling on the merged list. Expected composition is ~220: 100 market rows,
 # ~40 in-window recency rows, 20 Birdeye trending, 20 GeckoTerminal trending,
 # and ~40 from RugCheck and DexScreener. 300 leaves headroom without the cap
@@ -846,7 +852,15 @@ async def discover_candidates(client: httpx.AsyncClient,
             f"has changed, so results either side of this point are not one sample.")
         force_refresh = True
 
-    if not force_refresh and _cache["candidates"] and (now - _cache["fetched_at"]) < DISCOVERY_CACHE_TTL_S:
+    # NOTE the absence of an `and _cache["candidates"]` term. Requiring a
+    # non-empty cache to honour the TTL made the backoff below useless in the
+    # one case it exists for: a COLD START during a provider outage. With no
+    # cached list, the guard was falsy however recently fetched_at had been
+    # stamped, so every tick fell through to the destructive refresh -- which
+    # drains the holding pen -- three seconds apart, with nothing to fall
+    # back on. "Am I allowed to refresh yet" is a question about the clock,
+    # not about whether the last answer happened to be non-empty.
+    if not force_refresh and (now - _cache["fetched_at"]) < DISCOVERY_CACHE_TTL_S:
         return _cache["candidates"]
 
     have_key = bool(BIRDEYE_API_KEY)
@@ -946,10 +960,34 @@ async def discover_candidates(client: httpx.AsyncClient,
     candidates = candidates[:DISCOVERY_MAX_CANDIDATES]
 
     if not candidates:
+        # STAMP THE CLOCK EVEN ON FAILURE. Returning early without touching
+        # fetched_at left the TTL check permanently satisfied, so the next
+        # tick refreshed again -- three seconds later, and every three
+        # seconds after that.
+        #
+        # That matters because refreshing is DESTRUCTIVE: pen_supplier drains
+        # the holding pen, and examining a token stamps released_at on it
+        # forever. During an upstream outage every source returns empty, this
+        # branch is taken, and the drain runs 20x a minute at 120 rows a
+        # time. A pen holding a few thousand rows is entirely consumed in
+        # under a minute -- every row flagged "examined and failed" without a
+        # single liquidity measurement ever being taken -- and the only log
+        # line is the reassuring one below.
+        _cache["fetched_at"] = now - DISCOVERY_CACHE_TTL_S + DISCOVERY_FAILURE_RETRY_S
+        # Record the floors this attempt ran under even though it yielded
+        # nothing. The floor-change check above is what lets a settings edit
+        # take effect before the TTL expires, and it compares against this
+        # value -- leaving it unset after a failed sweep meant a floor lowered
+        # during an outage was silently ignored until the backoff lapsed.
+        _cache["floors"] = floors
         if _cache["candidates"]:
-            logger.warning("All discovery sources failed; reusing the previous candidate list.")
+            logger.warning(
+                f"All discovery sources failed; reusing the previous candidate list "
+                f"and not retrying for {DISCOVERY_FAILURE_RETRY_S:.0f}s.")
             return _cache["candidates"]
-        logger.error("All discovery sources failed and no cached candidates exist.")
+        logger.error(
+            f"All discovery sources failed and no cached candidates exist; "
+            f"not retrying for {DISCOVERY_FAILURE_RETRY_S:.0f}s.")
         return []
 
     _cache["candidates"] = candidates

@@ -59,7 +59,18 @@ PAPER_FEE_PERCENT_PER_SIDE = float(os.environ.get("PAPER_FEE_PERCENT_PER_SIDE", 
 # gate's own ceiling: a token that passed the gate is known to be under it, and
 # one we could not measure could be anything up to it. Erring high is the right
 # direction for an experiment whose failure mode is flattering the strategy.
-# Keep this in step with the G_ANCHOR impact ceiling if that changes.
+# Charged when price impact could not be measured at all.
+#
+# It must be >= node_G_ANCHOR's impact ceiling, and it is deliberately ABOVE
+# it rather than equal. A token whose impact Jupiter could not quote is not an
+# average token -- it is thinner than anything the gate would have approved,
+# so the stand-in should be at least as bad as the worst approvable case. The
+# previous comment here claimed this was "set to the slippage gate's own
+# ceiling" and asserted an invariant of equality that the two numbers did not
+# satisfy (3.0 vs 2.5), which reads as a bug to anyone who checks.
+#
+# tests/test_paper.py asserts the real invariant by reading the ceiling out of
+# engine.py, so the two cannot drift apart silently.
 PAPER_UNMEASURED_SLIPPAGE_PERCENT = 3.0
 
 # How long a LIMIT candidate waits for its pullback before being written
@@ -572,6 +583,51 @@ def mark_horizons(conn, prices: Dict[str, float]) -> Dict[int, int]:
     return marks
 
 
+def exit_is_confirmed(txns_m5: Optional[int],
+                      txns_h1: Optional[int] = None) -> Optional[bool]:
+    """Was there a counterparty at the mark that produced this exit?
+
+    A take-profit is a LIMIT SELL. It needs somebody on the other side. On a
+    token that has not traded in five minutes the quote is the last print,
+    not a price anyone will pay -- so a lone stale or wicked figure crossing
+    the target was booked as a clean win, at the target, with no trade behind
+    it. That error is not symmetric across cohorts: the gates select thin
+    tokens, and thin is exactly where one print moves the quote furthest, so
+    the fabricated wins land disproportionately in APPROVED.
+
+    m5 is the finest bucket DexScreener publishes and the right resolution
+    for "could this have filled just now". h1 is a FALLBACK only: an hour-old
+    count is weak evidence about the last five minutes, and it is used solely
+    to refute -- if nothing traded all hour, nothing traded in the last five
+    minutes either. It is never used to confirm.
+
+      True  -- transactions at the mark; a fill was possible.
+      False -- ZERO transactions; a quote, not a trade.
+      None  -- no transaction data at all. Unknown, and deliberately NOT
+               folded into False. Analysis filters on `IS TRUE`, so unknown
+               and refuted both drop out, but the raw data keeps them apart.
+    """
+    if txns_m5 is not None:
+        return bool(txns_m5 > 0)
+    if txns_h1 is not None and txns_h1 <= 0:
+        return False
+    return None
+
+
+def _as_mark(value) -> tuple:
+    """(price, txns_m5, txns_h1) from either a bare price or a full mark.
+
+    fetch_current_marks_sync returns the richer form; a bare float is still
+    accepted so every existing caller and fixture keeps working -- it simply
+    carries no evidence, which lands as `exit_confirmed = NULL`.
+    """
+    if isinstance(value, dict):
+        price = value.get("price")
+        return (None if price is None else float(price),
+                value.get("txns_m5"), value.get("txns_h1"))
+    return (float(value), None, None)
+
+
 def decide_exit(price: float, target: Optional[float], stop: Optional[float],
                 held_minutes: Optional[float]) -> Tuple[Optional[str], float]:
     """Which exit (if any) a live trade takes at this price, and at what price.
@@ -649,21 +705,47 @@ def mark_to_market(conn, prices: Dict[str, float]) -> Dict[str, int]:
                    target_exit_price, invalidation_level_price, fill_price,
                    assumed_slippage_percent,
                    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - evaluated_at))/60.0 AS age_min,
-                   EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - COALESCE(filled_at, evaluated_at)))/60.0 AS held_min
+                   EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - COALESCE(filled_at, evaluated_at)))/60.0 AS held_min,
+                   -- How long this trade has been WITHOUT A PRICE, which is a
+                   -- different quantity from how old it is.
+                   EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - COALESCE(last_marked_at, evaluated_at)))/60.0
+                       AS silent_min
             FROM paper_trades
             WHERE status IN ('PENDING_FILL', 'OPEN');
         """)
         live = cur.fetchall()
 
         for (tid, addr, entry_model, status, trigger, target, stop,
-             fill_price, slippage, age_min, held_min) in live:
-            price = prices.get(addr)
+             fill_price, slippage, age_min, held_min, silent_min) in live:
+            price, txns_m5, txns_h1 = _as_mark(prices.get(addr)) \
+                if prices.get(addr) is not None else (None, None, None)
             if price is None:
+                # A limit order that never filled inside its window is
+                # EXPIRED, and that is knowable WITHOUT a price -- "the trigger
+                # was never touched in 60 minutes" is a determinate fact about
+                # the past. Keying this on price availability sent every dead
+                # token's unfilled order down the ABANDONED path instead, which
+                # removed it from the fill-rate denominator entirely and
+                # reported 62.5% filled against a true 50%.
+                if (status == "PENDING_FILL"
+                        and float(age_min or 0) >= LIMIT_FILL_WINDOW_MINUTES):
+                    cur.execute(
+                        "UPDATE paper_trades SET status = 'EXPIRED', "
+                        "closed_at = CURRENT_TIMESTAMP WHERE id = %s;", (tid,))
+                    stats["expired"] += 1
+                    continue
+
                 # Unknown is still not zero -- we never invent a price. But a
                 # trade that has been unpriceable for this long is not coming
                 # back, and leaving it live would quietly drop the worst
                 # outcomes out of the sample. Abandon it with no P&L recorded.
-                if float(age_min or 0) >= UNPRICEABLE_ABANDON_MINUTES:
+                #
+                # SILENCE, not age. Keyed on total age, a single rate-limited
+                # tick abandoned EVERY open trade older than the threshold at
+                # once -- the position had been priced happily thirty seconds
+                # earlier. One 429 wiped the tail of the sample, and the trades
+                # it wiped were the long-lived ones, i.e. the winners.
+                if float(silent_min or 0) >= UNPRICEABLE_ABANDON_MINUTES:
                     cur.execute("""
                         UPDATE paper_trades
                         SET status = 'ABANDONED', exit_reason = 'NO_PRICE',
@@ -701,13 +783,20 @@ def mark_to_market(conn, prices: Dict[str, float]) -> Dict[str, int]:
                 continue
 
             gross, cost, net = net_pnl_percent(basis, exit_price, slippage)
+            # The flag is recorded for EVERY exit, not only target hits. A
+            # stop-out on a stale print is just as fictional; it errs in the
+            # conservative direction, which is why it went unnoticed, and that
+            # is not a reason to leave it unmeasured.
+            confirmed = exit_is_confirmed(txns_m5, txns_h1)
             cur.execute("""
                 UPDATE paper_trades
                 SET status = 'CLOSED', exit_reason = %s, exit_price = %s,
                     closed_at = CURRENT_TIMESTAMP, gross_pnl_percent = %s,
-                    cost_percent = %s, net_pnl_percent = %s
+                    cost_percent = %s, net_pnl_percent = %s,
+                    exit_confirmed = %s, exit_txns_m5 = %s, exit_txns_h1 = %s
                 WHERE id = %s;
-            """, (exit_reason, exit_price, gross, cost, net, tid))
+            """, (exit_reason, exit_price, gross, cost, net,
+                  confirmed, txns_m5, txns_h1, tid))
             stats[{"TARGET_HIT": "closed_target", "STOPPED_OUT": "closed_stop",
                      "TIMEOUT": "closed_timeout"}[exit_reason]] += 1
 
@@ -760,7 +849,40 @@ def results_summary(conn) -> List[Dict[str, Any]]:
                    ROUND(MAX(net_pnl_percent) FILTER (WHERE status = 'CLOSED'), 2) AS best,
                    COUNT(*) FILTER (WHERE status = 'EXPIRED')::int AS never_filled,
                    COUNT(*) FILTER (WHERE status IN ('PENDING_FILL','OPEN'))::int AS still_live,
-                   COUNT(*) FILTER (WHERE status = 'ABANDONED')::int AS abandoned_no_price
+                   COUNT(*) FILTER (WHERE status = 'ABANDONED')::int AS abandoned_no_price,
+                   -- Exits taken on a mark with a counterparty, versus exits
+                   -- taken on a stale print. See exit_is_confirmed: a
+                   -- take-profit is a limit sell and needs somebody on the
+                   -- other side, so an unconfirmed TARGET_HIT is a bookkeeping
+                   -- artefact, not a win. The error is not symmetric across
+                   -- cohorts -- the gates select thin tokens, where one print
+                   -- moves the quote furthest -- so these counts are read as a
+                   -- comparison between cohorts, not as a global nuisance.
+                   COUNT(*) FILTER (WHERE status = 'CLOSED'
+                                      AND exit_confirmed IS TRUE)::int AS exits_confirmed,
+                   COUNT(*) FILTER (WHERE status = 'CLOSED'
+                                      AND exit_confirmed IS FALSE)::int AS exits_refuted,
+                   COUNT(*) FILTER (WHERE status = 'CLOSED'
+                                      AND exit_confirmed IS NULL)::int AS exits_unknown,
+                   COUNT(*) FILTER (WHERE exit_reason = 'TARGET_HIT'
+                                      AND exit_confirmed IS TRUE)::int AS target_hits_confirmed,
+                   COUNT(*) FILTER (WHERE exit_reason = 'TARGET_HIT'
+                                      AND exit_confirmed IS NOT TRUE)::int AS target_hits_unconfirmed,
+                   -- The headline numbers recomputed over CONFIRMED exits only.
+                   -- Reported ALONGSIDE the unrestricted ones rather than
+                   -- replacing them: a large gap between the two is itself the
+                   -- finding, and silently swapping in the filtered figure
+                   -- would hide how much of the result rested on prints
+                   -- nobody traded against.
+                   COUNT(*) FILTER (WHERE status = 'CLOSED'
+                                      AND exit_confirmed IS TRUE
+                                      AND net_pnl_percent > 0)::int AS wins_confirmed,
+                   ROUND(AVG(net_pnl_percent) FILTER (
+                       WHERE status = 'CLOSED' AND exit_confirmed IS TRUE), 2)
+                       AS mean_net_confirmed,
+                   ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY net_pnl_percent)
+                       FILTER (WHERE status = 'CLOSED' AND exit_confirmed IS TRUE)::numeric, 2)
+                       AS median_net_confirmed
             FROM paper_trades
             GROUP BY cohort, entry_model
             ORDER BY cohort, entry_model;
@@ -770,6 +892,15 @@ def results_summary(conn) -> List[Dict[str, Any]]:
 
     for row in rows:
         row["win_rate"] = round((row["wins"] / row["n"]) * 100, 1) if row["n"] else None
+        nc = row.get("exits_confirmed") or 0
+        row["win_rate_confirmed"] = (
+            round((row["wins_confirmed"] / nc) * 100, 1) if nc else None)
+        # What share of this cohort's exits rests on evidence at all. A cohort
+        # whose confirmed share is much lower than its peer's has a result
+        # built on quotes rather than trades, whatever its headline says.
+        closed = row.get("n") or 0
+        row["exit_confirmed_rate"] = (
+            round((nc / closed) * 100, 1) if closed else None)
     return rows
 
 
@@ -802,34 +933,70 @@ def horizon_summary(conn, min_txns_h1: Optional[int] = None) -> List[Dict[str, A
     Those observations are noise, and noise dilutes a real signal rather than
     inventing a false one: if the cohort gap only appears once dead tokens
     are excluded, the gates work and DISCOVERY is what needs fixing.
+    
+    NOTE on cost: unmeasured slippage is charged at
+    PAPER_UNMEASURED_SLIPPAGE_PERCENT, never at zero. It used to coalesce to
+    0 here while total_cost_percent() and stage2_check.sql both substituted
+    the stand-in -- so the same quantity had two values depending on which
+    report you read, and they disagreed by more than the effect being
+    measured.
+
+    That asymmetry was not random. node_G_ANCHOR fails closed on
+    slippage_data_missing, so NO approved row can carry a NULL slippage: the
+    unmeasured set is a strict subset of REJECTED. Charging it zero
+    under-costed the control arm alone, manufacturing part of the very cohort
+    gap this function exists to measure.
     """
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT h.horizon_minutes,
-                   t.cohort,
-                   COUNT(*)::int AS n,
-                   COUNT(DISTINCT t.token_address)::int AS tokens,
-                   ROUND(AVG(h.return_percent), 2) AS mean_gross,
-                   ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY h.return_percent)::numeric, 2) AS median_gross,
-                   ROUND(AVG(h.return_percent - (%s + 2 * ABS(COALESCE(t.assumed_slippage_percent, 0)))), 2) AS net_after_costs,
-                   COUNT(*) FILTER (WHERE h.return_percent > 0)::int AS positive,
-                   ROUND(STDDEV_SAMP(h.return_percent), 2) AS stdev,
-                   ROUND(MIN(h.return_percent), 2) AS worst,
-                   ROUND(MAX(h.return_percent), 2) AS best
-            FROM paper_horizon_returns h
-            JOIN paper_trades t ON t.id = h.paper_trade_id
-            WHERE h.age_minutes_at_mark <= h.horizon_minutes * %s
-              AND (%s IS NULL OR t.txns_h1 >= %s)
-            GROUP BY h.horizon_minutes, t.cohort
-            ORDER BY h.horizon_minutes, t.cohort;
-        """, (PAPER_FEE_PERCENT_PER_SIDE * 2.0, HORIZON_TOLERANCE,
-              min_txns_h1, min_txns_h1))
+            WITH marks AS (
+                SELECT h.horizon_minutes, t.cohort, t.token_address,
+                       h.return_percent AS ret,
+                       h.return_percent
+                         - (%s + 2 * ABS(COALESCE(t.assumed_slippage_percent, %s)))
+                         AS net_ret
+                FROM paper_horizon_returns h
+                JOIN paper_trades t ON t.id = h.paper_trade_id
+                WHERE h.age_minutes_at_mark <= h.horizon_minutes * %s
+                  AND (%s IS NULL OR t.txns_h1 >= %s)
+            ),
+            -- ONE ROW PER TOKEN. Averaging marks let a token that lingered in
+            -- the discovery list all day outvote twenty tokens seen once, and
+            -- repeated marks on one token are correlated observations -- so
+            -- the standard error came out smaller than the truth by roughly
+            -- sqrt(marks/tokens). stage2_check.sql was rewritten to do this;
+            -- this function, which feeds the dashboard, was not, and the two
+            -- reported the same quantity 2-3x apart.
+            per_token AS (
+                SELECT horizon_minutes, cohort, token_address,
+                       AVG(ret) AS ret, AVG(net_ret) AS net_ret,
+                       COUNT(*) AS marks
+                FROM marks GROUP BY 1, 2, 3
+            )
+            SELECT horizon_minutes, cohort,
+                   SUM(marks)::int AS n,
+                   COUNT(*)::int AS tokens,
+                   ROUND(AVG(ret), 2) AS mean_gross,
+                   ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ret)::numeric, 2)
+                       AS median_gross,
+                   ROUND(AVG(net_ret), 2) AS net_after_costs,
+                   COUNT(*) FILTER (WHERE ret > 0)::int AS positive,
+                   ROUND(STDDEV_SAMP(ret), 2) AS stdev
+            FROM per_token
+            GROUP BY horizon_minutes, cohort
+            ORDER BY horizon_minutes, cohort;
+        """, (PAPER_FEE_PERCENT_PER_SIDE * 2.0, PAPER_UNMEASURED_SLIPPAGE_PERCENT,
+              HORIZON_TOLERANCE, min_txns_h1, min_txns_h1))
         cols = [d[0] for d in cur.description]
         rows = [dict(zip(cols, r)) for r in cur.fetchall()]
 
     for row in rows:
-        n = row.get("n") or 0
-        row["positive_rate"] = round((row["positive"] / n) * 100, 1) if n else 0.0
+        tokens_n = row.get("tokens") or 0
+        # Per TOKEN, matching the mean above. Dividing the token-level
+        # `positive` count by the mark-level `n` produced a rate that was
+        # neither: 5 of 10 tokens up reported as 20% because the same dead
+        # coin supplied 15 zero-return marks.
+        row["positive_rate"] = round((row["positive"] / tokens_n) * 100, 1) if tokens_n else 0.0
         # Standard error of the mean, so a cohort gap can be judged against
         # its own noise instead of being read as a result on sight.
         sd, tokens = row.get("stdev"), row.get("tokens") or 0
@@ -864,31 +1031,62 @@ def staleness_report(conn) -> List[Dict[str, Any]]:
                    COUNT(h.id) FILTER (WHERE h.return_percent = 0)::int AS zero_returns,
                    COUNT(DISTINCT t.token_address) FILTER (WHERE t.txns_h1 = 0)::int AS tokens_no_txns,
                    COUNT(DISTINCT t.token_address) FILTER (WHERE t.txns_h1 IS NULL)::int AS tokens_txns_unknown,
-                   -- Medians come from a SEPARATE aggregate over paper_trades
-                   -- alone. Computed across the LEFT JOIN above, each trade is
-                   -- counted once per horizon mark -- so a live token with 3
-                   -- marks weighs 3x a dead one with 0, in precisely the
-                   -- statistic meant to detect dead tokens. The join inflates
-                   -- the healthy end of the distribution and hides the problem.
-                   (SELECT ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY t2.txns_h1)::numeric, 0)
-                      FROM paper_trades t2
-                     WHERE t2.entry_model = 'IMMEDIATE' AND t2.cohort = t.cohort) AS median_txns_h1,
-                   (SELECT ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY t2.volume_h1_usd)::numeric, 0)
-                      FROM paper_trades t2
-                     WHERE t2.entry_model = 'IMMEDIATE' AND t2.cohort = t.cohort) AS median_volume_h1
+                   -- ONE ROW PER TOKEN, not per trade. A token evaluated
+                   -- nine times over an afternoon contributed nine rows to
+                   -- this median; a token seen once contributed one. The
+                   -- statistic meant to describe "how alive is the typical
+                   -- token we looked at" was therefore weighted by how often
+                   -- we happened to look, which is exactly the tokens that
+                   -- lingered in the discovery list -- the live ones. The
+                   -- healthy end of the distribution was inflated by
+                   -- construction.
+                   (SELECT ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x.v)::numeric, 0)
+                      FROM (SELECT AVG(t2.txns_h1) AS v FROM paper_trades t2
+                             WHERE t2.entry_model = 'IMMEDIATE' AND t2.cohort = t.cohort
+                             GROUP BY t2.token_address) x) AS median_txns_h1,
+                   (SELECT ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x.v)::numeric, 0)
+                      FROM (SELECT AVG(t2.volume_h1_usd) AS v FROM paper_trades t2
+                             WHERE t2.entry_model = 'IMMEDIATE' AND t2.cohort = t.cohort
+                             GROUP BY t2.token_address) x) AS median_volume_h1,
+                   -- Zero-return marks, restricted to marks taken INSIDE their
+                   -- horizon window. An unrestricted count swept in marks taken
+                   -- hours late, which come back at exactly zero because the
+                   -- token is long dead rather than because the quote was
+                   -- stale -- reporting 62 percent staleness against a true 9.
+                   -- The tolerance is the same one horizon_summary applies, so
+                   -- the two agree.
+                   --
+                   -- NB: no literal percent sign anywhere in this string.
+                   -- psycopg2 scans the WHOLE query for parameter syntax,
+                   -- comments included, and C-style format flags are legal --
+                   -- so a percent sign followed by a space and an "s"
+                   -- parses as a space-flagged placeholder and silently
+                   -- becomes an EXTRA parameter, which surfaces only as
+                   -- "IndexError: tuple index out of range" at query time.
+                   -- Spell percentages out in words inside a query string.
+                   -- See the guard in tests/test_hardening.py.
+                   COUNT(h.id) FILTER (
+                       WHERE h.return_percent = 0
+                         AND h.age_minutes_at_mark <= h.horizon_minutes * %s
+                   )::int AS zero_returns_in_window,
+                   COUNT(h.id) FILTER (
+                       WHERE h.age_minutes_at_mark <= h.horizon_minutes * %s
+                   )::int AS marks_in_window
             FROM paper_trades t
             LEFT JOIN paper_horizon_returns h ON h.paper_trade_id = t.id
             WHERE t.entry_model = 'IMMEDIATE'
             GROUP BY t.cohort
             ORDER BY t.cohort;
-        """)
+        """, (HORIZON_TOLERANCE, HORIZON_TOLERANCE))
         cols = [d[0] for d in cur.description]
         rows = [dict(zip(cols, r)) for r in cur.fetchall()]
 
     for row in rows:
-        marks = row.get("marks") or 0
+        in_window = row.get("marks_in_window") or 0
         tokens = row.get("tokens") or 0
-        row["zero_return_rate"] = round((row["zero_returns"] / marks) * 100, 1) if marks else None
+        row["zero_return_rate"] = (
+            round((row["zero_returns_in_window"] / in_window) * 100, 1)
+            if in_window else None)
         row["no_txn_rate"] = round((row["tokens_no_txns"] / tokens) * 100, 1) if tokens else None
     return rows
 

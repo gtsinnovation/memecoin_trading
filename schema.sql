@@ -154,6 +154,24 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     last_marked_at TIMESTAMP WITH TIME ZONE,
     exit_price NUMERIC,
     exit_reason VARCHAR(20),                -- 'TARGET_HIT', 'STOPPED_OUT', 'TIMEOUT'
+    -- Was there a COUNTERPARTY at the mark that produced this exit?
+    --
+    -- A take-profit is a limit sell: it needs somebody on the other side. A
+    -- single stale or wicked print on a token that has not traded in five
+    -- minutes crossed the target and was booked as a clean win, at the target
+    -- price, with no trade behind it. Those hits flatter the APPROVED cohort
+    -- specifically, because the gates select thin tokens where a lone print
+    -- moves the quote furthest.
+    --
+    -- TRUE  = the mark showed transactions, so a fill was possible.
+    -- FALSE = the mark showed ZERO transactions -- a quote, not a trade.
+    -- NULL  = the provider reported no transaction data at all. Unknown, and
+    --         deliberately NOT folded into FALSE: analysis filters on
+    --         `exit_confirmed IS TRUE`, so unknown and refuted both drop out,
+    --         but the two stay distinguishable in the raw data.
+    exit_confirmed BOOLEAN,
+    exit_txns_m5 INTEGER,                   -- the evidence, so the flag is re-derivable
+    exit_txns_h1 INTEGER,
     closed_at TIMESTAMP WITH TIME ZONE,
     gross_pnl_percent NUMERIC,
     cost_percent NUMERIC,
@@ -286,3 +304,9 @@ CREATE TABLE IF NOT EXISTS discovery_pen (
 );
 CREATE INDEX IF NOT EXISTS ix_discovery_pen_due
     ON discovery_pen(pool_created_at) WHERE released_at IS NULL;
+
+-- Retention support (see retention.py). The prune predicate is an age scan;
+-- without these it degrades into a sequential scan over the very tables that
+-- grew large enough to need pruning.
+CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON system_alerts(created_at);
+CREATE INDEX IF NOT EXISTS idx_holder_samples_sampled_at ON token_holder_samples(sampled_at);

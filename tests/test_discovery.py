@@ -50,11 +50,11 @@ def run(token_discovery) -> Suite:
         td.JUPITER_MIN_INTERVAL_S = 0.0
 
     def discover(handler):
-        return asyncio.get_event_loop().run_until_complete(
+        return asyncio.run(
             td.discover_candidates(client_for(handler), force_refresh=True))
 
     def discover_with_floors(handler, general=None, new_listing=None):
-        return asyncio.get_event_loop().run_until_complete(
+        return asyncio.run(
             td.discover_candidates(client_for(handler), force_refresh=True,
                                    min_liquidity_usd=general,
                                    new_listing_min_liquidity_usd=new_listing))
@@ -372,8 +372,13 @@ def run(token_discovery) -> Suite:
         await td._throttle("birdeye")
         fired.append(time.monotonic())
 
-    asyncio.get_event_loop().run_until_complete(
-        asyncio.gather(*[_fire() for _ in range(5)]))
+    # The gather must be BUILT INSIDE the loop: asyncio.gather() attaches its
+    # awaitables to the running loop as it is called, so constructing it in
+    # the argument list of asyncio.run() -- before any loop exists -- raises.
+    async def _fire_all():
+        await asyncio.gather(*[_fire() for _ in range(5)])
+
+    asyncio.run(_fire_all())
     fired.sort()
     gaps = [b - a for a, b in zip(fired, fired[1:])]
     s.check("all five concurrent callers ran", len(fired), 5)
@@ -681,6 +686,33 @@ def run(token_discovery) -> Suite:
     s.check_true("all three Jupiter sources are registered",
                  len([n for n in names if n.startswith("jupiter")]) == 3)
 
+    print("\n[FAILURE] a refresh where everything failed must not retry instantly")
+    # Refreshing is DESTRUCTIVE -- it drains the holding pen, and examining a
+    # token marks it forever. The failure path used to return without
+    # stamping fetched_at, so the TTL never applied and the drain ran every
+    # three seconds. A pen of a few thousand rows is gone in under a minute
+    # of provider outage, every row flagged "examined and failed" without a
+    # single measurement taken.
+    fresh()
+    drains = {"n": 0}
+
+    async def counting_supplier():
+        drains["n"] += 1
+        return []
+
+    def all_dead(request):
+        return httpx.Response(200, json={"data": []})
+
+    async def three_ticks():
+        client = client_for(all_dead)
+        for _ in range(3):
+            await td.discover_candidates(client, pen_supplier=counting_supplier)
+
+    asyncio.run(three_ticks())
+    s.check("a failed refresh drains the pen ONCE, not once per tick", drains["n"], 1)
+    s.check_true("and the retry gap is shorter than the normal TTL, so it recovers",
+                 0 < td.DISCOVERY_FAILURE_RETRY_S < td.DISCOVERY_CACHE_TTL_S)
+
     # =========================================== USER-ADJUSTABLE FLOORS
     print("\n[FLOOR] the bounds are derived from the gate, not typed in")
     # If B_SENTINEL's depth bar ever moves, the ceiling on a user-set floor
@@ -763,14 +795,14 @@ def run(token_discovery) -> Suite:
     # again.
     fresh()
     handler = router(jup_traded=[jup(820, liquidity=LOW)])
-    first = asyncio.get_event_loop().run_until_complete(
+    first = asyncio.run(
         td.discover_candidates(client_for(handler), min_liquidity_usd=HIGH))
     s.check("the high floor excludes it", first, [])
-    second = asyncio.get_event_loop().run_until_complete(
+    second = asyncio.run(
         td.discover_candidates(client_for(handler), min_liquidity_usd=LOW))
     s.check_true("lowering the floor takes effect WITHOUT force_refresh",
                  make_address(820) in second)
-    third = asyncio.get_event_loop().run_until_complete(
+    third = asyncio.run(
         td.discover_candidates(client_for(handler), min_liquidity_usd=LOW))
     s.check("an unchanged floor still serves the cache", third, second)
 

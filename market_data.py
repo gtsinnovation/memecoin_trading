@@ -205,6 +205,29 @@ def _price_for_side(pair: Dict[str, Any], token_address: str) -> Optional[float]
     return None
 
 
+def _opt_count(bucket: Optional[dict], key: str) -> Optional[int]:
+    """A transaction count, or None when the provider did not report one.
+
+    `int(bucket.get(key) or 0)` collapsed two different facts into the same
+    number: "DexScreener says there were zero trades this hour" (a dead token,
+    a real and damning measurement) and "DexScreener returned no txns block at
+    all" (we don't know). Downstream both became a hard 0, so the liveness
+    filter in stage2_check.sql section 5b silently dropped every unmeasured
+    token into the dead bucket, and staleness_report counted them as tokens
+    with no counterparty. An absent measurement must arrive at a gate as an
+    absence.
+    """
+    if not isinstance(bucket, dict):
+        return None
+    raw = bucket.get(key)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _as_pos_float(value: Any) -> Optional[float]:
     """Strictly positive finite float, or None. Prices are strings as often
     as numbers, and a zero or NaN price is not a price."""
@@ -283,9 +306,9 @@ async def fetch_dex_pair_data(client: httpx.AsyncClient, token_address: str) -> 
     # (see engine.node_E_BREADTH). Volume alone can't distinguish one
     # whale buying $10k from five thousand bots buying $2 each, and those
     # are very different tokens. Counts are what separate them.
-    txns_h1 = (best.get("txns") or {}).get("h1") or {}
-    txns_h1_buys = int(txns_h1.get("buys") or 0)
-    txns_h1_sells = int(txns_h1.get("sells") or 0)
+    txns_h1 = (best.get("txns") or {}).get("h1")
+    txns_h1_buys = _opt_count(txns_h1, "buys")
+    txns_h1_sells = _opt_count(txns_h1, "sells")
 
     # m5 is the FINEST bucket DexScreener publishes -- there is nothing below
     # five minutes, and chasing shorter windows off-API would be a mistake
@@ -304,9 +327,9 @@ async def fetch_dex_pair_data(client: httpx.AsyncClient, token_address: str) -> 
     # not imbalance in SIZE (900 one-dollar buys against 50 large sells is
     # distribution, not accumulation). Adding it as a gate on intuition is
     # how E_SIGNAL came to filter on noise for months.
-    txns_m5 = (best.get("txns") or {}).get("m5") or {}
-    txns_m5_buys = int(txns_m5.get("buys") or 0)
-    txns_m5_sells = int(txns_m5.get("sells") or 0)
+    txns_m5 = (best.get("txns") or {}).get("m5")
+    txns_m5_buys = _opt_count(txns_m5, "buys")
+    txns_m5_sells = _opt_count(txns_m5, "sells")
     volume_m5 = float(volume.get("m5") or 0.0)
     price_change = best.get("priceChange") or {}
 
@@ -381,6 +404,24 @@ def is_plausible_solana_address(value: Any) -> bool:
 def fetch_current_prices_sync(token_addresses: List[str]) -> Dict[str, float]:
     """Current USD prices for many tokens at once.
 
+    Thin wrapper over fetch_current_marks_sync() -- kept because every caller
+    that only needs a price should not have to know about the rest of the mark.
+    """
+    return {a: m["price"] for a, m in fetch_current_marks_sync(token_addresses).items()}
+
+
+def fetch_current_marks_sync(token_addresses: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Current price PLUS the liveness evidence from the same response.
+
+    DexScreener returns the whole pair object on this endpoint, transaction
+    counts included, so the evidence costs nothing extra -- no second request,
+    no second rate-limit budget. Discarding it was what left mark_to_market
+    unable to tell a real fill from a stale print.
+
+    Each value is {"price", "liquidity_usd", "txns_m5", "txns_h1"}, where the
+    two counts are None when the provider reported none. None is not zero: see
+    _opt_count.
+
     Synchronous on purpose: this is called from evaluate_open_positions(),
     which the pipeline already runs in a worker thread via run_in_executor,
     so a blocking client is the simpler correct choice there than threading
@@ -395,7 +436,7 @@ def fetch_current_prices_sync(token_addresses: List[str]) -> Dict[str, float]:
     if not token_addresses:
         return {}
 
-    prices: Dict[str, float] = {}
+    marks: Dict[str, Dict[str, Any]] = {}
     unique = list(dict.fromkeys(a for a in token_addresses if is_plausible_solana_address(a)))
     skipped = [a for a in token_addresses if a and not is_plausible_solana_address(a)]
     if skipped:
@@ -437,13 +478,28 @@ def fetch_current_prices_sync(token_addresses: List[str]) -> Dict[str, float]:
                         # A token can appear in many pools; keep the deepest
                         # pool's price, matching how fetch_dex_pair_data picks.
                         liq = float((pair.get("liquidity") or {}).get("usd") or 0.0)
-                        if addr not in prices or liq > prices.get(f"__liq__{addr}", 0.0):
-                            prices[addr] = value
-                            prices[f"__liq__{addr}"] = liq
+                        if addr in marks and liq <= marks[addr]["liquidity_usd"]:
+                            continue
+                        txns = pair.get("txns") or {}
+                        m5, h1 = txns.get("m5"), txns.get("h1")
+
+                        def _total(bucket):
+                            b = _opt_count(bucket, "buys")
+                            sl = _opt_count(bucket, "sells")
+                            if b is None and sl is None:
+                                return None
+                            return (b or 0) + (sl or 0)
+
+                        marks[addr] = {
+                            "price": value,
+                            "liquidity_usd": liq,
+                            "txns_m5": _total(m5),
+                            "txns_h1": _total(h1),
+                        }
     except Exception as e:
         logger.warning(f"Batch price lookup failed: {e}")
 
-    return {k: v for k, v in prices.items() if not k.startswith("__liq__")}
+    return marks
 
 
 def onchain_flow_velocity_proxy(volume_h1: float, liquidity_usd: float) -> float:

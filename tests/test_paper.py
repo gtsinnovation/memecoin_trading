@@ -38,6 +38,20 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
             conn.autocommit = True
 
     def age(addr, minutes):
+        """Age the trade AND its last mark -- i.e. it has been silent that long.
+
+        Abandonment keys on SILENCE, not on total age. Pushing evaluated_at
+        back while leaving last_marked_at at now describes a trade that is old
+        but still pricing happily, which must NOT be abandoned; see the
+        [SILENCE] block below, which asserts exactly that.
+        """
+        with conn.cursor() as cur:
+            cur.execute("UPDATE paper_trades SET evaluated_at = CURRENT_TIMESTAMP - "
+                        "(%s * INTERVAL '1 minute'), last_marked_at = CURRENT_TIMESTAMP - "
+                        "(%s * INTERVAL '1 minute') WHERE token_address = %s;",
+                        (minutes, minutes, addr))
+
+    def age_entry_only(addr, minutes):
         with conn.cursor() as cur:
             cur.execute("UPDATE paper_trades SET evaluated_at = CURRENT_TIMESTAMP - "
                         "(%s * INTERVAL '1 minute') WHERE token_address = %s;", (minutes, addr))
@@ -54,10 +68,23 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
         stats = paper_trading.mark_to_market(conn, {})       # nothing prices at all
         s.check_true("abandoned once past the window", stats["abandoned_no_price"] >= 1)
         with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT status, exit_reason FROM paper_trades "
-                        "WHERE token_address=%s;", (dead,))
-            s.check("status ABANDONED / reason NO_PRICE", sorted(cur.fetchall()),
-                    [("ABANDONED", "NO_PRICE")])
+            # EACH ARM GETS ITS OWN CORRECT TERMINAL STATE. This used to
+            # assert a single pair, because both arms went down the ABANDONED
+            # path -- the LIMIT order was recorded as "we lost the price feed"
+            # when what actually happened is that its trigger was never touched
+            # inside the fill window. Those are different facts, and conflating
+            # them took the unfilled order out of the fill-rate denominator.
+            #
+            # The original guarantee is unchanged and now stated per arm: the
+            # token terminates, nothing is fabricated, and it stops being
+            # priced. 200 minutes is past BOTH the 60-minute fill window and
+            # the 180-minute abandonment window, so both fire.
+            cur.execute("SELECT entry_model, status, exit_reason FROM paper_trades "
+                        "WHERE token_address=%s ORDER BY entry_model;", (dead,))
+            s.check("IMMEDIATE abandoned / LIMIT expired, each with its own reason",
+                    cur.fetchall(),
+                    [("IMMEDIATE", "ABANDONED", "NO_PRICE"),
+                     ("LIMIT", "EXPIRED", None)])
             # The rule that must survive: we never invent a price we did not see.
             cur.execute("SELECT count(*) FROM paper_trades WHERE token_address=%s "
                         "AND (net_pnl_percent IS NOT NULL OR exit_price IS NOT NULL);", (dead,))
@@ -169,6 +196,26 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
         s.check("median is over trades, not over marks", med, 950.0)
         s.check_true("not dragged to the marked token's value", med != 1800.0)
 
+        print("\n[COSTS] the unmeasured stand-in must not undercut the gate it mirrors")
+        # The old comment asserted equality with G_ANCHOR's ceiling and the two
+        # numbers were 3.0 and 2.5. The real invariant is >=: a token whose impact
+        # could not be quoted is thinner than anything the gate would approve, so
+        # charging it LESS than the worst approvable case understates the cost of
+        # exactly the rows that end up in the control arm.
+        import os as _os, re as _re
+        engine_src = open(_os.path.join(_os.path.dirname(_os.path.dirname(
+            _os.path.abspath(__file__))), "engine.py"), encoding="utf-8").read()
+        m = _re.search(r"max_slippage\s*=\s*([0-9.]+)", engine_src)
+        s.check_true("G_ANCHOR's impact ceiling was found in engine.py", m is not None)
+        ceiling = float(m.group(1)) if m else None
+        s.check_true(f"the stand-in ({paper_trading.PAPER_UNMEASURED_SLIPPAGE_PERCENT}) is at "
+                     f"least the gate ceiling ({ceiling})",
+                     ceiling is not None
+                     and paper_trading.PAPER_UNMEASURED_SLIPPAGE_PERCENT >= ceiling)
+        s.check_true("an unmeasured trade costs strictly more than a measured one at the ceiling",
+                     paper_trading.total_cost_percent(None)
+                     > paper_trading.total_cost_percent(ceiling * 0.999))
+
         print("\n[REJECT REASON] the gate name alone cannot say WHY")
         # F_ATLAS refuses for two unrelated reasons and both record
         # rejected_by='F_ATLAS'. One is the gate working; the other is a
@@ -248,6 +295,119 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
                         "FROM paper_trades WHERE token_address=%s LIMIT 1;", (nochain,))
             s.check("an unmeasured chain figure is NULL, not 0", list(cur.fetchone()),
                     [None, None])
+        print("\n[SILENCE] one rate-limited tick must not wipe the open book")
+        # Keyed on total age, a single 429 abandoned EVERY open trade older
+        # than the threshold at once -- positions that had priced happily
+        # thirty seconds earlier. The trades it wiped were the long-lived
+        # ones, which is to say the winners: the sample lost its right tail
+        # and the loss looked like ordinary censoring.
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE paper_trades CASCADE;")
+        veteran = make_address(41)
+        rec(_snap(veteran))
+        paper_trading.mark_to_market(conn, {veteran: 1.0})     # sets last_marked_at
+        age_entry_only(veteran, paper_trading.UNPRICEABLE_ABANDON_MINUTES + 120)
+        stats = paper_trading.mark_to_market(conn, {})          # one tick prices nothing
+        s.check("an old but freshly-priced trade survives a missed tick",
+                stats["abandoned_no_price"], 0)
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM paper_trades WHERE token_address=%s "
+                        "AND status IN ('OPEN','PENDING_FILL');", (veteran,))
+            s.check_true("still live", cur.fetchone()[0] >= 1)
+        # ...and genuine silence still abandons it.
+        age(veteran, paper_trading.UNPRICEABLE_ABANDON_MINUTES + 120)
+        stats = paper_trading.mark_to_market(conn, {})
+        s.check_true("sustained silence still abandons", stats["abandoned_no_price"] >= 1)
+
+        print("\n[FILL RATE] an unfilled LIMIT expires without needing a price")
+        # "The trigger was never touched in 60 minutes" is a determinate fact
+        # about the past, knowable with no price at all. Gating it on price
+        # availability sent every dead token's unfilled order down the
+        # ABANDONED path, which removed it from the fill-rate DENOMINATOR --
+        # reporting 62.5% filled against a true 50%.
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE paper_trades CASCADE;")
+        ghost = make_address(42)
+        rec(_snap(ghost))
+        age(ghost, paper_trading.LIMIT_FILL_WINDOW_MINUTES + 5)
+        stats = paper_trading.mark_to_market(conn, {})          # never prices again
+        s.check_true("expired, not abandoned", stats["expired"] >= 1)
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM paper_trades WHERE token_address=%s "
+                        "AND entry_model='LIMIT' AND status='EXPIRED';", (ghost,))
+            s.check_true("the LIMIT arm is EXPIRED", cur.fetchone()[0] == 1)
+            cur.execute("SELECT COUNT(*) FROM paper_trades WHERE token_address=%s "
+                        "AND entry_model='LIMIT' AND status='ABANDONED';", (ghost,))
+            s.check("it did not leave the fill-rate denominator", cur.fetchone()[0], 0)
+
+        print("\n[CONFIRMATION] a target hit on a dead token is not a win")
+        # The mark that crossed the target had ZERO transactions behind it.
+        # The trade still closes -- refusing the exit would change the fill
+        # model -- but it is flagged, so the analysis can exclude it instead
+        # of counting a stale print as alpha.
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE paper_trades CASCADE;")
+        ghost = make_address(43)
+        rec(_snap(ghost, price=1.0))
+        with conn.cursor() as cur:
+            cur.execute("SELECT target_exit_price FROM paper_trades WHERE "
+                        "token_address=%s AND entry_model='IMMEDIATE';", (ghost,))
+            tgt = float(cur.fetchone()[0])
+        paper_trading.mark_to_market(
+            conn, {ghost: {"price": tgt * 1.05, "txns_m5": 0, "txns_h1": 0}})
+        with conn.cursor() as cur:
+            cur.execute("SELECT exit_reason, exit_confirmed, exit_txns_m5 FROM paper_trades "
+                        "WHERE token_address=%s AND status='CLOSED' "
+                        "AND entry_model='IMMEDIATE';", (ghost,))
+            row = cur.fetchone()
+        s.check("it still books as a target hit", row[0], "TARGET_HIT")
+        s.check("but it is flagged unconfirmed", row[1], False)
+        s.check("and the evidence is stored so the flag is re-derivable", row[2], 0)
+
+        print("\n[CONFIRMATION] a target hit with real trades behind it stands")
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE paper_trades CASCADE;")
+        live = make_address(44)
+        rec(_snap(live, price=1.0))
+        with conn.cursor() as cur:
+            cur.execute("SELECT target_exit_price FROM paper_trades WHERE "
+                        "token_address=%s AND entry_model='IMMEDIATE';", (live,))
+            tgt = float(cur.fetchone()[0])
+        paper_trading.mark_to_market(
+            conn, {live: {"price": tgt * 1.05, "txns_m5": 12, "txns_h1": 300}})
+        with conn.cursor() as cur:
+            cur.execute("SELECT exit_confirmed FROM paper_trades WHERE token_address=%s "
+                        "AND status='CLOSED' AND entry_model='IMMEDIATE';", (live,))
+            s.check("confirmed", cur.fetchone()[0], True)
+        # results_summary must separate the two and never silently substitute
+        # the filtered figure for the headline one.
+        rows = paper_trading.results_summary(conn)
+        s.check_true("results_summary reports a confirmed-exit count",
+                     any(r.get("exits_confirmed") for r in rows))
+        s.check_true("and a confirmed share",
+                     any(r.get("exit_confirmed_rate") is not None for r in rows))
+
+        print("\n[CONFIRMATION] a legacy bare price records unknown, never confirmed")
+        # Every existing caller passes a plain float. That must not be read as
+        # evidence -- doing so would reinstate the defect wherever the richer
+        # mark has not been threaded through yet.
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE paper_trades CASCADE;")
+        legacy = make_address(45)
+        rec(_snap(legacy, price=1.0))
+        with conn.cursor() as cur:
+            cur.execute("SELECT target_exit_price FROM paper_trades WHERE "
+                        "token_address=%s AND entry_model='IMMEDIATE';", (legacy,))
+            tgt = float(cur.fetchone()[0])
+        paper_trading.mark_to_market(conn, {legacy: tgt * 1.05})
+        with conn.cursor() as cur:
+            cur.execute("SELECT exit_reason, exit_confirmed FROM paper_trades "
+                        "WHERE token_address=%s AND status='CLOSED' "
+                        "AND entry_model='IMMEDIATE';", (legacy,))
+            row = cur.fetchone()
+        s.check("the exit still happens", row[0], "TARGET_HIT")
+        s.check("but carries no confirmation", row[1], None)
+
     finally:
         conn.close()
     

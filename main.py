@@ -33,6 +33,7 @@ try:
     import market_data
     import token_discovery
     import discovery_pen
+    import retention
     import paper_trading
     import app_time
 except Exception as import_error:
@@ -66,6 +67,9 @@ WATCHLIST_TOKEN_ADDRESSES = [
 # makes the experiment produce an independent sample rather than the same
 # few tokens over and over. Set a watchlist to override discovery entirely.
 ENABLE_TOKEN_DISCOVERY = os.environ.get("ENABLE_TOKEN_DISCOVERY", "true").strip().lower() == "true"
+
+# Snapshot attempts a pen token gets before the queue gives up on it.
+PEN_SNAPSHOT_ATTEMPTS = int(os.environ.get("PEN_SNAPSHOT_ATTEMPTS", "3"))
 
 ENABLE_STAGE3_EXECUTION = os.environ.get("ENABLE_STAGE3_EXECUTION", "false").strip().lower() == "true"
 SIGNER_SERVICE_URL = os.environ.get("SIGNER_SERVICE_URL", "http://signer:8100")
@@ -488,7 +492,20 @@ def _invalidation_proximity_percent(price, invalidation_level):
 # Reasons check_kill_switch() can return that mean "I could not verify the
 # gate", as opposed to "the gate is shut and I already wrote that to the
 # database". Only the former needs the caller to act.
-UNVERIFIED_GATE_REASONS = ("SETTINGS_UNAVAILABLE", "UNKNOWN")
+# Reasons that mean "the kill switch could not be EVALUATED", as opposed to
+# "it was evaluated, it is shut, and the pause is already recorded".
+#
+# GATE_CHECK_FAILED was missing. It is the reason check_kill_switch returns
+# from its OWN except handler (engine.py) -- the one path where the realized
+# loss, drawdown and consecutive-loss thresholds were never computed and no
+# run_status was written. Treating it as "already recorded" meant a statement
+# timeout, a transient DB error or an unapplied migration silently disabled
+# the entire loss limiter for that tick while positions kept opening.
+#
+# Anything not in this tuple is trusted to have recorded its own pause. A new
+# failure reason added to check_kill_switch MUST be added here too; the test
+# suite asserts the two stay in step.
+UNVERIFIED_GATE_REASONS = ("SETTINGS_UNAVAILABLE", "UNKNOWN", "GATE_CHECK_FAILED")
 
 
 def kill_switch_pause_reason(verdict) -> Optional[str]:
@@ -658,12 +675,17 @@ def _mark_paper_trades() -> None:
             addresses = paper_trading.open_token_addresses(conn)
             if not addresses:
                 return
-            prices = market_data.fetch_current_prices_sync(addresses)
-            stats = paper_trading.mark_to_market(conn, prices)
+            # marks, not bare prices: the same DexScreener response carries
+            # the transaction counts that say whether an exit at this mark
+            # could actually have filled. See paper_trading.exit_is_confirmed.
+            marks = market_data.fetch_current_marks_sync(addresses)
+            stats = paper_trading.mark_to_market(conn, marks)
             # Independent of the barrier trades above: records what each token
             # actually did at fixed elapsed times. Must run even when
             # mark_to_market() changed nothing, because a token whose barrier
             # trade closed long ago still owes its later horizons.
+            # mark_horizons needs only the price half of each mark.
+            prices = {a: mk["price"] for a, mk in marks.items()}
             horizons = paper_trading.mark_horizons(conn, prices)
             if any(stats.values()):
                 logger.info(f"Paper trades: {stats}")
@@ -798,6 +820,9 @@ async def pipeline_executor_worker():
     # age out of the 15-90 minute window and cannot be recovered. Breadth
     # tokens are still there next tick.
     pen_queue: "collections.deque" = collections.deque(maxlen=400)
+    # How many snapshot attempts a pen token gets before it is abandoned.
+    # Bounded so one permanently unpriceable token cannot block the queue.
+    _pen_misses: dict = {}
     while True:
         try:
             candidates = WATCHLIST_TOKEN_ADDRESSES
@@ -938,9 +963,34 @@ async def pipeline_executor_worker():
             # one an hour. The queue drains within a few ticks of each
             # refresh, so breadth still fills the great majority of
             # evaluations; the pen simply stops being invisible.
+            # Peek, do not pop. A pen token is scarce and already carries
+            # released_at in the database, so losing it here loses it
+            # permanently -- and the two ways to lose it are both common:
+            # get_snapshot returning None (routine for thin, newly indexed
+            # tokens, which is the entire pen population) and any exception
+            # later in the tick. The pop happens only once the token has
+            # actually produced a snapshot.
             from_pen = bool(pen_queue)
-            target_address = pen_queue.popleft() if from_pen else random.choice(candidates)
+            target_address = pen_queue[0] if from_pen else random.choice(candidates)
             snapshot = await market_data.get_snapshot(http_client, target_address)
+            if from_pen and snapshot is not None and pen_queue and pen_queue[0] == target_address:
+                # Committed: this token produced data and is being evaluated.
+                pen_queue.popleft()
+            if snapshot is None and from_pen:
+                # Unpriceable at the front of the queue. Drop it after a
+                # bounded number of attempts rather than retrying it every
+                # tick and starving the tokens behind it -- but not on the
+                # first miss, because a single provider blip should not cost
+                # a token the pen waited thirty minutes for.
+                _pen_misses[target_address] = _pen_misses.get(target_address, 0) + 1
+                if _pen_misses[target_address] >= PEN_SNAPSHOT_ATTEMPTS:
+                    if pen_queue and pen_queue[0] == target_address:
+                        pen_queue.popleft()
+                    _pen_misses.pop(target_address, None)
+                    logger.info(
+                        f"Pen token {target_address} gave no market data in "
+                        f"{PEN_SNAPSHOT_ATTEMPTS} attempts; dropping it from the queue.")
+
             if snapshot is None:
                 # No indexed trading pair for this token right now (e.g. a
                 # pre-graduation pump.fun token, or a bad address) -- skip
@@ -1104,9 +1154,20 @@ async def pipeline_executor_worker():
             await ws_manager.broadcast(broadcast_payload)
         except Exception as e:
             logger.error(f"Error handling network execution loops: {e}")
+            # Closing a pool whose connections are already in the failed state
+            # that caused this exception can itself raise -- and an exception
+            # raised HERE escapes the while loop and kills the worker for
+            # good. The recovery path must not be able to do more damage than
+            # the fault it is recovering from.
             if pool is not None:
-                await pool.close()
-                pool = None
+                try:
+                    await pool.close()
+                except Exception as close_error:
+                    logger.error(
+                        f"Pool close failed during recovery ({type(close_error).__name__}: "
+                        f"{close_error}); dropping the reference and continuing.")
+                finally:
+                    pool = None
 
         await asyncio.sleep(3.0)
 
@@ -1144,11 +1205,70 @@ async def discovery_pen_worker():
         await asyncio.sleep(discovery_pen.PEN_CAPTURE_INTERVAL_S)
 
 
+# Strong references to the background tasks. Without these the event loop
+# holds only a weak reference and CPython may collect a running task.
+_BACKGROUND_TASKS: set = set()
+
+
+def _supervise(task: "asyncio.Task", name: str) -> None:
+    """Keep the task alive and make its death LOUD.
+
+    A bare create_task() is fire-and-forget: if an exception escapes the
+    worker's loop the coroutine simply ends, nothing awaits it, and the only
+    trace is a "Task exception was never retrieved" message emitted whenever
+    the garbage collector gets around to it. uvicorn keeps serving, the
+    dashboard keeps rendering, the OTHER worker keeps logging healthy lines --
+    and the pipeline is dead. That is the single most expensive failure mode
+    this process has, because everything about it looks fine.
+    """
+    _BACKGROUND_TASKS.add(task)
+
+    def _done(t: "asyncio.Task") -> None:
+        _BACKGROUND_TASKS.discard(t)
+        if t.cancelled():
+            logger.info(f"Background worker '{name}' was cancelled.")
+            return
+        exc = t.exception()
+        if exc is None:
+            logger.error(
+                f"Background worker '{name}' RETURNED. These loops are not "
+                f"supposed to terminate; the pipeline is now stopped while the "
+                f"web app keeps serving.")
+        else:
+            logger.error(
+                f"Background worker '{name}' DIED: {type(exc).__name__}: {exc}",
+                exc_info=exc)
+        try:
+            write_system_alert(
+                "CRITICAL", "WORKER",
+                f"Background worker '{name}' stopped. The pipeline is not "
+                f"evaluating tokens. Restart the container.")
+        except Exception:
+            # The alert table is the thing we would use to notice this, so if
+            # it is also unreachable the log line above is all there is.
+            pass
+
+    task.add_done_callback(_done)
+
+
 @app.on_event("startup")
 def start_pipeline_loops():
-    asyncio.create_task(pipeline_executor_worker())
+    _supervise(asyncio.create_task(pipeline_executor_worker()), "pipeline")
     if ENABLE_TOKEN_DISCOVERY:
-        asyncio.create_task(discovery_pen_worker())
+        _supervise(asyncio.create_task(discovery_pen_worker()), "discovery-pen")
+    _supervise(asyncio.create_task(retention.retention_worker(DB_DSN)), "retention")
+
+
+@app.on_event("shutdown")
+async def stop_pipeline_loops():
+    """Cancel the workers on SIGTERM so the container exits promptly."""
+    for task in list(_BACKGROUND_TASKS):
+        task.cancel()
+    for task in list(_BACKGROUND_TASKS):
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 @app.websocket("/ws/metrics")
 async def websocket_route(websocket: WebSocket):

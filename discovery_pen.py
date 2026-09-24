@@ -259,23 +259,46 @@ async def release_due(conn, client: httpx.AsyncClient, *,
     # at thirty minutes is not re-checked: re-offering it every refresh would
     # spend the same evaluation slot repeatedly on the candidate least likely
     # to deserve it, and starve the ones arriving behind it.
+    # Mark ONLY the tokens we actually measured.
+    #
+    # Marking every candidate meant a single failed DexScreener batch -- one
+    # 429, one timeout -- permanently burned thirty tokens that were never
+    # read, and a failed call burned all hundred and twenty. They vanish from
+    # the due index and can never be offered again. Worse, they land in the
+    # data as `qualified=false, liquidity_at_release=NULL`, indistinguishable
+    # in aggregate from genuinely thin tokens, corrupting the distribution
+    # this marking exists to collect.
+    #
+    # Unmeasured tokens are left alone and retried on the next refresh. That
+    # retry is bounded without a counter: they age out of the window within
+    # the hour and stop being selected.
+    measured = [m for m in candidates if m in liquidity]
+    unread = len(candidates) - len(measured)
     try:
-        await conn.executemany(
-            """
-            UPDATE discovery_pen
-            SET released_at = CURRENT_TIMESTAMP,
-                liquidity_at_release = $2::numeric,
-                qualified = $3::boolean
-            WHERE token_address = $1;
-            """,
-            [(m, liquidity.get(m), m in set(qualified)) for m in candidates])
+        if measured:
+            await conn.executemany(
+                """
+                UPDATE discovery_pen
+                SET released_at = CURRENT_TIMESTAMP,
+                    liquidity_at_release = $2::numeric,
+                    qualified = $3::boolean
+                WHERE token_address = $1;
+                """,
+                [(m, liquidity.get(m), m in set(qualified)) for m in measured])
     except Exception as e:
         logger.warning(f"Pen release marking failed: {type(e).__name__}: {e}")
 
     if candidates:
         logger.info(
-            f"Pen released {len(qualified)}/{len(candidates)} aged tokens "
-            f"above ${floor_usd:,.0f} (window {min_age_minutes:.0f}-{max_age_minutes:.0f} min).")
+            f"Pen released {len(qualified)}/{len(measured)} measured tokens "
+            f"above ${floor_usd:,.0f} (window {min_age_minutes:.0f}-{max_age_minutes:.0f} min)"
+            + (f"; {unread} unreadable, left for retry." if unread else "."))
+    # Every candidate unreadable is a provider problem, not a thin market, and
+    # it would otherwise look identical to a quiet night in the release counts.
+    if candidates and not measured:
+        logger.warning(
+            f"Pen could not read liquidity for ANY of {len(candidates)} due tokens. "
+            f"That is a provider failure, not a thin market -- none were marked.")
     return qualified
 
 

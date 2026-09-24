@@ -12,8 +12,108 @@ import paper_trading as pt
 import execution_rails as rails
 
 
+def _stray_percent_signs():
+    """Percent signs in a query string that psycopg2 will read as parameters.
+
+    psycopg2 scans the WHOLE query for parameter syntax -- SQL comments
+    included -- and C-style format flags are legal, so a percent sign followed
+    by a space and an "s" parses as a space-flagged placeholder. Writing
+    "62 percent staleness" as digits and a symbol inside an explanatory comment
+    therefore added a THIRD parameter to a two-parameter query, and the only
+    symptom was "IndexError: tuple index out of range" from a function whose
+    SQL looked obviously correct. Spell percentages out in words.
+
+    Only a bare percent sign is a problem: "%s" is a placeholder and "%%" is an
+    escaped literal. Everything else is flagged.
+    """
+    import ast as _ast, re as _re, glob as _glob, os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    bad = []
+    for path in sorted(_glob.glob(_os.path.join(root, "*.py"))):
+        try:
+            tree = _ast.parse(open(path, encoding="utf-8").read())
+        except SyntaxError:
+            continue
+        for node in _ast.walk(tree):
+            if not (isinstance(node, _ast.Call)
+                    and isinstance(node.func, _ast.Attribute)
+                    and node.func.attr == "execute" and node.args):
+                continue
+            q = node.args[0]
+            if not (isinstance(q, _ast.Constant) and isinstance(q.value, str)):
+                continue
+            for m in _re.finditer(r"%(.)", q.value):
+                if m.group(1) not in ("s", "%"):
+                    bad.append(f"{_os.path.basename(path)}:{node.lineno}")
+    return sorted(set(bad))
+
+def _compose_coverage():
+    """Every knob the RUNTIME modules read, minus what compose forwards."""
+    import os as _os, re as _re, glob as _glob
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    compose = open(_os.path.join(root, "docker-compose.yml"), encoding="utf-8").read()
+    # Probes, smoke scripts and one-off calibration tools are not shipped in
+    # the running container, so their knobs are not compose's business.
+    skip_prefix = ("probe_", "smoke", "explore_", "calibrate_", "gmgn_diagnose",
+                   "test_provider")
+    missing = []
+    for path in sorted(_glob.glob(_os.path.join(root, "*.py"))):
+        name = _os.path.basename(path)
+        if name.startswith(skip_prefix):
+            continue
+        text = open(path, encoding="utf-8").read()
+        for knob in _re.findall(r'os\.environ\.get\("([A-Z][A-Z0-9_]+)"', text):
+            if knob not in compose:
+                missing.append(f"{name}:{knob}")
+    return sorted(set(missing))
+
+
 def run() -> Suite:
     s = Suite("hardening")
+
+    # --- no bare percent signs inside query strings ------------------------
+    s.check("no query string contains a percent sign psycopg2 would misread",
+            _stray_percent_signs(), [])
+
+    # --- an exit needs a counterparty, not just a quote --------------------
+    # A take-profit is a LIMIT SELL. On a token that has not traded in five
+    # minutes the quote is the last print, not a price anyone will pay, so a
+    # lone stale or wicked figure crossing the target was booked as a clean
+    # win at the target with no trade behind it. The error is not symmetric:
+    # the gates select thin tokens, where one print moves the quote furthest,
+    # so the fabricated wins land disproportionately in APPROVED.
+    s.check("transactions at the mark confirm the exit", pt.exit_is_confirmed(4), True)
+    s.check("zero transactions refute it", pt.exit_is_confirmed(0), False)
+    s.check("no data at all is unknown, not refuted", pt.exit_is_confirmed(None), None)
+    # h1 may only REFUTE. An hour-old count is weak evidence about the last
+    # five minutes -- but if nothing traded all hour, nothing traded just now.
+    s.check("a silent hour refutes when m5 is missing",
+            pt.exit_is_confirmed(None, 0), False)
+    s.check("a busy hour does NOT confirm a silent five minutes",
+            pt.exit_is_confirmed(0, 900), False)
+    s.check("a busy hour alone stays unknown", pt.exit_is_confirmed(None, 900), None)
+    # Unknown must not be laundered into confirmed anywhere downstream: the
+    # analysis filters on `IS TRUE`, so both None and False have to fall out.
+    s.check_true("unknown is not truthy", pt.exit_is_confirmed(None) is not True)
+
+    # A bare price carries no evidence and must land as unknown -- never as
+    # confirmed, which would restore the defect for every legacy caller.
+    s.check("a bare price yields no evidence", pt._as_mark(1.5), (1.5, None, None))
+    s.check("a full mark is unpacked",
+            pt._as_mark({"price": 2.0, "txns_m5": 7, "txns_h1": 40}), (2.0, 7, 40))
+    s.check("a mark missing its counts is unknown, not zero",
+            pt._as_mark({"price": 2.0}), (2.0, None, None))
+
+    # --- compose forwards every knob, across the WHOLE codebase ------------
+    # The existing check covered token_discovery.py only, and passed while
+    # sixteen knobs elsewhere were unforwarded -- among them the horizon set,
+    # the LIMIT fill window and both abandonment clocks. Compose forwards ONLY
+    # what it names: an unlisted variable does not error, it silently keeps
+    # its code default. So the knob can be set in .env, verified by eye, and
+    # change nothing -- indistinguishable from the knob not working, which is
+    # the kind of thing that gets "fixed" by setting it again.
+    s.check("every knob every shipped module reads is forwarded by compose",
+            _compose_coverage(), [])
 
     # --- unmeasured slippage must never be free ---
     fee_only = round(pt.PAPER_FEE_PERCENT_PER_SIDE * 2.0, 4)

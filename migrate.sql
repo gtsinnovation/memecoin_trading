@@ -362,3 +362,11 @@ ALTER TABLE discovery_pen ADD COLUMN IF NOT EXISTS qualified BOOLEAN;
 -- go quiet for six hours and the cohort silently becomes a study of
 -- established tokens while every count still looks healthy.
 ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS discovery_source VARCHAR(20);
+
+-- Exit confirmation: did the mark that triggered this exit have a
+-- counterparty? See the column comments in schema.sql. Existing rows keep
+-- NULL, which reads as "unknown" -- correct, because for those rows it is.
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS exit_confirmed BOOLEAN;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS exit_txns_m5 INTEGER;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS exit_txns_h1 INTEGER;
+

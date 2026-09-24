@@ -229,6 +229,46 @@ def run(asyncpg, discovery_pen, dsn) -> Suite:
         c, dex_client({}, fail=True), min_age_minutes=15, max_age_minutes=90, floor_usd=8000))
     s.check("nor is one whose batch call failed", out, [])
 
+    print("\n[PEN] an unreadable token is NOT burned -- it is left for retry")
+    # One DexScreener 429 used to permanently consume every token in the
+    # batch: marked released, never offered again, and recorded as
+    # qualified=false with a NULL liquidity -- indistinguishable in aggregate
+    # from a genuinely thin token, corrupting the distribution the marking
+    # exists to collect.
+    clear()
+    unread_a, unread_b = make_address(980), make_address(981)
+
+    async def seed_two(conn):
+        await seed(conn, unread_a, 40)
+        await seed(conn, unread_b, 40)
+    run_async(seed_two)
+    out = run_async(lambda c: pen.release_due(
+        c, dex_client({}, fail=True), min_age_minutes=30, max_age_minutes=90, floor_usd=8000))
+    s.check("nothing is offered when nothing could be read", out, [])
+    still_due = run_async(lambda c: c.fetchval(
+        "SELECT count(*) FROM discovery_pen WHERE released_at IS NULL;"))
+    s.check("both remain unreleased, so the next refresh can retry them",
+            int(still_due), 2)
+
+    # A token that IS read, and fails the floor, is still marked -- otherwise
+    # it would be re-examined forever and starve the queue behind it.
+    clear()
+    thin_read, no_read = make_address(982), make_address(983)
+
+    async def seed_mixed(conn):
+        await seed(conn, thin_read, 40)
+        await seed(conn, no_read, 40)
+    run_async(seed_mixed)
+    run_async(lambda c: pen.release_due(
+        c, dex_client({thin_read: 500.0}),
+        min_age_minutes=30, max_age_minutes=90, floor_usd=8000))
+    marked = run_async(lambda c: c.fetchval(
+        "SELECT released_at IS NOT NULL FROM discovery_pen WHERE token_address=$1;", thin_read))
+    unmarked = run_async(lambda c: c.fetchval(
+        "SELECT released_at IS NULL FROM discovery_pen WHERE token_address=$1;", no_read))
+    s.check_true("a token that was READ and failed the floor is marked", bool(marked))
+    s.check_true("a token in the same batch that could not be read is not", bool(unmarked))
+
     print("\n[PEN] a token is examined once, not re-offered every refresh")
     clear()
     once = make_address(930)

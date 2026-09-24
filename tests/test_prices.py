@@ -99,6 +99,21 @@ def run(market_data) -> Suite:
          "priceUsd": "1637.0", "liquidity": {"usd": 1.0}}
     s.check("quote side without priceNative -> None", md._price_for_side(p, SNDK), None)
 
+    # ---------------------------------------- absent counts are not zeroes
+    # `int(bucket.get("buys") or 0)` collapsed "DexScreener says zero trades"
+    # (a dead token -- a real, damning measurement) into "DexScreener sent no
+    # txns block" (we don't know). Both arrived downstream as a hard 0, so
+    # section 5b's liveness filter silently binned every unmeasured token with
+    # the dead ones, and staleness_report counted them as having no
+    # counterparty. The two facts must stay distinguishable.
+    s.check("a reported zero stays zero", md._opt_count({"buys": 0}, "buys"), 0)
+    s.check("an absent key is unknown, not zero", md._opt_count({}, "buys"), None)
+    s.check("an absent bucket is unknown, not zero", md._opt_count(None, "buys"), None)
+    s.check("an explicit null is unknown, not zero",
+            md._opt_count({"buys": None}, "buys"), None)
+    s.check("garbage is unknown, not zero", md._opt_count({"buys": "x"}, "buys"), None)
+    s.check("a real count survives", md._opt_count({"buys": "37"}, "buys"), 37)
+
     # -------------------------------------------------- entry path (async)
     print("\n[ENTRY] fetch_dex_pair_data prices the token it was asked about")
 
@@ -108,8 +123,7 @@ def run(market_data) -> Suite:
         return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
     def fetch(pairs, addr):
-        return asyncio.get_event_loop().run_until_complete(
-            md.fetch_dex_pair_data(entry_client(pairs), addr))
+        return asyncio.run(md.fetch_dex_pair_data(entry_client(pairs), addr))
 
     # The deepest pool is the trap: our token is the quote side there.
     data = fetch([base_side, trap], SNDK)
@@ -218,7 +232,7 @@ def run(market_data) -> Suite:
     def impact(payload):
         def handler(request):
             return httpx.Response(200, json=payload)
-        return asyncio.get_event_loop().run_until_complete(
+        return asyncio.run(
             md.fetch_price_impact_pct(
                 httpx.AsyncClient(transport=httpx.MockTransport(handler)),
                 make_address(950 + impact.n), 500.0))
@@ -258,7 +272,7 @@ def run(market_data) -> Suite:
                                   request=httpx.Request("GET", str(request.url)))
 
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        return asyncio.get_event_loop().run_until_complete(
+        return asyncio.run(
             fmd.fetch_rugcheck_report(client, make_address(960)))
 
     def holder(pct):

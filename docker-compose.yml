@@ -114,6 +114,37 @@ services:
       - PEN_CAPTURE_PAGES=${PEN_CAPTURE_PAGES:-4}
       - PEN_BATCH_SIZE=${PEN_BATCH_SIZE:-30}
       - PEN_RETENTION_MINUTES=${PEN_RETENTION_MINUTES:-360}
+      - DISCOVERY_FAILURE_RETRY_S=${DISCOVERY_FAILURE_RETRY_S:-30}
+      # Knobs that were read by the code but never forwarded here. An
+      # unlisted variable does not fail -- it silently keeps its code default,
+      # so setting it in .env appeared to work and changed nothing. These
+      # include the experiment's own parameters: the horizon set, the fill
+      # window, and both abandonment clocks.
+      - GECKOTERMINAL_API_BASE=${GECKOTERMINAL_API_BASE:-https://api.geckoterminal.com}
+      - PEN_EXAMINE_AGE_MINUTES=${PEN_EXAMINE_AGE_MINUTES:-30}
+      - JUPITER_PRICE_BASE=${JUPITER_PRICE_BASE:-https://api.jup.ag}
+      - PRICE_DISAGREEMENT_WARN_PCT=${PRICE_DISAGREEMENT_WARN_PCT:-10}
+      - RUGCHECK_API_BASE=${RUGCHECK_API_BASE:-https://api.rugcheck.xyz}
+      - GMGN_API_BASE=${GMGN_API_BASE:-https://openapi.gmgn.ai}
+      - GMGN_USER_AGENT=${GMGN_USER_AGENT:-memecoin-trading-agent/1.0}
+      - PEN_SNAPSHOT_ATTEMPTS=${PEN_SNAPSHOT_ATTEMPTS:-3}
+      - JUPITER_CACHE_TTL_S=${JUPITER_CACHE_TTL_S:-120}
+      - LIMIT_FILL_WINDOW_MINUTES=${LIMIT_FILL_WINDOW_MINUTES:-60}
+      - PAPER_FEE_PERCENT_PER_SIDE=${PAPER_FEE_PERCENT_PER_SIDE:-0.25}
+      - PAPER_HORIZONS_MINUTES=${PAPER_HORIZONS_MINUTES:-30,60,120}
+      - PAPER_HORIZON_TOLERANCE=${PAPER_HORIZON_TOLERANCE:-1.5}
+      - PAPER_MAX_HOLD_MINUTES=${PAPER_MAX_HOLD_MINUTES:-360}
+      - PAPER_REENTRY_COOLDOWN_MINUTES=${PAPER_REENTRY_COOLDOWN_MINUTES:-60}
+      - PAPER_UNPRICEABLE_ABANDON_MINUTES=${PAPER_UNPRICEABLE_ABANDON_MINUTES:-180}
+      # Bounded storage for operational tables (retention.py). The
+      # experiment's own tables -- paper_trades, paper_horizon_returns --
+      # are deliberately absent from this list and are never pruned.
+      - RETENTION_ENABLED=${RETENTION_ENABLED:-true}
+      - RETENTION_INTERVAL_S=${RETENTION_INTERVAL_S:-900}
+      - RETENTION_BATCH=${RETENTION_BATCH:-5000}
+      - ALERT_RETENTION_HOURS=${ALERT_RETENTION_HOURS:-72}
+      - AUDIT_RETENTION_HOURS=${AUDIT_RETENTION_HOURS:-336}
+      - HOLDER_SAMPLE_RETENTION_HOURS=${HOLDER_SAMPLE_RETENTION_HOURS:-168}
       - JUPITER_MIN_AGE_MINUTES=${JUPITER_MIN_AGE_MINUTES:-15}
       - JUPITER_MAX_AGE_MINUTES=${JUPITER_MAX_AGE_MINUTES:-90}
       - JUPITER_MIN_INTERVAL_S=${JUPITER_MIN_INTERVAL_S:-1.1}

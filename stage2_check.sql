@@ -628,3 +628,65 @@ SELECT activity, mins, n1 AS approved, n2 AS rejected,
        CASE WHEN LEAST(n1, n2) < 20 THEN 'too few' ELSE '' END AS note
 FROM agg WHERE n1 > 0 AND n2 > 0 AND mins = 60
 ORDER BY activity, mins;
+
+\echo ''
+\echo '=== 11. EXIT CONFIRMATION -- were the wins traded, or just quoted? ==='
+-- A take-profit is a LIMIT SELL: it needs somebody on the other side. On a
+-- token that has not traded in five minutes the quote is the last print, not
+-- a price anyone will pay -- so a lone stale or wicked figure crossing the
+-- target booked a clean win, AT the target, with no trade behind it.
+--
+-- The error is not symmetric across cohorts, which is why it matters here
+-- rather than as a general nuisance: the gates select THIN tokens, and thin
+-- is exactly where a single print moves the quote furthest. Fabricated wins
+-- therefore land disproportionately in APPROVED -- in the same direction as
+-- the effect this whole experiment is trying to detect.
+--
+-- Read the last two columns as a pair. If `net_confirmed` holds up against
+-- `net_all`, the result survives. If the gap is large, the headline was
+-- resting on prints nobody traded against, and the honest number is the
+-- confirmed one -- computed on a smaller sample, with correspondingly wider
+-- uncertainty.
+SELECT cohort,
+       entry_model,
+       COUNT(*) FILTER (WHERE status = 'CLOSED')::int                     AS closed,
+       COUNT(*) FILTER (WHERE status='CLOSED' AND exit_confirmed IS TRUE)::int
+                                                                          AS confirmed,
+       COUNT(*) FILTER (WHERE status='CLOSED' AND exit_confirmed IS FALSE)::int
+                                                                          AS refuted,
+       COUNT(*) FILTER (WHERE status='CLOSED' AND exit_confirmed IS NULL)::int
+                                                                          AS unknown,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE status='CLOSED' AND exit_confirmed IS TRUE)
+             / NULLIF(COUNT(*) FILTER (WHERE status = 'CLOSED'), 0), 1)   AS confirmed_pct,
+       -- Target hits specifically: the exit the defect flatters.
+       COUNT(*) FILTER (WHERE exit_reason='TARGET_HIT')::int              AS target_hits,
+       COUNT(*) FILTER (WHERE exit_reason='TARGET_HIT'
+                          AND exit_confirmed IS NOT TRUE)::int            AS target_hits_unconfirmed,
+       ROUND(AVG(net_pnl_percent) FILTER (WHERE status='CLOSED'), 2)      AS net_all,
+       ROUND(AVG(net_pnl_percent) FILTER (WHERE status='CLOSED'
+                                            AND exit_confirmed IS TRUE), 2)
+                                                                          AS net_confirmed
+FROM paper_trades
+GROUP BY cohort, entry_model
+ORDER BY cohort, entry_model;
+
+\echo ''
+\echo '--- 11b. Is the CONFIRMED share itself different between cohorts? ---'
+-- A cohort whose exits are confirmed far less often is not merely noisier:
+-- its trades are being marked against quotes rather than trades, so every
+-- other statistic about it is built on a weaker measurement. A large split
+-- here is a finding in its own right, independent of the returns.
+WITH per_cohort AS (
+    SELECT cohort,
+           COUNT(*) FILTER (WHERE status='CLOSED')                     AS closed,
+           COUNT(*) FILTER (WHERE status='CLOSED' AND exit_confirmed IS TRUE) AS conf
+    FROM paper_trades
+    WHERE entry_model = 'IMMEDIATE'
+    GROUP BY cohort
+)
+SELECT cohort, closed, conf,
+       ROUND(100.0 * conf / NULLIF(closed, 0), 1) AS confirmed_pct,
+       CASE WHEN closed < 30 THEN 'too few closed trades to compare'
+            ELSE 'compare the two rows directly' END AS note
+FROM per_cohort
+ORDER BY cohort;

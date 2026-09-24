@@ -146,4 +146,31 @@ def run(main) -> Suite:
     s.check_true("only an explicit opt-in disables Secure",
                  main._COOKIE_INSECURE in (True, False))
 
+    print("\n[KILL SWITCH] a gate that could not be EVALUATED must pause")
+    # GATE_CHECK_FAILED is what check_kill_switch returns from its own except
+    # handler: the thresholds were never computed and no run_status was
+    # written. Treating it as "shut and already recorded" meant a statement
+    # timeout silently disabled the loss limiter while positions kept opening.
+    s.check_true("GATE_CHECK_FAILED pauses rather than proceeding",
+                 bool(main.kill_switch_pause_reason(
+                     {"gate_open": False, "reason": "GATE_CHECK_FAILED"})))
+    s.check_true("and the reason says the state was unreadable, not that a limit tripped",
+                 "unreadable" in (main.kill_switch_pause_reason(
+                     {"gate_open": False, "reason": "GATE_CHECK_FAILED"}) or "").lower())
+
+    # THE INVARIANT. Every reason check_kill_switch can produce must either be
+    # in the unverified tuple, or be a PAUSED_* that wrote its own run_status.
+    # A new failure reason added there and not here reopens this hole silently.
+    import ast as _ast, os as _os, re as _re
+    engine_src = open(_os.path.join(_os.path.dirname(_os.path.dirname(
+        _os.path.abspath(__file__))), "engine.py"), encoding="utf-8").read()
+    fn_start = engine_src.index("def check_kill_switch")
+    fn_end = engine_src.index("\ndef ", fn_start + 10)
+    reasons = set(_re.findall(r'"reason": "([A-Z_]+)"', engine_src[fn_start:fn_end]))
+    s.check_true(f"check_kill_switch's reasons were found ({sorted(reasons)})", len(reasons) >= 2)
+    unhandled = sorted(r for r in reasons
+                       if r not in main.UNVERIFIED_GATE_REASONS and not r.startswith("PAUSED_"))
+    s.check("every kill-switch reason is either unverified-and-paused, or self-recording",
+            unhandled, [])
+
     return s
