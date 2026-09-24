@@ -742,45 +742,155 @@ LIMIT 15;
 
 \echo ''
 \echo '--- 10e. WHAT THE MEANS BECOME WITHOUT THE REFUTED ROWS ---'
--- The decision-relevant number. If dropping the rows that failed a physical
--- test leaves the means roughly where they were, sections 5, 5b, 5c and 9b
--- are readable and the tail was real. If the means collapse, those sections
--- have been reporting a handful of bad reads all along and the rank-based
--- sections 10 and 10b are the only trustworthy ones -- which is what they
--- were built for.
+-- TWO FIXES over the first version, both of which made it disagree with 10d.
 --
--- Rows are dropped ONLY where a test refutes them, never for being large. A
--- filter that removed returns for exceeding a threshold would be assuming the
--- conclusion.
+-- 1. It applied only the PHYSICS test and ignored the FROZEN test that 10d
+--    applies. So 10d could report a row as frozen while 10e silently kept it
+--    in the mean -- which is exactly what happened at 60 minutes, where 10d
+--    flagged JE3MdNMM and 10e refuted nothing at all. Two sections of the
+--    same report contradicting each other is the defect this whole audit has
+--    been about; it does not get an exemption for being mine.
+--
+-- 2. It used a single arbitrary threshold (10x hourly volume). A conclusion
+--    that moves with a number nobody can justify is not a conclusion, so the
+--    sensitivity is now shown across three of them. The 1x column is the
+--    honest bar: needing MORE than the token's entire hourly volume, counting
+--    sells as if they were buys, concentrated into a window a third as long,
+--    is already impossible. 10x and 100x are shown so the reader can see the
+--    answer does not depend on where the line is drawn.
+--
+-- The median column is there to make the point: it does not move at all,
+-- whatever is dropped. That is the argument for reading sections 10 and 10b
+-- rather than any mean.
 WITH scored AS (
     SELECT t.cohort, h.horizon_minutes AS mins, t.token_address AS token,
            h.return_percent AS ret,
-           (h.return_percent > 1000
-            AND (COALESCE(t.tradeable_depth_usd, 0) / 2.0)
-                * (SQRT(h.price / NULLIF(t.price_at_evaluation, 0)) - 1)
-                > 10 * COALESCE(t.volume_h1_usd, 0))          AS refuted
+           (COALESCE(t.tradeable_depth_usd, 0) / 2.0)
+             * (SQRT(h.price / NULLIF(t.price_at_evaluation, 0)) - 1)
+             AS buying_needed,
+           COALESCE(t.volume_h1_usd, 0) AS vol_h1,
+           f.distinct_marks, f.n_marks
     FROM paper_horizon_returns h
     JOIN paper_trades t ON t.id = h.paper_trade_id
+    JOIN (SELECT t2.token_address,
+                 COUNT(DISTINCT h2.price) AS distinct_marks,
+                 COUNT(*)                 AS n_marks
+          FROM paper_horizon_returns h2
+          JOIN paper_trades t2 ON t2.id = h2.paper_trade_id
+          GROUP BY t2.token_address) f ON f.token_address = t.token_address
     WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
       AND h.price > 0 AND t.price_at_evaluation > 0
 ),
+flagged AS (
+    SELECT cohort, mins, token, ret,
+           -- The same two tests 10d reports, applied identically here.
+           (ret > 1000 AND distinct_marks = 1 AND n_marks > 1)  AS frozen,
+           (ret > 1000 AND buying_needed >   1 * vol_h1)        AS imposs_1x,
+           (ret > 1000 AND buying_needed >  10 * vol_h1)        AS imposs_10x,
+           (ret > 1000 AND buying_needed > 100 * vol_h1)        AS imposs_100x
+    FROM scored
+),
 per_token AS (
     SELECT cohort, mins, token,
-           AVG(ret)                                  AS ret_all,
-           AVG(ret) FILTER (WHERE NOT refuted)       AS ret_kept,
-           COUNT(*) FILTER (WHERE refuted)           AS n_refuted
-    FROM scored GROUP BY 1, 2, 3
+           AVG(ret)                                               AS ret_all,
+           AVG(ret) FILTER (WHERE NOT (frozen OR imposs_1x))      AS keep_1x,
+           AVG(ret) FILTER (WHERE NOT (frozen OR imposs_10x))     AS keep_10x,
+           AVG(ret) FILTER (WHERE NOT (frozen OR imposs_100x))    AS keep_100x,
+           COUNT(*) FILTER (WHERE frozen)                         AS n_frozen,
+           COUNT(*) FILTER (WHERE imposs_1x)                      AS n_imposs
+    FROM flagged GROUP BY 1, 2, 3
 )
 SELECT mins, cohort,
-       COUNT(*)                                        AS tokens,
-       SUM(n_refuted)                                  AS rows_refuted,
-       ROUND(AVG(ret_all), 2)                          AS mean_as_reported,
-       ROUND(AVG(ret_kept), 2)                         AS mean_refuted_dropped,
+       COUNT(*)                                     AS tokens,
+       SUM(n_frozen)                                AS frozen_rows,
+       SUM(n_imposs)                                AS impossible_rows,
+       ROUND(AVG(ret_all),   2)                     AS mean_as_reported,
+       ROUND(AVG(keep_100x), 2)                     AS mean_drop_100x,
+       ROUND(AVG(keep_10x),  2)                     AS mean_drop_10x,
+       ROUND(AVG(keep_1x),   2)                     AS mean_drop_1x,
        ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ret_all)::numeric, 2)
-                                                       AS median_unchanged
+                                                    AS median_unmoved
 FROM per_token
 GROUP BY mins, cohort
 ORDER BY mins, cohort;
+
+\echo ''
+\echo '=== 10f. IS IT THE GATES OR THE STOP? -- path vs endpoint ==='
+-- The contradiction this section exists to resolve:
+--
+--   Section 5   approved tokens are UP 68 percent of the time at 120 minutes,
+--               median +2.22
+--   Section 11  approved IMMEDIATE trades average -5.41
+--
+-- Both can be true. The horizon measurement samples the ENDPOINT; the barrier
+-- trade experiences the PATH. A token that dips 9 percent and finishes +2 is
+-- a win to section 5 and a stopped-out loss to section 11. If that is what is
+-- happening, the gates are doing their job and the 7.53 percent stop is
+-- giving the money back -- a completely different problem with a completely
+-- different fix, and until now the evidence for it looked identical to "the
+-- gates do not work".
+--
+-- MAE is maximum adverse excursion: the worst drawdown from entry before the
+-- horizon. Read the last column. If the median MAE is deeper than the stop
+-- distance, the stop was never survivable on this asset class and the trade
+-- outcomes say nothing about the gates at all.
+--
+-- NULL for every row recorded before min_price_seen existed. Their paths were
+-- never observed and must not be inferred from their endpoints.
+WITH p AS (
+    SELECT t.cohort, t.entry_model, t.discovery_source,
+           t.price_at_evaluation AS basis,
+           t.min_price_seen AS lo, t.max_price_seen AS hi,
+           t.status, t.exit_reason, t.net_pnl_percent,
+           100.0 * (t.min_price_seen - t.price_at_evaluation)
+                 / NULLIF(t.price_at_evaluation, 0) AS mae_pct,
+           100.0 * (t.max_price_seen - t.price_at_evaluation)
+                 / NULLIF(t.price_at_evaluation, 0) AS mfe_pct
+    FROM paper_trades t
+    WHERE t.min_price_seen IS NOT NULL
+      AND t.price_at_evaluation > 0
+)
+SELECT cohort, entry_model,
+       COUNT(*)                                                   AS trades,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY mae_pct)::numeric, 2)
+                                                                  AS median_mae,
+       ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY mae_pct)::numeric, 2)
+                                                                  AS p25_mae,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY mfe_pct)::numeric, 2)
+                                                                  AS median_mfe,
+       -- How many would have been stopped out by the CURRENT distance, purely
+       -- from the path, whatever they finished at.
+       COUNT(*) FILTER (WHERE mae_pct <= -7.53)                    AS would_stop,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE mae_pct <= -7.53)
+             / NULLIF(COUNT(*), 0), 0)                             AS would_stop_pct,
+       -- The damning cell: stopped out, and the token was ABOVE entry at its
+       -- best. The stop fired on noise the position then recovered from.
+       COUNT(*) FILTER (WHERE mae_pct <= -7.53 AND mfe_pct > 0)     AS stopped_but_rose
+FROM p
+GROUP BY cohort, entry_model
+ORDER BY cohort, entry_model;
+
+\echo ''
+\echo '--- 10g. WHAT STOP DISTANCE WOULD THE PATHS HAVE SURVIVED? ---'
+-- Not a recommendation -- a description of what the observed paths did. A
+-- wider stop keeps more trades alive AND makes each loss bigger; this shows
+-- only the first half, so it cannot on its own justify a change. It says
+-- which distances are even in the running.
+WITH p AS (
+    SELECT t.cohort,
+           100.0 * (t.min_price_seen - t.price_at_evaluation)
+                 / NULLIF(t.price_at_evaluation, 0) AS mae_pct
+    FROM paper_trades t
+    WHERE t.min_price_seen IS NOT NULL AND t.price_at_evaluation > 0
+      AND t.entry_model = 'IMMEDIATE'
+)
+SELECT cohort, COUNT(*) AS trades,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE mae_pct > -5)  / NULLIF(COUNT(*),0), 0) AS survive_5pct,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE mae_pct > -7.53)/ NULLIF(COUNT(*),0), 0) AS survive_current,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE mae_pct > -12) / NULLIF(COUNT(*),0), 0) AS survive_12pct,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE mae_pct > -20) / NULLIF(COUNT(*),0), 0) AS survive_20pct,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE mae_pct > -35) / NULLIF(COUNT(*),0), 0) AS survive_35pct
+FROM p GROUP BY cohort ORDER BY cohort;
 
 \echo ''
 \echo '=== 11. EXIT CONFIRMATION -- were the wins traded, or just quoted? ==='

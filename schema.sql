@@ -152,6 +152,20 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     filled_at TIMESTAMP WITH TIME ZONE,
     last_price NUMERIC,
     last_marked_at TIMESTAMP WITH TIME ZONE,
+    -- The PATH, not just the endpoints.
+    --
+    -- Section 5 says approved tokens are UP 68 percent of the time at 120
+    -- minutes with a median of +2.22 -- and closed trades average -5.41. Both
+    -- can be true at once if the token dips through the 7.53 percent stop on
+    -- its way to finishing higher: the horizon measurement samples the
+    -- ENDPOINT, the barrier trade experiences the PATH, and nothing recorded
+    -- the difference. Without these two columns "the gates are wrong" and
+    -- "the stop is too tight" produce identical evidence.
+    --
+    -- Maintained on every mark, from the same prices the rest of the
+    -- measurement uses, so they cost no extra request.
+    min_price_seen NUMERIC,
+    max_price_seen NUMERIC,
     exit_price NUMERIC,
     exit_reason VARCHAR(20),                -- 'TARGET_HIT', 'STOPPED_OUT', 'TIMEOUT'
     -- Was there a COUNTERPARTY at the mark that produced this exit?

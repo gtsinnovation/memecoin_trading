@@ -370,3 +370,9 @@ ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS exit_confirmed BOOLEAN;
 ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS exit_txns_m5 INTEGER;
 ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS exit_txns_h1 INTEGER;
 
+-- Path extremes, for deciding whether the stop or the gates are losing the
+-- money. See the column comments in schema.sql. Existing rows keep NULL:
+-- their path was never observed and must not be inferred from their endpoints.
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS min_price_seen NUMERIC;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS max_price_seen NUMERIC;
+

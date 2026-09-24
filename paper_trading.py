@@ -566,6 +566,21 @@ def mark_horizons(conn, prices: Dict[str, float]) -> Dict[int, int]:
             basis = float(basis)
             age = float(age_min or 0.0)
             ret = ((float(price) / basis) - 1.0) * 100.0
+
+            # Keep the path extremes current here too. mark_to_market stops
+            # updating a trade the moment it closes, so without this the
+            # recorded low would always be the one that TRIGGERED the stop and
+            # never showed what the token did afterwards -- which is precisely
+            # the question "was the stop too tight" asks. This function keeps
+            # pricing a token for the whole horizon window regardless of
+            # barrier state, so it is the only place the full path is visible.
+            cur.execute("""
+                UPDATE paper_trades
+                SET min_price_seen = LEAST(COALESCE(min_price_seen, %s), %s),
+                    max_price_seen = GREATEST(COALESCE(max_price_seen, %s), %s)
+                WHERE id = %s;
+            """, (float(price), float(price), float(price), float(price), tid))
+
             for horizon in HORIZONS_MINUTES:
                 if age < horizon:
                     break  # HORIZONS_MINUTES is sorted; later ones aren't due either
@@ -756,9 +771,17 @@ def mark_to_market(conn, prices: Dict[str, float]) -> Dict[str, int]:
                 continue
 
             price = float(price)
-            cur.execute(
-                "UPDATE paper_trades SET last_price = %s, last_marked_at = CURRENT_TIMESTAMP WHERE id = %s;",
-                (price, tid))
+            # LEAST/GREATEST over the stored value, so the extremes accumulate
+            # across ticks rather than being overwritten by the latest mark.
+            # COALESCE seeds them on the first mark; a NULL would otherwise
+            # swallow every subsequent comparison.
+            cur.execute("""
+                UPDATE paper_trades
+                SET last_price = %s, last_marked_at = CURRENT_TIMESTAMP,
+                    min_price_seen = LEAST(COALESCE(min_price_seen, %s), %s),
+                    max_price_seen = GREATEST(COALESCE(max_price_seen, %s), %s)
+                WHERE id = %s;
+            """, (price, price, price, price, price, tid))
 
             if status == "PENDING_FILL":
                 if price <= float(trigger):
