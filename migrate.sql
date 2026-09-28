@@ -400,3 +400,44 @@ CREATE INDEX IF NOT EXISTS idx_holder_samples_sampled_at ON token_holder_samples
 -- was a full scan of the largest table every 15 minutes.
 CREATE INDEX IF NOT EXISTS idx_price_path_observed_at ON paper_price_path(observed_at);
 
+
+-- Live ledger costs. The kill switch sums closed_positions.realized_pnl_usd,
+-- which was GROSS of fees and slippage and booked stop-outs AT the stop even
+-- when the market gapped far below. From here on realized_pnl_* is NET, with
+-- the gross figure and the cost kept alongside. Old rows keep NULL cost and
+-- are gross; nothing is back-filled, because their entry slippage was never
+-- recorded and must not be invented.
+ALTER TABLE active_positions ADD COLUMN IF NOT EXISTS entry_slippage_percent NUMERIC;
+ALTER TABLE closed_positions ADD COLUMN IF NOT EXISTS gross_pnl_percent NUMERIC;
+ALTER TABLE closed_positions ADD COLUMN IF NOT EXISTS cost_percent NUMERIC;
+
+-- Stage 3 lifecycle and idempotency. See the column comments in schema.sql.
+-- Existing rows become 'PAPER' (none of them was ever sent to a signer) and
+-- each gets its own random client_order_id from the column default.
+ALTER TABLE active_positions ADD COLUMN IF NOT EXISTS execution_status VARCHAR(24) NOT NULL DEFAULT 'PAPER';
+ALTER TABLE active_positions ADD COLUMN IF NOT EXISTS client_order_id UUID NOT NULL DEFAULT gen_random_uuid();
+ALTER TABLE active_positions ADD COLUMN IF NOT EXISTS tx_signature VARCHAR(128);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_active_positions_client_order_id
+    ON active_positions(client_order_id);
+
+CREATE TABLE IF NOT EXISTS signer_orders (
+    client_order_id VARCHAR(64) PRIMARY KEY,
+    token_address VARCHAR(128) NOT NULL,
+    requested_usd NUMERIC NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    reason TEXT,
+    tx_signature VARCHAR(128),
+    network VARCHAR(20),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_signer_orders_created_at ON signer_orders(created_at);
+
+-- Horizon dropout, persisted rather than only logged. See schema.sql.
+CREATE TABLE IF NOT EXISTS paper_horizon_dropout (
+    hour TIMESTAMP WITH TIME ZONE PRIMARY KEY,
+    due INTEGER NOT NULL DEFAULT 0,
+    marked INTEGER NOT NULL DEFAULT 0,
+    dropped_no_price INTEGER NOT NULL DEFAULT 0,
+    dropped_no_basis INTEGER NOT NULL DEFAULT 0
+);

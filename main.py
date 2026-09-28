@@ -1,6 +1,8 @@
 # main.py
 import os
+import math
 import time
+import threading
 import secrets
 import asyncio
 import json
@@ -27,7 +29,8 @@ import psycopg2
 # Diagnostic block to print detailed local code tracebacks if an import fails.
 try:
     from engine import (
-        agent_network, DB_DSN, evaluate_open_positions, check_kill_switch,
+        agent_network, DB_DSN, db_connect, DB_CONNECT_TIMEOUT_S, DB_STATEMENT_TIMEOUT_MS,
+        DB_IDLE_TX_TIMEOUT_MS, evaluate_open_positions, check_kill_switch,
         get_app_settings, resume_trading, pause_trading, set_run_status,
         write_system_alert, AgentUnresponsiveError, get_agent_latencies,
     )
@@ -37,6 +40,7 @@ try:
     import retention
     import paper_trading
     import app_time
+    import signer_auth
 except Exception as import_error:
     print("\n" + "!" * 50)
     print("CRITICAL IMPORT EXCEPTION DETECTED IN YOUR LOCAL PROJECT FILES:")
@@ -74,6 +78,24 @@ PEN_SNAPSHOT_ATTEMPTS = int(os.environ.get("PEN_SNAPSHOT_ATTEMPTS", "3"))
 
 ENABLE_STAGE3_EXECUTION = os.environ.get("ENABLE_STAGE3_EXECUTION", "false").strip().lower() == "true"
 SIGNER_SERVICE_URL = os.environ.get("SIGNER_SERVICE_URL", "http://signer:8100")
+# HMAC key for web -> signer requests (signer_auth.py). None when unset or too
+# short, in which case no request is ever sent.
+SIGNER_SHARED_SECRET = signer_auth.load_secret()
+
+
+async def _apg_connect():
+    """One-off asyncpg connection, bounded like engine.db_connect()."""
+    return await asyncpg.connect(
+        dsn=DB_DSN, timeout=DB_CONNECT_TIMEOUT_S,
+        command_timeout=DB_STATEMENT_TIMEOUT_MS / 1000.0,
+        server_settings={"idle_in_transaction_session_timeout": str(DB_IDLE_TX_TIMEOUT_MS)})
+
+
+async def _apg_pool():
+    return await asyncpg.create_pool(
+        dsn=DB_DSN, min_size=1, max_size=2, timeout=DB_CONNECT_TIMEOUT_S,
+        command_timeout=DB_STATEMENT_TIMEOUT_MS / 1000.0,
+        server_settings={"idle_in_transaction_session_timeout": str(DB_IDLE_TX_TIMEOUT_MS)})
 
 # Log in the operator's zone as well, so a log line and the dashboard clock
 # agree. converter takes a struct_time, so this goes through localtime of the
@@ -157,16 +179,38 @@ class WebSocketConnectionManager:
         self.active_connections.append(websocket)
 
     def disconnect(self, websocket: WebSocket):
+        # Idempotent: broadcast() may already have dropped it.
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
 
-        self.active_connections.remove(websocket)
+    # The PIPELINE awaits broadcast() on every tick. One browser tab on a bad
+    # connection stopped reading, its send buffer filled, and send_text waited
+    # -- so a dashboard viewer could stall the trading loop until the
+    # heartbeat watchdog killed the process. Each send is now bounded, they
+    # run concurrently, and a socket that fails or times out is dropped
+    # instead of being retried (and failing silently) forever.
+    SEND_TIMEOUT_S = 2.0
 
     async def broadcast(self, message: dict):
         payload = json.dumps(message, default=_json_default)
-        for connection in self.active_connections:
+        connections = list(self.active_connections)
+        if not connections:
+            return
+
+        async def _send(ws):
             try:
-                await connection.send_text(payload)
+                await asyncio.wait_for(ws.send_text(payload), timeout=self.SEND_TIMEOUT_S)
+                return None
             except Exception:
-                pass
+                return ws
+
+        for dead in await asyncio.gather(*(_send(c) for c in connections)):
+            if dead is not None:
+                self.disconnect(dead)
+                try:
+                    await asyncio.wait_for(dead.close(), timeout=1.0)
+                except Exception:
+                    pass
 
 ws_manager = WebSocketConnectionManager()
 
@@ -250,6 +294,71 @@ def pipeline_health(now: float = None) -> tuple:
         return False, {"status": "stalled", "last_tick_age_s": round(age, 1),
                        "limit_s": HEALTH_MAX_TICK_AGE_S}
     return True, {"status": "ok", "last_tick_age_s": round(age, 1)}
+
+
+# ---------------------------------------------------------------------------
+# Self-recovery. /health makes a stall VISIBLE; this makes it RECOVER.
+#
+# Docker restarts a container only when its process exits -- never for being
+# unhealthy -- and the one tool that restarts on health (an autoheal sidecar)
+# needs the Docker socket, which is root on the host. So the process exits
+# itself: a daemon THREAD (not an asyncio task, which a blocked event loop
+# would starve) checks the heartbeat and the worker registry, and calls
+# os._exit(1) when either says the pipeline is gone. `restart: unless-stopped`
+# does the rest. os._exit rather than sys.exit: a hung worker thread would
+# block interpreter shutdown forever, which is the state being escaped.
+# ---------------------------------------------------------------------------
+WATCHDOG_EXIT_ENABLED = os.environ.get("WATCHDOG_EXIT_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+WATCHDOG_EXIT_AFTER_S = max(60.0, float(os.environ.get("WATCHDOG_EXIT_AFTER_S", "900")))
+# The first iteration waits on startup sleeps and the first discovery sweep.
+WATCHDOG_STARTUP_GRACE_S = max(WATCHDOG_EXIT_AFTER_S, 300.0)
+WATCHDOG_POLL_S = 15.0
+# Names of background workers that stopped for any reason other than
+# cancellation at shutdown. Appended by _supervise; read by the watchdog.
+_WORKER_DEATHS: list = []
+
+
+def watchdog_verdict(now: float, started_at: float) -> Optional[str]:
+    """The reason to exit, or None. Pure, so it is testable."""
+    if _WORKER_DEATHS:
+        return f"background worker(s) stopped: {', '.join(_WORKER_DEATHS)}"
+    at = _PIPELINE_HEARTBEAT["at"]
+    if at is None:
+        if now - started_at > WATCHDOG_STARTUP_GRACE_S:
+            return f"the pipeline never started an iteration in {now - started_at:.0f}s"
+        return None
+    if now - at > WATCHDOG_EXIT_AFTER_S:
+        return f"no pipeline iteration has started for {now - at:.0f}s"
+    return None
+
+
+def _exit_for_restart(reason: str) -> None:
+    logger.critical(f"WATCHDOG: {reason} -- exiting so the container restart policy "
+                    f"brings the pipeline back.")
+    # Best effort and bounded: the database may be the thing that is stuck,
+    # so the alert gets its own thread and at most 20 seconds.
+    t = threading.Thread(target=lambda: write_system_alert(
+        "CRITICAL", "WATCHDOG", f"Process restarting: {reason}."), daemon=True)
+    t.start()
+    t.join(timeout=20.0)
+    for handler in logging.getLogger().handlers:
+        try:
+            handler.flush()
+        except Exception:
+            pass
+    os._exit(1)
+
+
+def _watchdog_loop(started_at: float) -> None:
+    while True:
+        time.sleep(WATCHDOG_POLL_S)
+        try:
+            reason = watchdog_verdict(time.monotonic(), started_at)
+        except Exception as e:  # the watchdog itself must not die quietly
+            logger.error(f"watchdog check failed: {e}")
+            continue
+        if reason:
+            _exit_for_restart(reason)
 
 
 @app.get("/health")
@@ -351,7 +460,7 @@ def _serialize_settings_row(row: dict) -> dict:
 
 
 async def _fetch_settings_row() -> Optional[dict]:
-    conn = await asyncpg.connect(dsn=DB_DSN)
+    conn = await _apg_connect()
     try:
         row = await conn.fetchrow("SELECT * FROM app_settings WHERE id = 1;")
         return dict(row) if row else None
@@ -465,7 +574,7 @@ async def api_update_settings(request: Request, payload: SettingsUpdate):
     if not fields:
         return JSONResponse({"error": "no fields to update"}, status_code=400)
 
-    conn = await asyncpg.connect(dsn=DB_DSN)
+    conn = await _apg_connect()
     try:
         set_clauses = ", ".join(f"{k} = ${i + 1}" for i, k in enumerate(fields.keys()))
         values = list(fields.values())
@@ -591,11 +700,95 @@ def signer_request_or_reason(final_state: dict, enabled: bool):
         amount = float(requested_usd)
     except (TypeError, ValueError):
         return None, "max_safe_position_usd is not a number"
-    if not amount > 0:
-        return None, "requested size is not positive"
+    # isfinite: `inf > 0` is True, and json.dumps would render it as the bare
+    # literal Infinity, which the signer's validator is then trusted to catch.
+    if not (math.isfinite(amount) and amount > 0):
+        return None, "requested size is not a positive finite number"
+    # The idempotency key. Without it a retried request is indistinguishable
+    # from a second order, which is exactly how one trade gets signed twice.
+    client_order_id = state.get("client_order_id")
+    if not client_order_id:
+        return None, "client_order_id is missing from final_state -- refusing to send an unkeyed order"
     return {"token_address": token_address,
             "token_symbol": state.get("token_symbol"),
-            "requested_usd": amount}, None
+            "requested_usd": amount,
+            "client_order_id": str(client_order_id)}, None
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 ledger lifecycle.
+#
+# I_ACCOUNTANT writes the active_positions row BEFORE the signer is called,
+# as 'PENDING_EXECUTION' -- a capital reservation. It used to be written as a
+# plain open position whatever the signer then did: a refused or failed order
+# left a phantom position that was marked, closed and summed into the kill
+# switch as if it had traded. Every row now reaches a definite fate:
+#
+#   EXECUTED  the signer broadcast it           -> row stays, 'EXECUTED'
+#   VOID      nothing was, or can be, signed     -> row deleted
+#   UNKNOWN   the outcome could not be learned   -> 'EXECUTION_UNKNOWN': stays
+#             counted against capital and is re-asked by
+#             reconcile_pending_executions() until the signer answers.
+# ---------------------------------------------------------------------------
+_EXECUTED_STATUSES = ("SIGNED_BROADCAST",)
+_UNKNOWN_STATUSES = ("RESERVED", "UNKNOWN")
+_VOID_STATUSES = ("REFUSED", "FAILED")
+# HTTP statuses the signer returns BEFORE reserving the order: nothing can
+# have been signed. Anything else without an order_status is UNKNOWN.
+_PRE_RESERVATION_HTTP = (400, 401, 403, 404, 422, 501, 503)
+
+
+def execution_fate(status_code, data) -> str:
+    """'EXECUTED', 'VOID' or 'UNKNOWN' for one signer response. Pure."""
+    order_status = (data or {}).get("order_status") if isinstance(data, dict) else None
+    if order_status in _EXECUTED_STATUSES:
+        return "EXECUTED"
+    if order_status in _UNKNOWN_STATUSES:
+        return "UNKNOWN"
+    if order_status in _VOID_STATUSES:
+        return "VOID"
+    if order_status is None and status_code in _PRE_RESERVATION_HTTP:
+        return "VOID"
+    return "UNKNOWN"
+
+
+def apply_execution_fate(client_order_id: str, fate: str,
+                         tx_signature: Optional[str] = None) -> int:
+    """Moves one ledger row to its fate. Returns rows affected. Sync (psycopg2)."""
+    conn = None
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                if fate == "EXECUTED":
+                    cur.execute(
+                        "UPDATE active_positions SET execution_status = 'EXECUTED', "
+                        "tx_signature = %s WHERE client_order_id::text = %s "
+                        "AND execution_status IN ('PENDING_EXECUTION', 'EXECUTION_UNKNOWN');",
+                        (tx_signature, client_order_id))
+                elif fate == "VOID":
+                    cur.execute(
+                        "DELETE FROM active_positions WHERE client_order_id::text = %s "
+                        "AND execution_status IN ('PENDING_EXECUTION', 'EXECUTION_UNKNOWN');",
+                        (client_order_id,))
+                else:
+                    cur.execute(
+                        "UPDATE active_positions SET execution_status = 'EXECUTION_UNKNOWN' "
+                        "WHERE client_order_id::text = %s AND execution_status = 'PENDING_EXECUTION';",
+                        (client_order_id,))
+                return cur.rowcount
+    except Exception as e:
+        logger.error(f"Stage 3: could not record execution fate {fate} for order "
+                     f"{client_order_id}: {e}")
+        return 0
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _signed_headers(method: str, path: str, body: bytes) -> dict:
+    return {"Content-Type": "application/json",
+            **signer_auth.sign(SIGNER_SHARED_SECRET, method, path, body)}
 
 
 def discovery_floors_from(settings_snapshot) -> tuple:
@@ -639,7 +832,7 @@ async def _release_from_pen(client, new_listing_floor) -> list:
              else token_discovery.JUPITER_NEW_LISTING_MIN_LIQUIDITY_USD)
     conn = None
     try:
-        conn = await asyncpg.connect(dsn=DB_DSN)
+        conn = await _apg_connect()
         return await discovery_pen.release_due(
             conn, client,
             # Examined partway INTO the window, not at its lower edge -- see
@@ -728,7 +921,7 @@ def _record_paper_candidate(snapshot: dict, final_state: dict) -> None:
     a failure to record the experiment must never take down a tick."""
     conn = None
     try:
-        conn = psycopg2.connect(DB_DSN)
+        conn = db_connect()
         with conn:
             paper_trading.record_candidate(conn, snapshot, final_state)
     except Exception as e:
@@ -742,15 +935,21 @@ def _mark_paper_trades() -> None:
     """Marks every live paper trade to its real current price."""
     conn = None
     try:
-        conn = psycopg2.connect(DB_DSN)
+        conn = db_connect()
+        # Two short transactions with the HTTP fetch BETWEEN them, not one
+        # spanning it. Inside one transaction CURRENT_TIMESTAMP is frozen at
+        # its START, so every mark, path sample and horizon was stamped as of
+        # before a fetch that can take tens of seconds -- and the transaction
+        # sat idle holding its snapshot the whole time.
         with conn:
             addresses = paper_trading.open_token_addresses(conn)
-            if not addresses:
-                return
-            # marks, not bare prices: the same DexScreener response carries
-            # the transaction counts that say whether an exit at this mark
-            # could actually have filled. See paper_trading.exit_is_confirmed.
-            marks = market_data.fetch_current_marks_sync(addresses)
+        if not addresses:
+            return
+        # marks, not bare prices: the same DexScreener response carries
+        # the transaction counts that say whether an exit at this mark
+        # could actually have filled. See paper_trading.exit_is_confirmed.
+        marks = market_data.fetch_current_marks_sync(addresses)
+        with conn:
             stats = paper_trading.mark_to_market(conn, marks)
             # Independent of the barrier trades above: records what each token
             # actually did at fixed elapsed times. Must run even when
@@ -759,6 +958,8 @@ def _mark_paper_trades() -> None:
             # mark_horizons needs only the price half of each mark.
             prices = {a: mk["price"] for a, mk in marks.items()}
             horizons = paper_trading.mark_horizons(conn, prices)
+            if horizons:
+                paper_trading.record_horizon_dropout(conn, horizons)
             if any(stats.values()):
                 logger.info(f"Paper trades: {stats}")
             if horizons:
@@ -827,45 +1028,150 @@ async def record_holder_sample_and_get_velocity(conn, token_address: str,
 
 
 async def maybe_execute_via_signer(http_client: httpx.AsyncClient, final_state: dict) -> None:
-    """Stage 3 (see STAGE3_SETUP.md): if I_ACCOUNTANT opened a position
+    """Stage 3 (see STAGE3_SETUP.md): if I_ACCOUNTANT reserved a position
     this tick AND ENABLE_STAGE3_EXECUTION is on, ask the separate signer
-    service to act on it. This is strictly additive and best-effort --
-    the position was already recorded in active_positions exactly the way
-    every prior stage recorded it (this function runs after that, never
-    instead of it), and nothing here can roll that back or block the next
-    tick. A signer failure/refusal is logged and written to
-    system_alerts, not raised -- Stage 3 must never turn an unreachable or
-    disagreeing signer into a pipeline outage.
-    """
-    payload, refusal = signer_request_or_reason(final_state, ENABLE_STAGE3_EXECUTION)
-    if payload is None:
-        # Only the malformed-state case is worth a warning; "disabled" and
-        # "nothing opened" are the normal path on almost every tick.
-        if refusal and "missing from final_state" in refusal:
-            logger.warning("Stage 3: %s -- skipping signer call.", refusal)
-        return
-    token_address = payload["token_address"]
-    token_symbol = payload["token_symbol"]
+    service to act on it, then settle the ledger row to the outcome.
 
+    Never raises -- a signer failure is logged and written to system_alerts,
+    and must never turn into a pipeline outage. The request is HMAC-signed
+    (signer_auth.py) and keyed by client_order_id, so neither a retry nor a
+    replay can make the signer sign twice.
+    """
+    loop = asyncio.get_running_loop()
+    state = final_state or {}
+    payload, refusal = signer_request_or_reason(state, ENABLE_STAGE3_EXECUTION)
+    if payload is None:
+        if refusal and "missing" in refusal:
+            logger.warning("Stage 3: %s -- skipping signer call.", refusal)
+        # A reservation that will never be sent must not linger as a position.
+        if ENABLE_STAGE3_EXECUTION and state.get("position_logged") and state.get("client_order_id"):
+            await loop.run_in_executor(
+                None, apply_execution_fate, str(state["client_order_id"]), "VOID", None)
+        return
+    token_symbol = payload["token_symbol"]
+    order_id = payload["client_order_id"]
+
+    if SIGNER_SHARED_SECRET is None:
+        msg = (f"Stage 3: SIGNER_SHARED_SECRET is not set (or shorter than "
+               f"{signer_auth.MIN_SECRET_LEN} characters) -- not calling the signer for "
+               f"${token_symbol}; the reservation is released.")
+        logger.error(msg)
+        await loop.run_in_executor(None, apply_execution_fate, order_id, "VOID", None)
+        await loop.run_in_executor(None, lambda: write_system_alert("CRITICAL", "SIGNER", msg))
+        return
+
+    body = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    data, status_code = {}, None
     try:
         resp = await http_client.post(
-            f"{SIGNER_SERVICE_URL}/execute",
-            json=payload,
+            f"{SIGNER_SERVICE_URL}/execute", content=body,
+            headers=_signed_headers("POST", "/execute", body),
             timeout=60.0,  # signing + broadcast + confirmation polling can take a while
         )
-        data = resp.json()
-        if resp.status_code == 200 and data.get("executed"):
-            msg = f"Stage 3: signer executed for ${token_symbol} -- tx {data.get('tx_signature')} on {data.get('network')}."
-            logger.info(msg)
-            await asyncio.get_running_loop().run_in_executor(None, lambda: write_system_alert("INFO", "SIGNER", msg))
-        else:
-            msg = f"Stage 3: signer did not execute for ${token_symbol}: {data.get('reason')}"
-            logger.warning(msg)
-            await asyncio.get_running_loop().run_in_executor(None, lambda: write_system_alert("WARN", "SIGNER", msg))
+        status_code = resp.status_code
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        fate = execution_fate(status_code, data)
     except Exception as e:
-        msg = f"Stage 3: signer service call failed for ${token_symbol}: {e}"
-        logger.error(msg)
-        await asyncio.get_running_loop().run_in_executor(None, lambda: write_system_alert("ERROR", "SIGNER", msg))
+        # The request may have reached the signer. UNKNOWN keeps the capital
+        # reserved and lets reconciliation ask the signer what happened.
+        fate = "UNKNOWN"
+        data = {"reason": f"signer call failed: {type(e).__name__}: {e}"}
+
+    await loop.run_in_executor(None, apply_execution_fate, order_id, fate, data.get("tx_signature"))
+    if fate == "EXECUTED":
+        level, msg = "INFO", (f"Stage 3: signer executed ${token_symbol} -- tx {data.get('tx_signature')} "
+                              f"on {data.get('network')}.")
+    elif fate == "VOID":
+        level, msg = "WARN", (f"Stage 3: signer did not execute ${token_symbol} "
+                              f"(HTTP {status_code}): {data.get('reason')} -- reservation released.")
+    else:
+        level, msg = "CRITICAL", (f"Stage 3: outcome UNKNOWN for ${token_symbol} (order {order_id}, "
+                                  f"HTTP {status_code}): {data.get('reason')} -- position held as "
+                                  f"EXECUTION_UNKNOWN until the signer confirms.")
+    getattr(logger, {"INFO": "info", "WARN": "warning"}.get(level, "error"))(msg)
+    await loop.run_in_executor(None, lambda: write_system_alert(level, "SIGNER", msg))
+
+
+RECONCILE_INTERVAL_S = 60.0
+# A PENDING row older than this was never settled by its own tick -- the
+# process died between reserving and hearing back.
+PENDING_STALE_S = 120
+_RECONCILE_STATE = {"at": None}
+
+
+def _unsettled_orders() -> list:
+    conn = None
+    try:
+        conn = db_connect()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT client_order_id::text, token_symbol FROM active_positions "
+                    "WHERE execution_status = 'EXECUTION_UNKNOWN' "
+                    "   OR (execution_status = 'PENDING_EXECUTION' "
+                    "       AND captured_at < CURRENT_TIMESTAMP - (%s * INTERVAL '1 second')) "
+                    "LIMIT 20;", (PENDING_STALE_S,))
+                return cur.fetchall()
+    except Exception as e:
+        logger.warning(f"Stage 3: could not read unsettled orders: {e}")
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+async def reconcile_pending_executions(http_client: httpx.AsyncClient,
+                                       now: Optional[float] = None) -> int:
+    """Asks the signer about every order whose outcome is not yet known.
+
+    Read-only on the signer side (GET /orders/{id}) -- a reconciliation must
+    never be able to CAUSE a signature. 404 means the signer never recorded
+    the order, and since it records before it signs, nothing was signed.
+    Returns how many rows were settled.
+    """
+    now = time.monotonic() if now is None else now
+    last = _RECONCILE_STATE["at"]
+    if last is not None and now - last < RECONCILE_INTERVAL_S:
+        return 0
+    _RECONCILE_STATE["at"] = now
+    loop = asyncio.get_running_loop()
+    rows = await loop.run_in_executor(None, _unsettled_orders)
+    if not rows or SIGNER_SHARED_SECRET is None:
+        if rows:
+            logger.error("Stage 3: %d unsettled order(s) but SIGNER_SHARED_SECRET is not set -- "
+                         "cannot ask the signer.", len(rows))
+        return 0
+    settled = 0
+    for order_id, symbol in rows:
+        path = f"/orders/{order_id}"
+        try:
+            resp = await http_client.get(f"{SIGNER_SERVICE_URL}{path}",
+                                         headers=_signed_headers("GET", path, b""), timeout=15.0)
+        except Exception as e:
+            logger.warning(f"Stage 3: reconciliation for {order_id} failed: {type(e).__name__}")
+            continue
+        if resp.status_code == 404:
+            fate, data = "VOID", {}
+        elif resp.status_code == 200:
+            try:
+                data = resp.json()
+            except ValueError:
+                continue
+            fate = execution_fate(200, data)
+            if fate == "UNKNOWN":
+                continue
+        else:
+            continue
+        if await loop.run_in_executor(None, apply_execution_fate, order_id, fate,
+                                      data.get("tx_signature")):
+            settled += 1
+            msg = f"Stage 3: reconciled ${symbol} order {order_id} -> {fate}."
+            logger.warning(msg)
+            await loop.run_in_executor(None, lambda: write_system_alert("WARN", "SIGNER", msg))
+    return settled
 
 
 async def pipeline_executor_worker():
@@ -953,13 +1259,20 @@ async def pipeline_executor_worker():
                 continue
 
             if pool is None:
-                pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=2)
+                pool = await _apg_pool()
 
             loop = asyncio.get_running_loop()
 
             # Settle any open positions that have hit their take-profit or
             # stop-loss level *before* reading this tick's stats, so realized
             # P&L reflects the latest state rather than lagging a cycle.
+            # Settle Stage 3 orders whose outcome was not learned in their own
+            # tick (throttled; a no-op when there are none).
+            try:
+                await reconcile_pending_executions(http_client)
+            except Exception as e:
+                logger.warning(f"Stage 3 reconciliation skipped: {type(e).__name__}: {e}")
+
             await loop.run_in_executor(None, evaluate_open_positions)
 
             # Advance every live paper trade against real prices. Same tick
@@ -997,12 +1310,25 @@ async def pipeline_executor_worker():
                 """)
                 funds = await conn.fetchval("SELECT COALESCE(SUM(allocated_usd), 0.0)::float FROM active_positions;")
                 positions = await conn.fetch("SELECT token_symbol, allocated_usd::float AS allocated_usd, entry_trigger::float AS entry_trigger FROM active_positions ORDER BY id DESC LIMIT 4;")
-                funnel_counts = await conn.fetch("""
-                    SELECT final_briefing, COUNT(*)::int as count
-
-                    FROM trading_sessions
-                    WHERE session_status = 'REJECTED'
-                    GROUP BY final_briefing;
+                # Classified IN THE DATABASE, one row back. This used to
+                # GROUP BY the full final_briefing text -- which carries each
+                # token's own numbers, so nearly every rejection was its own
+                # group -- and ship every one of them to Python on every tick,
+                # from a table that only grows. Same precedence as before
+                # (first matching gate wins), same historical E_SIGNAL alias.
+                funnel_row = await conn.fetchrow(r"""
+                    SELECT
+                      COUNT(*) FILTER (WHERE fb LIKE '%B\_SENTINEL%')::int AS b,
+                      COUNT(*) FILTER (WHERE fb NOT LIKE '%B\_SENTINEL%'
+                          AND (fb LIKE '%E\_BREADTH%' OR fb LIKE '%E\_SIGNAL%'))::int AS e,
+                      COUNT(*) FILTER (WHERE fb NOT LIKE '%B\_SENTINEL%'
+                          AND fb NOT LIKE '%E\_BREADTH%' AND fb NOT LIKE '%E\_SIGNAL%'
+                          AND fb LIKE '%F\_ATLAS%')::int AS f,
+                      COUNT(*) FILTER (WHERE fb NOT LIKE '%B\_SENTINEL%'
+                          AND fb NOT LIKE '%E\_BREADTH%' AND fb NOT LIKE '%E\_SIGNAL%'
+                          AND fb NOT LIKE '%F\_ATLAS%' AND fb LIKE '%G\_ANCHOR%')::int AS g
+                    FROM (SELECT COALESCE(final_briefing, '') AS fb FROM trading_sessions
+                          WHERE session_status = 'REJECTED') r;
                 """)
                 alert_rows = await conn.fetch("SELECT agent_name, message FROM system_alerts WHERE log_level IN ('WARN', 'ERROR', 'CRITICAL') ORDER BY id DESC LIMIT 3;")
                 pnl_row = await conn.fetchrow("""
@@ -1019,16 +1345,10 @@ async def pipeline_executor_worker():
                     FROM closed_positions ORDER BY id DESC LIMIT 5;
                 """)
 
-            funnel_data = {"B_SENTINEL": 0, "E_BREADTH": 0, "F_ATLAS": 0, "G_ANCHOR": 0}
-            for row in funnel_counts:
-                brief = row["final_briefing"] or ""
-                if "B_SENTINEL" in brief: funnel_data["B_SENTINEL"] += row["count"]
-                # "E_SIGNAL" is the pre-rename name of this gate. Historical
-                # trading_sessions rows still carry it in final_briefing, so
-                # match both or every past rejection silently drops off the chart.
-                elif "E_BREADTH" in brief or "E_SIGNAL" in brief: funnel_data["E_BREADTH"] += row["count"]
-                elif "F_ATLAS" in brief: funnel_data["F_ATLAS"] += row["count"]
-                elif "G_ANCHOR" in brief: funnel_data["G_ANCHOR"] += row["count"]
+            # "E_SIGNAL" is the pre-rename name of E_BREADTH; historical rows
+            # still carry it, so both count (see the query above).
+            funnel_data = {"B_SENTINEL": funnel_row["b"], "E_BREADTH": funnel_row["e"],
+                           "F_ATLAS": funnel_row["f"], "G_ANCHOR": funnel_row["g"]}
 
             # A pen token if one is waiting, otherwise a random candidate.
             #
@@ -1052,6 +1372,14 @@ async def pipeline_executor_worker():
             if from_pen and snapshot is not None and pen_queue and pen_queue[0] == target_address:
                 # Committed: this token produced data and is being evaluated.
                 pen_queue.popleft()
+                # Its miss count is finished with. Only a token that exhausted
+                # its attempts was ever removed, so every token that missed once
+                # and then succeeded stayed in this dict for the process's life.
+                _pen_misses.pop(target_address, None)
+            if len(_pen_misses) > 2 * (pen_queue.maxlen or 400):
+                queued = set(pen_queue)
+                for stale in [a for a in _pen_misses if a not in queued]:
+                    _pen_misses.pop(stale, None)
             if snapshot is None and from_pen:
                 # Unpriceable at the front of the queue. Drop it after a
                 # bounded number of attempts rather than retrying it every
@@ -1095,8 +1423,12 @@ async def pipeline_executor_worker():
             # most permissive input both F_ATLAS and G_ANCHOR could receive.
             # The booleans are the only way those gates can tell "measured
             # zero" from "never measured", and both now refuse on the latter.
-            holder_missing = bool(snapshot.pop("_holder_data_missing", False))
-            slippage_missing = bool(snapshot.pop("_slippage_data_missing", False))
+            # An ABSENT flag means nobody measured it -- a provider that
+            # omitted the key, or a holder lookup that raised before merging.
+            # Defaulting to False read that as "measured, and fine": the one
+            # fail-open left on this path.
+            holder_missing = bool(snapshot.pop("_holder_data_missing", True))
+            slippage_missing = bool(snapshot.pop("_slippage_data_missing", True))
             snapshot["holder_data_missing"] = holder_missing
             snapshot["slippage_data_missing"] = slippage_missing
             if holder_missing:
@@ -1149,23 +1481,27 @@ async def pipeline_executor_worker():
                 logger.critical(f"Agent watchdog: {watchdog_err} Configured action: {action}.")
 
                 if action == "SHUTDOWN":
+                    # SHUTDOWN halts ENTRIES, not the loop. It used to `return`
+                    # from this worker, which also stopped evaluate_open_positions
+                    # and the paper marks -- every open position lost its stop
+                    # and target until someone restarted the container, which
+                    # is the one outcome a safety action must never produce
+                    # (see execution_rails: exits are never gated). Setting
+                    # run_status blocks I_ACCOUNTANT exactly like a pause; the
+                    # operator resumes from the dashboard as for any pause.
                     await loop.run_in_executor(
                         None, lambda: set_run_status(
-                            "SHUTDOWN_WATCHDOG", f"{watchdog_err.agent_name} was unresponsive; pipeline shut down per configured watchdog action."
+                            "SHUTDOWN_WATCHDOG", f"{watchdog_err.agent_name} was unresponsive; new entries halted per configured watchdog action. Exits continue."
                         )
                     )
                     await ws_manager.broadcast({
                         "timestamp": app_time.format_local(),  # operator's zone, not the container's UTC
                         "watchdog_shutdown": True,
-                        "latest_log": f"[WATCHDOG] {watchdog_err.agent_name} unresponsive -- pipeline shut down. The dashboard stays up; restart the container to resume.",
+                        "latest_log": f"[WATCHDOG] {watchdog_err.agent_name} unresponsive -- new entries halted. Open positions are still managed; resume from the dashboard.",
                     })
-                    logger.critical("Pipeline worker stopping (watchdog SHUTDOWN action). The web server and dashboard remain up.")
-                    await http_client.aclose()
-                    if pool is not None:
-                        await pool.close()
-                    return  # stop the loop entirely; FastAPI/uvicorn keep serving the dashboard
+                    logger.critical("Watchdog SHUTDOWN action: new entries halted; exits and measurement continue.")
 
-                # RESTART_ALL: drop the pool defensively (in case the hang was
+                # Both actions: drop the pool defensively (in case the hang was
                 # DB-related) and retry fresh on the next tick.
                 if pool is not None:
                     await pool.close()
@@ -1273,7 +1609,7 @@ async def discovery_pen_worker():
     while True:
         conn = None
         try:
-            conn = await asyncpg.connect(dsn=DB_DSN)
+            conn = await _apg_connect()
             got = await discovery_pen.capture(conn, client)
             removed = await discovery_pen.prune(conn)
             info = await discovery_pen.stats(conn)
@@ -1316,6 +1652,9 @@ def _supervise(task: "asyncio.Task", name: str) -> None:
         if t.cancelled():
             logger.info(f"Background worker '{name}' was cancelled.")
             return
+        # Recorded for the watchdog thread, which exits the process so the
+        # container restarts with every worker running again.
+        _WORKER_DEATHS.append(name)
         exc = t.exception()
         if exc is None:
             logger.error(
@@ -1329,8 +1668,8 @@ def _supervise(task: "asyncio.Task", name: str) -> None:
         try:
             write_system_alert(
                 "CRITICAL", "WORKER",
-                f"Background worker '{name}' stopped. The pipeline is not "
-                f"evaluating tokens. Restart the container.")
+                f"Background worker '{name}' stopped. The process will exit and "
+                f"restart itself{'' if WATCHDOG_EXIT_ENABLED else ' -- NOT: WATCHDOG_EXIT_ENABLED is false, restart the container'}.")
         except Exception:
             # The alert table is the thing we would use to notice this, so if
             # it is also unreachable the log line above is all there is.
@@ -1344,7 +1683,20 @@ def start_pipeline_loops():
     _supervise(asyncio.create_task(pipeline_executor_worker()), "pipeline")
     if ENABLE_TOKEN_DISCOVERY:
         _supervise(asyncio.create_task(discovery_pen_worker()), "discovery-pen")
-    _supervise(asyncio.create_task(retention.retention_worker(DB_DSN)), "retention")
+    # Only started when enabled: it returns immediately otherwise, and a
+    # returned worker now means "restart the process".
+    if retention.RETENTION_ENABLED:
+        _supervise(asyncio.create_task(retention.retention_worker(DB_DSN)), "retention")
+    if not DB_DSN:
+        logger.critical("DATABASE_URL is not set -- every database call will fail.")
+    if WATCHDOG_EXIT_ENABLED:
+        threading.Thread(target=_watchdog_loop, args=(time.monotonic(),),
+                         name="pipeline-watchdog", daemon=True).start()
+        logger.info(f"Watchdog armed: exit after {WATCHDOG_EXIT_AFTER_S:.0f}s without a "
+                    f"pipeline iteration, or on any worker death.")
+    else:
+        logger.warning("WATCHDOG_EXIT_ENABLED is false -- a stalled pipeline will be "
+                       "reported by /health but not recovered.")
 
 
 @app.on_event("shutdown")
@@ -1555,7 +1907,7 @@ async def get_dashboard_interface(request: Request):
                         <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">If an Agent Is Unresponsive to the Others</label>
                         <select id="set-watchdog-action" class="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-slate-100">
                             <option value="RESTART_ALL">Restart all agents</option>
-                            <option value="SHUTDOWN">Shut down the pipeline</option>
+                            <option value="SHUTDOWN">Halt new entries (exits continue)</option>
                         </select>
                         <div class="flex items-center gap-2 mt-2">
                             <span class="text-slate-500">Timeout</span>
@@ -1682,7 +2034,7 @@ async def get_dashboard_interface(request: Request):
                     PAUSED_MANUAL: 'PAUSED — MANUAL',
                     PAUSED_KILL_SWITCH: 'PAUSED — KILL SWITCH',
                     PAUSED_DURATION_ELAPSED: 'PAUSED — DURATION ELAPSED',
-                    SHUTDOWN_WATCHDOG: 'SHUT DOWN — AGENT UNRESPONSIVE',
+                    SHUTDOWN_WATCHDOG: 'ENTRIES HALTED — AGENT UNRESPONSIVE',
                 };
                 badge.innerText = labels[status] || status;
                 badge.className = status === 'RUNNING' ? 'text-[10px] font-bold text-emerald-400' : 'text-[10px] font-bold text-rose-400';

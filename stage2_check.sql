@@ -31,6 +31,38 @@
 \set ceiling 30.0
 \endif
 
+-- MUST match paper_trading.HORIZON_TOLERANCE (PAPER_HORIZON_TOLERANCE): a
+-- mark taken later than horizon x this is not that horizon's return. It was
+-- a hard-coded 1.5 in nine places, so changing the env knob silently made
+-- this report and the dashboard measure different windows.
+\if :{?horizon_tolerance}
+\else
+\set horizon_tolerance 1.5
+\endif
+
+-- MUST match paper_trading.REENTRY_COOLDOWN_MINUTES (PAPER_REENTRY_COOLDOWN_MINUTES).
+\if :{?cooldown_min}
+\else
+\set cooldown_min 60
+\endif
+
+-- THE UNIT OF EVIDENCE: each token's FIRST evaluation, in the cohort that
+-- evaluation assigned it. Every decision section below reads marks through
+-- this view.
+--
+-- A token can be approved at one evaluation and rejected at the next. Counted
+-- in both arms, the two samples shared tokens and were not independent; and a
+-- token is only RE-evaluated if it survived in the discovery list, so later
+-- evaluations are selected on outcome. The first evaluation is neither. It
+-- also makes every "per-token" statistic well defined -- one observation per
+-- token per horizon -- so "up" means the same thing in 5, 10b, 10c and the
+-- dashboard's horizon_summary(): the first evaluation's return was above zero.
+-- A TEMP view: it lives for this psql session only and changes nothing stored.
+CREATE TEMP VIEW first_eval AS
+SELECT DISTINCT ON (token_address) id, token_address, cohort
+FROM paper_trades WHERE entry_model = 'IMMEDIATE'
+ORDER BY token_address, evaluated_at, id;
+
 \echo ''
 \echo '=== 1. PLUMBING: is anything being recorded, and is dedup holding? ==='
 -- Read rows_per_token_per_HOUR, not rows_per_token.
@@ -57,6 +89,31 @@ SELECT COUNT(*) AS rows,
        to_char(MIN(evaluated_at), 'YYYY-MM-DD HH24:MI:SS TZ') AS first_seen,
        to_char(MAX(evaluated_at), 'YYYY-MM-DD HH24:MI:SS TZ') AS last_seen
 FROM paper_trades;
+
+-- THE DEDUP ALARM, stated so it can actually fire. rows_per_token_per_hour
+-- above is averaged over every token and the whole run, so a dedup failure
+-- on a handful of tokens -- or for one bad hour -- disappears into it and the
+-- "materially above 2" signature is unreachable in practice. This counts the
+-- thing itself: IMMEDIATE evaluations of the same token closer together than
+-- the re-entry cooldown. It must be 0.
+SELECT COUNT(*) FILTER (WHERE gap_min < :cooldown_min) AS evaluations_inside_cooldown,
+       COUNT(DISTINCT token_address) FILTER (WHERE gap_min < :cooldown_min) AS tokens_affected,
+       CASE WHEN COUNT(*) FILTER (WHERE gap_min < :cooldown_min) = 0 THEN 'ok'
+            ELSE 'DEDUP FAILING' END AS verdict
+FROM (SELECT token_address,
+             EXTRACT(EPOCH FROM (evaluated_at - LAG(evaluated_at)
+                 OVER (PARTITION BY token_address ORDER BY evaluated_at)))/60.0 AS gap_min
+      FROM paper_trades WHERE entry_model = 'IMMEDIATE') g;
+
+-- Tokens evaluated into BOTH cohorts, and what the first-evaluation rule
+-- (first_eval, above) sets aside. Every decision section counts each token
+-- once, in its first cohort; this is how much that excludes.
+SELECT COUNT(*) AS tokens,
+       COUNT(*) FILTER (WHERE n_cohorts > 1) AS tokens_in_both_cohorts,
+       SUM(evaluations) AS evaluations,
+       SUM(evaluations) - COUNT(*) AS later_evaluations_set_aside
+FROM (SELECT token_address, COUNT(DISTINCT cohort) AS n_cohorts, COUNT(*) AS evaluations
+      FROM paper_trades WHERE entry_model = 'IMMEDIATE' GROUP BY token_address) c;
 
 \echo ''
 \echo '=== 2. PLUMBING: are the new columns actually populating? ==='
@@ -109,21 +166,38 @@ FROM paper_trades WHERE status = 'ABANDONED'
 GROUP BY 1,2 ORDER BY 1,2;
 
 \echo ''
+\echo '=== 3c. HORIZON DROPOUT per day (persisted by the pipeline) ==='
+-- The share of due horizon marks that could not be taken, because the token
+-- stopped pricing or had no basis. Every horizon statistic describes the
+-- survivors only; a rising rate here means they are a smaller, more selected
+-- group. Row-ticks, so read the percentage, not the counts.
+SELECT to_char(date_trunc('day', hour), 'YYYY-MM-DD') AS day,
+       SUM(due) AS due, SUM(dropped_no_price) AS no_price, SUM(dropped_no_basis) AS no_basis,
+       ROUND(100.0 * SUM(dropped_no_price + dropped_no_basis) / NULLIF(SUM(due), 0), 1) AS dropout_pct
+FROM paper_horizon_dropout GROUP BY 1 ORDER BY 1 DESC LIMIT 14;
+
+\echo ''
 \echo '=== 4. STALENESS: how much of the sample is a repeated stale quote? ==='
 -- A live token essentially never reprices to the IDENTICAL figure 30 minutes
 -- later. A dead one does, every time.
+--
+-- Marks taken INSIDE their horizon window only -- the same filter
+-- staleness_report() applies. Unfiltered, a mark taken hours late on a token
+-- long dead comes back at exactly zero and counts as "stale", which is how
+-- the dashboard said 9 percent while this section said 62.
 SELECT t.cohort,
        COUNT(h.id) AS marks,
        COUNT(h.id) FILTER (WHERE h.return_percent = 0) AS zero_returns,
        ROUND(100.0 * COUNT(h.id) FILTER (WHERE h.return_percent = 0) / NULLIF(COUNT(h.id),0)) AS zero_pct
 FROM paper_trades t JOIN paper_horizon_returns h ON h.paper_trade_id = t.id
+WHERE h.age_minutes_at_mark <= h.horizon_minutes * :horizon_tolerance
 GROUP BY t.cohort ORDER BY t.cohort;
 
 \echo ''
 \echo '=== 5. HORIZON RETURNS by cohort -- the measurement that matters ==='
--- TOKEN-WEIGHTED, in two stages: average the marks within each token, then
--- average across tokens. Every token counts once regardless of how many
--- times it was re-recorded.
+-- TOKEN-WEIGHTED: one observation per token -- its FIRST evaluation (see
+-- first_eval at the top). Every token counts once regardless of how many
+-- times it was re-recorded; the per-token AVG below is now over one mark.
 --
 -- Averaging raw marks was wrong in a way that flattered the result. A
 -- 60-minute re-entry cooldown means a token that stays in the discovery
@@ -156,7 +230,8 @@ WITH marks AS (
            (t.assumed_slippage_percent IS NULL)::int AS assumed
     FROM paper_horizon_returns h
     JOIN paper_trades t ON t.id = h.paper_trade_id
-    WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
+    JOIN first_eval fe ON fe.id = t.id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * :horizon_tolerance
 ),
 per_token AS (
     SELECT mins, cohort, token,
@@ -196,7 +271,8 @@ WITH marks AS (
            h.return_percent AS ret
     FROM paper_horizon_returns h
     JOIN paper_trades t ON t.id = h.paper_trade_id
-    WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
+    JOIN first_eval fe ON fe.id = t.id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * :horizon_tolerance
 ),
 per_token AS (
     SELECT mins, cohort, token, AVG(ret) AS ret FROM marks GROUP BY 1, 2, 3
@@ -234,7 +310,8 @@ WITH marks AS (
            h.return_percent AS ret
     FROM paper_horizon_returns h
     JOIN paper_trades t ON t.id = h.paper_trade_id
-    WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
+    JOIN first_eval fe ON fe.id = t.id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * :horizon_tolerance
       AND t.txns_h1 >= 50
 ),
 per_token AS (
@@ -274,7 +351,8 @@ WITH pairs AS (
         ('depth_usd',      t.tradeable_depth_usd),
         ('slippage_pct',   t.assumed_slippage_percent)
     ) AS f(name, val)
-    WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
+    JOIN first_eval fe ON fe.id = t.id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * :horizon_tolerance
       AND f.val IS NOT NULL
 ),
 -- MID-ranks. RANK() assigns tied values the MINIMUM position and skips,
@@ -432,7 +510,8 @@ WITH marks AS (
            h.return_percent AS ret
     FROM paper_horizon_returns h
     JOIN paper_trades t ON t.id = h.paper_trade_id
-    WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
+    JOIN first_eval fe ON fe.id = t.id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * :horizon_tolerance
 ),
 per_token AS (
     SELECT population, mins, cohort, token, AVG(ret) AS ret
@@ -488,7 +567,8 @@ WITH marks AS (
            h.return_percent AS ret
     FROM paper_horizon_returns h
     JOIN paper_trades t ON t.id = h.paper_trade_id
-    WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
+    JOIN first_eval fe ON fe.id = t.id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * :horizon_tolerance
 ),
 per_token AS (
     SELECT population, mins, cohort, token,
@@ -549,7 +629,8 @@ WITH marks AS (
            h.return_percent AS ret
     FROM paper_horizon_returns h
     JOIN paper_trades t ON t.id = h.paper_trade_id
-    WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
+    JOIN first_eval fe ON fe.id = t.id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * :horizon_tolerance
 ),
 per_token AS (
     SELECT population, mins, cohort, token,
@@ -619,7 +700,8 @@ WITH marks AS (
                 ELSE 'c. 500+ txns (busy)' END AS activity
     FROM paper_horizon_returns h
     JOIN paper_trades t ON t.id = h.paper_trade_id
-    WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
+    JOIN first_eval fe ON fe.id = t.id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * :horizon_tolerance
 ),
 per_token AS (
     SELECT population, activity, mins, cohort, token,
@@ -778,7 +860,8 @@ WITH scored AS (
           FROM paper_horizon_returns h2
           JOIN paper_trades t2 ON t2.id = h2.paper_trade_id
           GROUP BY t2.token_address) f ON f.token_address = t.token_address
-    WHERE h.age_minutes_at_mark <= h.horizon_minutes * 1.5
+    JOIN first_eval fe ON fe.id = t.id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * :horizon_tolerance
       AND h.price > 0 AND t.price_at_evaluation > 0
 ),
 flagged AS (

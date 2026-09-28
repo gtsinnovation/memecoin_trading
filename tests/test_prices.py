@@ -345,4 +345,24 @@ def run(market_data) -> Suite:
     s.check_true("the token in the chunk AFTER the 429 is still priced", later in got)
     s.check("and nothing from the failed chunk is invented",
             [a for a in first if a in got], [])
+    print("\n[CACHE] per-mint caches are bounded")
+    md = market_data
+    saved_max = md.CACHE_MAX_ENTRIES
+    try:
+        md.CACHE_MAX_ENTRIES = 3
+        c = {}
+        for n, key in enumerate("abcd"):
+            md.bounded_cache_put(c, key, n, ttl_s=100.0, now=float(n))
+        s.check("a cache past its size keeps only the limit", len(c), 3)
+        s.check_true("the oldest live entry is the one evicted", "a" not in c and "d" in c)
+        c = {}
+        md.bounded_cache_put(c, "old", 1, ttl_s=10.0, now=0.0)
+        md.bounded_cache_put(c, "x", 2, ttl_s=10.0, now=50.0)
+        md.bounded_cache_put(c, "y", 3, ttl_s=10.0, now=51.0)
+        md.bounded_cache_put(c, "z", 4, ttl_s=10.0, now=52.0)
+        s.check_true("expired entries go first", "old" not in c and len(c) == 3)
+    finally:
+        md.CACHE_MAX_ENTRIES = saved_max
+    s.check_true("market_data and discovery share ONE Jupiter throttle",
+                 md.JUPITER_MIN_INTERVAL_S == md._td.JUPITER_MIN_INTERVAL_S)
     return s

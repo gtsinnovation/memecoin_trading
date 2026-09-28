@@ -1,7 +1,7 @@
 # gmgn_market_data.py
 """Alternative market-data provider backed by GMGN's OpenAPI.
 
-Selected by setting MARKET_DATA_PROVIDER=gmgn (default is "dexscreener",
+Selected by setting MARKET_DATA_PROVIDER=gmgn (default is "free",
 which uses market_data.py's original DexScreener + Solana-RPC path). Both
 providers implement the same fetch_full_snapshot() contract and return
 dicts with identical keys, so the pipeline doesn't know or care which one

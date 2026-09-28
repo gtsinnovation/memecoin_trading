@@ -82,12 +82,29 @@ def build_tx(*, fee_payer: str, programs, versioned=False, lookup_tables=0,
     return base64.b64encode(bytes(body)).decode()
 
 
-def sim(pre_in, post_in, pre_out, post_out, owner="OWNER", err=None):
+PRE_LAMPORTS = 50_000_000
+MAX_LAMPORTS = 5_000_000
+
+
+def sim(pre_in, post_in, pre_out, post_out, owner="OWNER", err=None,
+        post_lamports=PRE_LAMPORTS - 10_000, other=None):
+    """other: (mint, pre, post) for a third token the wallet holds."""
     def row(mint, amount):
         return {"owner": owner, "mint": mint, "uiTokenAmount": {"amount": str(amount)}}
-    return {"err": err,
-            "preTokenBalances": [row(USDC, pre_in), row(TOKEN_MINT, pre_out)],
-            "postTokenBalances": [row(USDC, post_in), row(TOKEN_MINT, post_out)]}
+    pre = [row(USDC, pre_in), row(TOKEN_MINT, pre_out)]
+    post = [row(USDC, post_in), row(TOKEN_MINT, post_out)]
+    if other:
+        pre.append(row(other[0], other[1]))
+        if other[2] is not None:
+            post.append(row(other[0], other[2]))
+    out = {"err": err, "preTokenBalances": pre, "postTokenBalances": post}
+    if post_lamports is not None:
+        out["accounts"] = [{"lamports": post_lamports}]
+    return out
+
+
+def vs(result, owner, in_mint, out_mint, max_in, pre_l=PRE_LAMPORTS, max_l=MAX_LAMPORTS):
+    return tv.verify_simulation(result, owner, in_mint, out_mint, max_in, pre_l, max_l)
 
 
 def run() -> Suite:
@@ -119,7 +136,8 @@ def run() -> Suite:
 
     # Undecodable bytes must refuse at the top level rather than propagate.
     r = tv.verify_before_signing("not base64!!", expected_fee_payer=owner, sim_result=sim(100, 90, 0, 5),
-                                 input_mint=USDC, output_mint=TOKEN_MINT, max_input_raw=100)
+                                 input_mint=USDC, output_mint=TOKEN_MINT, max_input_raw=100,
+                                 owner_pre_lamports=PRE_LAMPORTS, max_lamports_spend=MAX_LAMPORTS)
     s.check_true("an undecodable transaction refuses instead of crashing", not r.ok)
 
     # --- structural checks ---
@@ -156,42 +174,67 @@ def run() -> Suite:
 
     # --- simulation checks ---
     s.check_true("a simulation spending within budget and receiving tokens passes",
-                 tv.verify_simulation(sim(1000, 900, 0, 50), "OWNER", USDC, TOKEN_MINT, 100).ok)
+                 vs(sim(1000, 900, 0, 50), "OWNER", USDC, TOKEN_MINT, 100).ok)
     s.check_true("spending more than authorised must refuse",
-                 not tv.verify_simulation(sim(1000, 500, 0, 50), "OWNER", USDC, TOKEN_MINT, 100).ok)
+                 not vs(sim(1000, 500, 0, 50), "OWNER", USDC, TOKEN_MINT, 100).ok)
     s.check_true("receiving none of the requested token must refuse",
-                 not tv.verify_simulation(sim(1000, 900, 0, 0), "OWNER", USDC, TOKEN_MINT, 100).ok)
+                 not vs(sim(1000, 900, 0, 0), "OWNER", USDC, TOKEN_MINT, 100).ok)
     s.check_true("a transaction that increases our input balance is not a buy",
-                 not tv.verify_simulation(sim(1000, 1100, 0, 50), "OWNER", USDC, TOKEN_MINT, 100).ok)
+                 not vs(sim(1000, 1100, 0, 50), "OWNER", USDC, TOKEN_MINT, 100).ok)
     s.check_true("an on-chain simulation error must refuse",
-                 not tv.verify_simulation(sim(1000, 900, 0, 50, err={"InstructionError": 1}),
+                 not vs(sim(1000, 900, 0, 50, err={"InstructionError": 1}),
                                           "OWNER", USDC, TOKEN_MINT, 100).ok)
     s.check_true("a simulation that did not run must refuse",
-                 not tv.verify_simulation(None, "OWNER", USDC, TOKEN_MINT, 100).ok)
+                 not vs(None, "OWNER", USDC, TOKEN_MINT, 100).ok)
     s.check_true("a simulation with no balance data must refuse",
-                 not tv.verify_simulation({"err": None}, "OWNER", USDC, TOKEN_MINT, 100).ok)
+                 not vs({"err": None}, "OWNER", USDC, TOKEN_MINT, 100).ok)
     s.check_true("an unbounded spend must refuse",
-                 not tv.verify_simulation(sim(1000, 900, 0, 50), "OWNER", USDC, TOKEN_MINT, None).ok)
+                 not vs(sim(1000, 900, 0, 50), "OWNER", USDC, TOKEN_MINT, None).ok)
     s.check_true("a missing mint must refuse",
-                 not tv.verify_simulation(sim(1000, 900, 0, 50), "OWNER", None, TOKEN_MINT, 100).ok)
+                 not vs(sim(1000, 900, 0, 50), "OWNER", None, TOKEN_MINT, 100).ok)
     # Balances belonging to somebody else must not be counted as ours.
     s.check_true("another wallet's balances must not satisfy the check",
-                 not tv.verify_simulation(sim(1000, 900, 0, 50, owner="SOMEONE_ELSE"),
+                 not vs(sim(1000, 900, 0, 50, owner="SOMEONE_ELSE"),
                                           "OWNER", USDC, TOKEN_MINT, 100).ok)
     # Spending exactly the authorised amount is allowed; one unit more is not.
     s.check_true("spending exactly the authorised amount is allowed",
-                 tv.verify_simulation(sim(1000, 900, 0, 50), "OWNER", USDC, TOKEN_MINT, 100).ok)
+                 vs(sim(1000, 900, 0, 50), "OWNER", USDC, TOKEN_MINT, 100).ok)
     s.check_true("one raw unit above the authorised amount must refuse",
-                 not tv.verify_simulation(sim(1000, 899, 0, 50), "OWNER", USDC, TOKEN_MINT, 100).ok)
+                 not vs(sim(1000, 899, 0, 50), "OWNER", USDC, TOKEN_MINT, 100).ok)
+
+    # --- the rest of the wallet ---
+    OTHER = "OtherMint1111111111111111111111111111111111"
+    s.check_true("a native-SOL drain via the System Program must refuse",
+                 not vs(sim(1000, 900, 0, 50, post_lamports=1_000), "OWNER", USDC, TOKEN_MINT, 100).ok)
+    s.check_true("a lamport spend inside the fee budget passes",
+                 vs(sim(1000, 900, 0, 50, post_lamports=PRE_LAMPORTS - MAX_LAMPORTS),
+                    "OWNER", USDC, TOKEN_MINT, 100).ok)
+    s.check_true("one lamport over the budget must refuse",
+                 not vs(sim(1000, 900, 0, 50, post_lamports=PRE_LAMPORTS - MAX_LAMPORTS - 1),
+                        "OWNER", USDC, TOKEN_MINT, 100).ok)
+    s.check_true("a simulation without our post lamports must refuse",
+                 not vs(sim(1000, 900, 0, 50, post_lamports=None), "OWNER", USDC, TOKEN_MINT, 100).ok)
+    s.check_true("no lamport baseline must refuse",
+                 not vs(sim(1000, 900, 0, 50), "OWNER", USDC, TOKEN_MINT, 100, pre_l=None).ok)
+    s.check_true("no lamport bound must refuse",
+                 not vs(sim(1000, 900, 0, 50), "OWNER", USDC, TOKEN_MINT, 100, max_l=None).ok)
+    s.check_true("draining an unrelated token must refuse",
+                 not vs(sim(1000, 900, 0, 50, other=(OTHER, 500, 0)), "OWNER", USDC, TOKEN_MINT, 100).ok)
+    s.check_true("closing an unrelated token account must refuse",
+                 not vs(sim(1000, 900, 0, 50, other=(OTHER, 500, None)), "OWNER", USDC, TOKEN_MINT, 100).ok)
+    s.check_true("an unrelated token left untouched passes",
+                 vs(sim(1000, 900, 0, 50, other=(OTHER, 500, 500)), "OWNER", USDC, TOKEN_MINT, 100).ok)
 
     # --- combined gate ---
     good = build_tx(fee_payer=owner, programs=[JUPITER])
     owner2 = tv.decode_transaction(good).fee_payer
     r = tv.verify_before_signing(good, expected_fee_payer=owner2, sim_result=sim(1000, 900, 0, 50, owner=owner2),
-                                 input_mint=USDC, output_mint=TOKEN_MINT, max_input_raw=100)
+                                 input_mint=USDC, output_mint=TOKEN_MINT, max_input_raw=100,
+                                 owner_pre_lamports=PRE_LAMPORTS, max_lamports_spend=MAX_LAMPORTS)
     s.check_true("structure and simulation both passing signs", r.ok)
     r = tv.verify_before_signing(good, expected_fee_payer=owner2, sim_result=None,
-                                 input_mint=USDC, output_mint=TOKEN_MINT, max_input_raw=100)
+                                 input_mint=USDC, output_mint=TOKEN_MINT, max_input_raw=100,
+                                 owner_pre_lamports=PRE_LAMPORTS, max_lamports_spend=MAX_LAMPORTS)
     s.check_true("a good structure with no simulation must still refuse", not r.ok)
 
     return s

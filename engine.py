@@ -1,6 +1,7 @@
 # engine.py
 
 import os
+import math
 import time
 import logging
 import random
@@ -14,10 +15,38 @@ from langgraph.graph import StateGraph, START, END
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("graph_engine")
 from fill_accounting import round_significant
+import paper_trading
 import holder_concentration
 import market_microstructure
 
-DB_DSN = os.environ.get("DATABASE_URL", "postgresql://postgres:secret@localhost:5432/memecoin_trading")
+# No fallback DSN. The old default carried a hard-coded password, so a
+# missing DATABASE_URL silently connected with it instead of failing.
+DB_DSN = os.environ.get("DATABASE_URL", "")
+
+# Every psycopg2 connection is bounded. Without these a stalled socket or a
+# lock wait blocks the pipeline's worker thread forever: no exception, no log
+# line, just a tick that never ends. The heartbeat watchdog in main.py is the
+# backstop; these make the common case fail fast and visibly instead.
+DB_CONNECT_TIMEOUT_S = max(1, int(float(os.environ.get("DB_CONNECT_TIMEOUT_S", "10"))))
+DB_STATEMENT_TIMEOUT_MS = max(1000, int(float(os.environ.get("DB_STATEMENT_TIMEOUT_MS", "60000"))))
+# A transaction left open across a slow HTTP call holds row locks and pins
+# CURRENT_TIMESTAMP to its start; the server ends it after this long.
+DB_IDLE_TX_TIMEOUT_MS = max(1000, int(float(os.environ.get("DB_IDLE_TX_TIMEOUT_MS", "120000"))))
+
+
+# Mirrors main.ENABLE_STAGE3_EXECUTION (same variable, same parse). Read here
+# because the ledger row's lifecycle depends on it.
+STAGE3_ENABLED = os.environ.get("ENABLE_STAGE3_EXECUTION", "false").strip().lower() == "true"
+
+
+def db_connect():
+    """psycopg2 connection with connect, statement and idle-transaction limits."""
+    if not DB_DSN:
+        raise RuntimeError("DATABASE_URL is not set -- refusing to guess a database.")
+    return psycopg2.connect(
+        DB_DSN, connect_timeout=DB_CONNECT_TIMEOUT_S,
+        options=(f"-c statement_timeout={DB_STATEMENT_TIMEOUT_MS} "
+                 f"-c idle_in_transaction_session_timeout={DB_IDLE_TX_TIMEOUT_MS}"))
 
 
 class AgentUnresponsiveError(Exception):
@@ -112,6 +141,10 @@ class AgentNetworkState(TypedDict):
     launchpad: Optional[str]
     final_briefing_compiled: str
     position_logged: bool
+    # The ledger row I_ACCOUNTANT wrote, and the idempotency key the signer
+    # dedupes on. Declared because LangGraph rejects undeclared keys.
+    position_id: Optional[int]
+    client_order_id: Optional[str]
     session_closed: bool
     termination_reason: Optional[str]
 
@@ -121,7 +154,7 @@ def write_system_alert(level: str, agent: str, message: str):
     """Logs system alerts into the outbox buffer table."""
     conn = None
     try:
-        conn = psycopg2.connect(DB_DSN)
+        conn = db_connect()
         with conn:
             with conn.cursor() as cur:
                 query = """
@@ -138,7 +171,7 @@ def save_trading_session(state: AgentNetworkState):
     """Saves structural session records to the tracking ledger table."""
     conn = None
     try:
-        conn = psycopg2.connect(DB_DSN)
+        conn = db_connect()
         with conn:
             with conn.cursor() as cur:
                 query = """
@@ -165,12 +198,30 @@ def save_trading_session(state: AgentNetworkState):
             conn.close()
 
 
-def save_active_position(state: AgentNetworkState) -> bool:
+def entry_slippage_for(state: Dict[str, Any]) -> Optional[float]:
+    """Measured entry slippage for the ledger, or None when unmeasured.
+
+    None is stored as NULL and costed at the paper experiment's stand-in on
+    close. Storing the state's 0.0 default for an unmeasured read would
+    charge the position fees only -- the exact bias paper_trading documents.
+    """
+    if state.get("slippage_data_missing", True):
+        return None
+    v = state.get("estimated_slippage_percent")
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return abs(v) if math.isfinite(v) else None
+
+
+def save_active_position(state: AgentNetworkState) -> Optional[Dict[str, Any]]:
     """Appends successful entries into the asset exposure position table.
 
-    Returns True only if a row was actually written. False means either the
+    Returns {position_id, client_order_id} only if a row was actually
+    written. None means either the
     duplicate guard declined (a position is already open for this token) or
-    the write failed. The caller MUST NOT report success on a False: with
+    the write failed. The caller MUST NOT report success on a None: with
     Stage 3 enabled, "position_logged" is what decides whether the signer is
     asked to execute, so a silent False would ask for a real trade whose
     position row does not exist -- unstoppable, unmarkable, with no
@@ -184,7 +235,7 @@ def save_active_position(state: AgentNetworkState) -> bool:
     conn = None
     try:
         entry_price = state.get("target_pullback_price", 0.0)
-        conn = psycopg2.connect(DB_DSN)
+        conn = db_connect()
         with conn:
             with conn.cursor() as cur:
                 # ONE OPEN POSITION PER TOKEN.
@@ -208,24 +259,34 @@ def save_active_position(state: AgentNetworkState) -> bool:
                     logger.debug(
                         f"Position already open for {state['token_symbol']}; not opening a second."
                     )
-                    return False
+                    return None
                 query = """
                     INSERT INTO active_positions (
                         token_symbol, token_address, allocated_usd, entry_trigger,
-                        target_exit_price, invalidation_level_price, last_simulated_price
+                        target_exit_price, invalidation_level_price, last_simulated_price,
+                        entry_slippage_percent, execution_status
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s);
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id, client_order_id::text;
                 """
                 cur.execute(query, (
                     state["token_symbol"], state["token_address"],
                     state.get("max_safe_position_usd", 0.0), entry_price,
                     state.get("target_exit_price"), state.get("invalidation_level_price"),
-                    entry_price
+                    entry_price, entry_slippage_for(state),
+                    # With Stage 3 on, the row is a RESERVATION until the
+                    # signer confirms: it counts against capital (so two ticks
+                    # cannot both spend the same headroom) but is not marked
+                    # or closed as if it had filled.
+                    "PENDING_EXECUTION" if STAGE3_ENABLED else "PAPER",
                 ))
-        return True
+                row = cur.fetchone()
+        if not row:
+            return None
+        return {"position_id": int(row[0]), "client_order_id": row[1]}
     except Exception as e:
         logger.error(f"Failed to log entry position to accounting ledger: {e}")
-        return False
+        return None
     finally:
         if conn is not None:
             conn.close()
@@ -250,18 +311,31 @@ def evaluate_open_positions() -> List[Dict[str, Any]]:
     # Staged here and only merged after the transaction commits.
     pending_summaries = []
     try:
-        conn = psycopg2.connect(DB_DSN)
+        conn = db_connect()
+        # Read, fetch, THEN write. The price fetch is HTTP and can take many
+        # seconds; holding a transaction open across it pinned
+        # CURRENT_TIMESTAMP to before the fetch and sat idle-in-transaction.
+        #
+        # PENDING_EXECUTION rows are excluded: the signer has not confirmed
+        # them, so there is no position to mark or close yet. A stale one is
+        # resolved by main.reconcile_pending_executions, never by this loop.
         with conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
                     SELECT id, token_symbol, token_address, allocated_usd, entry_trigger,
-                           target_exit_price, invalidation_level_price, last_simulated_price, captured_at
-                    FROM active_positions;
+                           target_exit_price, invalidation_level_price, last_simulated_price, captured_at,
+                           entry_slippage_percent
+                    FROM active_positions
+                    WHERE execution_status IS DISTINCT FROM 'PENDING_EXECUTION';
                 """)
                 open_positions = cur.fetchall()
+        if not open_positions:
+            return []
 
-                prices = _fetch_position_prices([p["token_address"] for p in open_positions])
+        prices = _fetch_position_prices([p["token_address"] for p in open_positions])
 
+        with conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 for pos in open_positions:
                     next_price = prices.get(pos["token_address"])
                     if next_price is None:
@@ -270,41 +344,64 @@ def evaluate_open_positions() -> List[Dict[str, Any]]:
                             f"leaving the position untouched rather than marking it to an assumed value."
                         )
                         continue
-                    next_price = float(next_price)
+                    # NaN/inf/<=0 is "no price", not a price. NaN is the
+                    # dangerous one: it fails BOTH barrier comparisons, so it
+                    # would be written into last_simulated_price (NUMERIC
+                    # accepts 'NaN') and silently disable the stop.
+                    next_price = paper_trading._finite_positive(next_price)
+                    if next_price is None:
+                        logger.warning(
+                            f"Unusable price for {pos['token_symbol']} this tick -- "
+                            f"leaving the position untouched.")
+                        continue
 
-                    exit_reason = None
-                    if pos["target_exit_price"] is not None and next_price >= float(pos["target_exit_price"]):
-                        exit_reason = "TARGET_HIT"
-                        next_price = float(pos["target_exit_price"])
-                    elif pos["invalidation_level_price"] is not None and next_price <= float(pos["invalidation_level_price"]):
-                        exit_reason = "STOPPED_OUT"
-                        next_price = float(pos["invalidation_level_price"])
+                    # ONE barrier rule, shared with the paper experiment. A
+                    # stop fills at the WORSE of the stop and the observed
+                    # price: booking it AT the stop hid every gap-down from
+                    # realized P&L and therefore from the kill switch.
+                    exit_reason, next_price = paper_trading.barrier_exit(
+                        next_price, pos["target_exit_price"], pos["invalidation_level_price"])
 
                     if exit_reason is None:
                         cur.execute(
                             # Column name kept for schema continuity; the value is
                             # now a real market price, not a simulated one.
                             "UPDATE active_positions SET last_simulated_price = %s WHERE id = %s;",
-                            (round(next_price, 8), pos["id"])
+                            (paper_trading._round_sig(next_price), pos["id"])
                         )
+                        continue
+
+                    # Claim the row FIRST. Only the claimant books the close,
+                    # so a row that is already gone (a concurrent close, a
+                    # manual delete) can never be realized twice.
+                    cur.execute("DELETE FROM active_positions WHERE id = %s RETURNING id;", (pos["id"],))
+                    if cur.fetchone() is None:
                         continue
 
                     entry_price = float(pos["entry_trigger"])
                     allocated_usd = float(pos["allocated_usd"])
-                    pnl_percent = ((next_price / entry_price) - 1.0) * 100.0 if entry_price else 0.0
+                    # NET of round-trip fees and slippage, with the same cost
+                    # model as the paper experiment (unmeasured slippage costs
+                    # the documented stand-in, never zero). realized_pnl_* is
+                    # what the kill switch sums; a gross figure let every
+                    # losing streak look ~6 points per trade smaller than it
+                    # was. Gross and cost are kept alongside for audit.
+                    gross_pct, cost_pct, pnl_percent = paper_trading.net_pnl_percent(
+                        entry_price, next_price, pos.get("entry_slippage_percent"))
                     pnl_usd = allocated_usd * (pnl_percent / 100.0)
 
                     cur.execute("""
                         INSERT INTO closed_positions (
                             token_symbol, token_address, allocated_usd, entry_trigger,
-                            exit_price, exit_reason, realized_pnl_usd, realized_pnl_percent, opened_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+                            exit_price, exit_reason, realized_pnl_usd, realized_pnl_percent, opened_at,
+                            gross_pnl_percent, cost_percent
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
                     """, (
                         pos["token_symbol"], pos["token_address"], allocated_usd, entry_price,
-                        round(next_price, 8), exit_reason, round(pnl_usd, 2), round(pnl_percent, 2),
-                        pos["captured_at"]
+                        paper_trading._round_sig(next_price), exit_reason, round(pnl_usd, 2),
+                        round(pnl_percent, 2), pos["captured_at"],
+                        round(gross_pct, 4), cost_pct
                     ))
-                    cur.execute("DELETE FROM active_positions WHERE id = %s;", (pos["id"],))
 
                     pending_summaries.append({
                         "token_symbol": pos["token_symbol"],
@@ -355,7 +452,22 @@ def _fetch_position_prices(token_addresses: List[str]) -> Dict[str, float]:
 
 # 2b. Operator Settings (capital limits, run duration, wallet labels,
 # watchdog behavior, kill-switch thresholds) -- a single row in app_settings.
-_settings_cache: Dict[str, Any] = {"data": None, "fetched_at": 0.0}
+_settings_cache: Dict[str, Any] = {"data": None, "fetched_at": 0.0, "gen": 0}
+# The cache is read by the pipeline's worker thread and INVALIDATED by the
+# dashboard's pause/resume handlers on other threads. Without a generation
+# check, a read that started before a pause could finish after it and write
+# the pre-pause RUNNING row back into the cache -- served as fresh for the
+# next TTL, which is exactly when I_ACCOUNTANT asks whether it may open.
+_settings_lock = threading.Lock()
+
+
+def invalidate_settings_cache() -> None:
+    """Forget the cached row AND fence off any read already in flight."""
+    with _settings_lock:
+        _settings_cache["gen"] += 1
+        _settings_cache["data"] = None
+
+
 _SETTINGS_CACHE_TTL_SECONDS = 3.0
 # How long a cached copy may still be served once the database has stopped
 # answering. Past this the reader returns None and every caller must fail
@@ -374,14 +486,23 @@ def get_app_settings(force_refresh: bool = False) -> Optional[Dict[str, Any]]:
 
     conn = None
     try:
-        conn = psycopg2.connect(DB_DSN)
-        with conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM app_settings WHERE id = 1;")
-                row = cur.fetchone()
-                _settings_cache["data"] = dict(row) if row else None
-                _settings_cache["fetched_at"] = now
-                return _settings_cache["data"]
+        conn = db_connect()
+        # At most two reads: if an invalidation lands while the first is in
+        # flight, its result may predate the write that caused it.
+        for _attempt in range(2):
+            gen = _settings_cache["gen"]
+            with conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("SELECT * FROM app_settings WHERE id = 1;")
+                    row = cur.fetchone()
+            data = dict(row) if row else None
+            with _settings_lock:
+                if _settings_cache["gen"] == gen:
+                    _settings_cache["data"] = data
+                    _settings_cache["fetched_at"] = now
+                    return data
+        # Invalidated twice mid-read: return the newest read, uncached.
+        return data
     except Exception as e:
         # Serving the last good row through a brief blip is useful. Serving it
         # forever is not: a pause set during the outage would never be seen,
@@ -406,7 +527,7 @@ def set_run_status(status: str, reason: Optional[str] = None):
     PAUSED_DURATION_ELAPSED / SHUTDOWN_WATCHDOG) that I_ACCOUNTANT consults before opening new positions."""
     conn = None
     try:
-        conn = psycopg2.connect(DB_DSN)
+        conn = db_connect()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -418,7 +539,7 @@ def set_run_status(status: str, reason: Optional[str] = None):
     finally:
         if conn is not None:
             conn.close()
-    _settings_cache["data"] = None  # force a fresh read next time anything checks
+    invalidate_settings_cache()  # force a fresh read next time anything checks
 
 
 def resume_trading():
@@ -427,7 +548,7 @@ def resume_trading():
     Called from the dashboard's 'Resume Trading' action."""
     conn = None
     try:
-        conn = psycopg2.connect(DB_DSN)
+        conn = db_connect()
         with conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -440,7 +561,7 @@ def resume_trading():
     finally:
         if conn is not None:
             conn.close()
-    _settings_cache["data"] = None
+    invalidate_settings_cache()
 
 
 def pause_trading(reason: Optional[str] = None):
@@ -475,7 +596,7 @@ def get_total_deployed_capital() -> float:
     """
     conn = None
     try:
-        conn = psycopg2.connect(DB_DSN)
+        conn = db_connect()
         with conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT COALESCE(SUM(allocated_usd), 0.0) FROM active_positions;")
@@ -501,7 +622,7 @@ def check_kill_switch() -> Dict[str, Any]:
     """
     conn = None
     try:
-        conn = psycopg2.connect(DB_DSN)
+        conn = db_connect()
         with conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("SELECT * FROM app_settings WHERE id = 1;")
@@ -519,7 +640,7 @@ def check_kill_switch() -> Dict[str, Any]:
                             "UPDATE app_settings SET run_status = 'PAUSED_DURATION_ELAPSED', run_status_reason = %s, updated_at = CURRENT_TIMESTAMP WHERE id = 1;",
                             (reason,)
                         )
-                        _settings_cache["data"] = None
+                        invalidate_settings_cache()
                         write_system_alert("CRITICAL", "RUN_TIMER", reason + " New entries paused.")
                         return {"gate_open": False, "reason": "PAUSED_DURATION_ELAPSED"}
 
@@ -536,7 +657,7 @@ def check_kill_switch() -> Dict[str, Any]:
                         "UPDATE app_settings SET run_status = 'PAUSED_KILL_SWITCH', run_status_reason = %s, updated_at = CURRENT_TIMESTAMP WHERE id = 1;",
                         (reason,)
                     )
-                    _settings_cache["data"] = None
+                    invalidate_settings_cache()
                     write_system_alert("CRITICAL", "KILL_SWITCH", reason + " New entries paused.")
                     return {"gate_open": False, "reason": "PAUSED_KILL_SWITCH"}
 
@@ -548,7 +669,7 @@ def check_kill_switch() -> Dict[str, Any]:
                             "UPDATE app_settings SET run_status = 'PAUSED_KILL_SWITCH', run_status_reason = %s, updated_at = CURRENT_TIMESTAMP WHERE id = 1;",
                             (reason,)
                         )
-                        _settings_cache["data"] = None
+                        invalidate_settings_cache()
                         write_system_alert("CRITICAL", "KILL_SWITCH", reason + " New entries paused.")
                         return {"gate_open": False, "reason": "PAUSED_KILL_SWITCH"}
 
@@ -570,7 +691,7 @@ def check_kill_switch() -> Dict[str, Any]:
                             "UPDATE app_settings SET run_status = 'PAUSED_KILL_SWITCH', run_status_reason = %s, updated_at = CURRENT_TIMESTAMP WHERE id = 1;",
                             (reason,)
                         )
-                        _settings_cache["data"] = None
+                        invalidate_settings_cache()
                         write_system_alert("CRITICAL", "KILL_SWITCH", reason + " New entries paused.")
                         return {"gate_open": False, "reason": "PAUSED_KILL_SWITCH"}
 
@@ -863,18 +984,36 @@ def compute_capital_per_participant(volume_h1_usd: Optional[float],
     versa) is exactly the kind of silent miscategorisation this project
     keeps having to dig out.
     """
-    if volume_h1_usd is None or volume_h1_usd <= 0:
+    try:
+        volume = float(volume_h1_usd) if volume_h1_usd is not None else None
+    except (TypeError, ValueError):
         return None
-    events = 0.0
-    if txns_h1_buys:
-        events += float(txns_h1_buys)
-    if txns_h1_sells:
-        events += float(txns_h1_sells)
-    if holders_added_per_hour and holders_added_per_hour > 0:
-        events += float(holders_added_per_hour)
+    if volume is None or not math.isfinite(volume) or volume <= 0:
+        return None
+    # BOTH sides or neither. With only one side reported the event count is
+    # a fraction of the truth, so capital-per-participant came out several
+    # times too HIGH -- and this gate refuses LOW values, so a half-measured
+    # token read as "real money behind it" and passed as if measured. A
+    # partial count is unmeasured, and unmeasured is the documented skip.
+    if txns_h1_buys is None or txns_h1_sells is None:
+        return None
+    try:
+        buys, sells = float(txns_h1_buys), float(txns_h1_sells)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(buys) and math.isfinite(sells)) or buys < 0 or sells < 0:
+        return None
+    events = buys + sells
+    if holders_added_per_hour is not None:
+        try:
+            h = float(holders_added_per_hour)
+        except (TypeError, ValueError):
+            h = 0.0
+        if math.isfinite(h) and h > 0:
+            events += h
     if events <= 0:
         return None
-    return round(volume_h1_usd / events, 4)
+    return round(volume / events, 4)
 
 
 def node_E_BREADTH(state: AgentNetworkState) -> Dict[str, Any]:
@@ -1064,7 +1203,8 @@ def node_I_ACCOUNTANT(state: AgentNetworkState) -> Dict[str, Any]:
     # we tried. Reporting True on the duplicate-guard path would ask the signer
     # to buy a token we already hold, every tick, which is precisely the
     # duplicate-trade bug the guard exists to prevent.
-    if not save_active_position(state):
+    written = save_active_position(state)
+    if not written:
         write_system_alert(
             "WARN", "I_ACCOUNTANT",
             f"No position row written for ${state['token_symbol']} (already open, or the "
@@ -1073,7 +1213,9 @@ def node_I_ACCOUNTANT(state: AgentNetworkState) -> Dict[str, Any]:
         return {"position_logged": False}
 
     write_system_alert("INFO", "I_ACCOUNTANT", f"Active ledger holding metrics appended for ${state['token_symbol']}.")
-    return {"position_logged": True}
+    # position_id / client_order_id travel to the signer: the key it dedupes
+    # on, so a retried or replayed request can never sign twice.
+    return {"position_logged": True, **written}
 def node_Z_CLOSER(state: AgentNetworkState) -> Dict[str, Any]:
     save_trading_session(state)
     if state.get("termination_reason"):

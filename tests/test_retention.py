@@ -51,6 +51,16 @@ def run() -> Suite:
     s.check_true("the two predicates are complementary, so no level is never pruned",
                  routine[3].replace("IN", "NOT IN", 1) == severe[3])
 
+    # The execution audit log is the record of whether funds moved. Only
+    # policy refusals -- the volume -- may age out; a signature never does.
+    audit = [p for p in retention._POLICIES if p[0] == "execution_audit_log"]
+    s.check_true("execution_audit_log is pruned only by an outcome predicate",
+                 len(audit) == 1 and audit[0][3] == "outcome = 'REFUSED_POLICY'")
+    s.check_true("signed executions and errors are never on a retention timer",
+                 all("SIGNED" not in (p[3] or "") and "ERROR" not in (p[3] or "")
+                     for p in audit))
+    s.check_true("signer_orders is never on a retention timer", "signer_orders" not in tables)
+
     # Batching is not a micro-optimisation: the tick loop shares this
     # database, and an unbounded DELETE over a day of alerts holds a lock
     # long enough to stall trading in order to tidy up after trading.

@@ -57,6 +57,7 @@ from market_data import (
     fetch_price_impact_pct,
     fetch_dex_pair_data,
     jupiter_throttle,
+    bounded_cache_put,
     JUPITER_CACHE_TTL_S,
 )
 
@@ -183,7 +184,10 @@ async def fetch_jupiter_token_data(client: httpx.AsyncClient, token_address: str
     """Independent price, one-sided liquidity, token age and launchpad.
     Free, no key, roughly 1 request/second."""
     cached = _jupiter_cache.get(token_address)
-    if cached and (time.time() - cached["at"]) < JUPITER_CACHE_TTL_S:
+    # Monotonic, not wall-clock: a clock step (NTP, resume from sleep) made
+    # a wall-clock age negative or huge, which either pinned a stale entry
+    # or defeated the cache.
+    if cached and (time.monotonic() - cached["at"]) < JUPITER_CACHE_TTL_S:
         return cached["value"]
 
     url = f"{JUPITER_PRICE_BASE}/price/v3"
@@ -215,7 +219,7 @@ async def fetch_jupiter_token_data(client: httpx.AsyncClient, token_address: str
         "token_age_hours": age_hours,
         "launchpad": sanitize_external_text(row.get("launchpad"), fallback="") or None,
     }
-    _jupiter_cache[token_address] = {"value": result, "at": time.time()}
+    bounded_cache_put(_jupiter_cache, token_address, result, JUPITER_CACHE_TTL_S)
     return result
 
 

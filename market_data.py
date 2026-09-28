@@ -104,20 +104,21 @@ JUPITER_BASE = os.environ.get("JUPITER_API_BASE", "https://api.jup.ag")
 # So every Jupiter call goes through one process-wide throttle that
 # serialises them and enforces a minimum gap. Concurrency elsewhere is
 # unaffected -- RugCheck and DexScreener still run in parallel with these.
-JUPITER_MIN_INTERVAL_S = float(os.environ.get("JUPITER_MIN_INTERVAL_S", "1.2"))
-_jupiter_lock = asyncio.Lock()
-_jupiter_last_call = 0.0
+#
+# ONE throttle for Jupiter, shared with token_discovery. There used to be two,
+# each reading JUPITER_MIN_INTERVAL_S with a DIFFERENT default (1.2 here, 1.1
+# there) and each ignorant of the other's calls -- so discovery's three token
+# list requests and this module's price/quote requests could land together
+# while each throttle believed the limit was respected.
+import token_discovery as _td  # noqa: E402 -- dependency-free by design
+
+JUPITER_MIN_INTERVAL_S = _td.JUPITER_MIN_INTERVAL_S
 
 
 async def jupiter_throttle() -> None:
-    """Blocks until at least JUPITER_MIN_INTERVAL_S has passed since the
-    previous Jupiter request, then claims the slot."""
-    global _jupiter_last_call
-    async with _jupiter_lock:
-        wait = JUPITER_MIN_INTERVAL_S - (time.monotonic() - _jupiter_last_call)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _jupiter_last_call = time.monotonic()
+    """Blocks until this caller's Jupiter slot, then returns. Slots are
+    reserved atomically on the event loop (see token_discovery._throttle)."""
+    await _td._throttle("jupiter")
 
 
 # Slippage barely moves minute to minute, and the discovery list cycles the
@@ -126,6 +127,27 @@ async def jupiter_throttle() -> None:
 # repeatedly banned.
 JUPITER_CACHE_TTL_S = float(os.environ.get("JUPITER_CACHE_TTL_S", "120"))
 _slippage_cache: Dict[str, Any] = {}
+# Per-mint caches are keyed by every token discovery ever surfaces -- tens of
+# thousands a day on Solana -- and nothing ever removed an entry, so memory
+# grew for the life of the process. Expired entries are swept whenever a
+# cache passes this size; live ones are never evicted early.
+CACHE_MAX_ENTRIES = int(os.environ.get("CACHE_MAX_ENTRIES", "5000"))
+
+
+def bounded_cache_put(cache: Dict[str, Any], key: str, value: Any, ttl_s: float,
+                      now: Optional[float] = None) -> None:
+    """cache[key] = {"value", "at"} (monotonic), pruning expired entries -- and,
+    if everything is still live, the oldest -- once the cache is too large."""
+    now = time.monotonic() if now is None else now
+    cache[key] = {"value": value, "at": now}
+    if len(cache) <= CACHE_MAX_ENTRIES:
+        return
+    for k in [k for k, v in cache.items() if now - v.get("at", 0.0) >= ttl_s]:
+        cache.pop(k, None)
+    if len(cache) > CACHE_MAX_ENTRIES:
+        for k, _ in sorted(cache.items(), key=lambda kv: kv[1].get("at", 0.0))[
+                :len(cache) - CACHE_MAX_ENTRIES]:
+            cache.pop(k, None)
 # RPC endpoint and auth are defined in holder_concentration.py -- the module
 # that actually talks to the chain -- and re-exported here so every existing
 # reference to market_data.SOLANA_RPC_URL still resolves, and so there is
@@ -571,7 +593,7 @@ async def fetch_price_impact_pct(client: httpx.AsyncClient, token_address: str,
                 f"Jupiter reported zero price impact for {token_address} -- treating as "
                 f"unmeasured rather than free. A real quote is never exactly 0.")
             value = None
-        _slippage_cache[token_address] = {"value": value, "at": time.monotonic()}
+        bounded_cache_put(_slippage_cache, token_address, value, JUPITER_CACHE_TTL_S)
         return value
     except Exception as e:
         logger.warning(f"Jupiter quote failed for {token_address}: {e}")
@@ -728,7 +750,10 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
 # integration isn't lost if their access model changes.
 #
 # All providers return identical dict keys.
-MARKET_DATA_PROVIDER = os.environ.get("MARKET_DATA_PROVIDER", "dexscreener").strip().lower()
+# Default "free", matching docker-compose.yml and .env.example. The code said
+# "dexscreener" while compose said "free", so the same unset variable meant
+# two different providers depending on whether the app ran under compose.
+MARKET_DATA_PROVIDER = os.environ.get("MARKET_DATA_PROVIDER", "free").strip().lower()
 
 
 async def get_snapshot(client: httpx.AsyncClient, token_address: str) -> Optional[Dict[str, Any]]:

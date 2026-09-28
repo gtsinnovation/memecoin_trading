@@ -73,4 +73,12 @@ def run(engine) -> Suite:
     s.check_true("router_G lets a clean read through to H_FUSE",
                  engine.router_G({"termination_reason": None}) == "H_FUSE")
 
+    print("\n[E_BREADTH] a half-measured participation count is unmeasured, not a pass")
+    cpp = engine.compute_capital_per_participant
+    s.check("both sides measured: volume over events", cpp(1000.0, 60, 40, None), 10.0)
+    s.check_true("sells missing -> None, not an inflated figure", cpp(1000.0, 60, None, None) is None)
+    s.check_true("buys missing -> None", cpp(1000.0, None, 40, None) is None)
+    s.check_true("NaN volume -> None", cpp(float("nan"), 60, 40, None) is None)
+    s.check("measured zero sides with holders still divide", cpp(100.0, 0, 0, 10.0), 10.0)
+    s.check_true("no events at all -> None", cpp(100.0, 0, 0, None) is None)
     return s

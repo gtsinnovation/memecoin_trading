@@ -26,6 +26,7 @@ Every input is Optional and None means "we could not read this". None refuses.
 A balance that could not be fetched is not a balance of zero and is certainly
 not a balance that is sufficient.
 """
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -48,6 +49,22 @@ def _refuse(reason: str) -> RailVerdict:
     return RailVerdict(ok=False, reason=reason)
 
 
+def _finite(value) -> Optional[float]:
+    """float(value) when it is a finite number, else None.
+
+    NaN is the reason this exists: every comparison against it is False, so
+    `nan > ceiling`, `balance < size` and `count >= cap` all PASS. A NaN
+    ceiling, balance or count read as the most permissive value possible.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return v if math.isfinite(v) else None
+
+
 def position_ceiling_usd(live_max_position_usd: Optional[float],
                          max_position_usd: Optional[float]) -> float:
     """The smallest of the configured ceilings and the hard constant.
@@ -57,12 +74,12 @@ def position_ceiling_usd(live_max_position_usd: Optional[float],
     """
     candidates = []
     for value in (live_max_position_usd, max_position_usd):
-        if value is None:
+        v = _finite(value)
+        # min() with a NaN in first position returns NaN, and every later
+        # "size > ceiling" test is then False -- an unlimited ceiling.
+        if v is None:
             return 0.0
-        try:
-            candidates.append(float(value))
-        except (TypeError, ValueError):
-            return 0.0
+        candidates.append(v)
     candidates.append(ABSOLUTE_MAX_POSITION_USD)
     return max(0.0, min(candidates))
 
@@ -76,12 +93,16 @@ def check_entry_rails(*,
                       orders_sent_today: Optional[int],
                       max_orders_per_day: Optional[int],
                       sol_lamports: Optional[int],
-                      quote_balance_usd: Optional[float]) -> RailVerdict:
+                      quote_balance_usd: Optional[float],
+                      quote_balance_required: bool = True) -> RailVerdict:
     """Every refusal that can stop an entry, evaluated before anything is signed.
 
     Pure: it measures nothing itself. The caller fetches balances and counts and
     passes them in, which is what makes every branch here testable without a
     wallet, an RPC endpoint or a database.
+
+    quote_balance_required=False is for the devnet self-transfer ONLY, which
+    spends lamports and no quote currency. Every swap path must leave it True.
     """
     if mode is None:
         return _refuse("trading mode unreadable")
@@ -93,9 +114,9 @@ def check_entry_rails(*,
     if str(run_status).upper() != "RUNNING":
         return _refuse(f"entries blocked: {run_status}")
 
-    if requested_usd is None or not (float(requested_usd) > 0):
-        return _refuse("requested size is missing or not positive")
-    requested = float(requested_usd)
+    requested = _finite(requested_usd)
+    if requested is None or not requested > 0:
+        return _refuse("requested size is missing, non-finite or not positive")
 
     ceiling = position_ceiling_usd(live_max_position_usd, max_position_usd)
     if ceiling <= 0:
@@ -106,24 +127,29 @@ def check_entry_rails(*,
     # A cap of zero means no orders are permitted. Only an explicitly absent
     # cap is treated as unlimited, and even that is refused rather than
     # assumed -- an unreadable cap is not an infinite one.
-    if max_orders_per_day is None:
+    cap = _finite(max_orders_per_day)
+    if cap is None:
         return _refuse("daily order cap unreadable")
-    if int(max_orders_per_day) <= 0:
+    if cap <= 0:
         return _refuse("daily order cap is zero -- no live orders permitted")
-    if orders_sent_today is None:
+    sent = _finite(orders_sent_today)
+    if sent is None or sent < 0:
         return _refuse("today's order count unreadable")
-    if int(orders_sent_today) >= int(max_orders_per_day):
-        return _refuse(f"daily order cap reached ({orders_sent_today}/{max_orders_per_day})")
+    if sent >= cap:
+        return _refuse(f"daily order cap reached ({int(sent)}/{int(cap)})")
 
-    if sol_lamports is None:
+    lamports = _finite(sol_lamports)
+    if lamports is None or lamports < 0:
         return _refuse("SOL balance unreadable")
-    if int(sol_lamports) < MIN_SOL_LAMPORTS_FOR_FEES:
-        return _refuse(f"SOL too low for fees ({int(sol_lamports) / 1e9:.4f} SOL)")
+    if lamports < MIN_SOL_LAMPORTS_FOR_FEES:
+        return _refuse(f"SOL too low for fees ({lamports / 1e9:.4f} SOL)")
 
-    if quote_balance_usd is None:
-        return _refuse("quote-currency balance unreadable")
-    if float(quote_balance_usd) < requested:
-        return _refuse(f"balance ${float(quote_balance_usd):,.2f} below size ${requested:,.2f}")
+    if quote_balance_required:
+        balance = _finite(quote_balance_usd)
+        if balance is None:
+            return _refuse("quote-currency balance unreadable")
+        if balance < requested:
+            return _refuse(f"balance ${balance:,.2f} below size ${requested:,.2f}")
 
     return RailVerdict(ok=True, approved_size_usd=min(requested, ceiling))
 
@@ -137,11 +163,13 @@ def requote_still_acceptable(quoted_impact_percent: Optional[float],
     is the check against the quote actually being signed, not the one that won
     the token its place in the queue.
     """
-    if tolerance_percent is None:
+    tolerance = _finite(tolerance_percent)
+    if tolerance is None:
         return _refuse("slippage tolerance unreadable")
-    if quoted_impact_percent is None:
-        return _refuse("re-quote returned no price impact -- refusing to sign blind")
-    if abs(float(quoted_impact_percent)) > float(tolerance_percent):
-        return _refuse(f"route degraded to {abs(float(quoted_impact_percent)):.2f}% impact, "
-                       f"above {float(tolerance_percent):.2f}% tolerance")
+    impact = _finite(quoted_impact_percent)
+    if impact is None:
+        return _refuse("re-quote returned no usable price impact -- refusing to sign blind")
+    if abs(impact) > tolerance:
+        return _refuse(f"route degraded to {abs(impact):.2f}% impact, "
+                       f"above {tolerance:.2f}% tolerance")
     return RailVerdict(ok=True)

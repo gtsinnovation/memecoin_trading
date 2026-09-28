@@ -21,7 +21,14 @@ COPY signer_service/ .
 #                         the import falls back to a mirrored copy of the
 #                         constant, which would silently defeat the point of
 #                         the check.
-COPY tx_verify.py execution_rails.py ./
+#   signer_auth.py     -- HMAC request authentication; the web app signs with
+#                         the same file, so the wire format cannot drift.
+COPY tx_verify.py execution_rails.py signer_auth.py ./
+
+# Unprivileged. This container holds the Turnkey API key; code execution in
+# it as root would also own the filesystem and every process in it.
+RUN useradd --system --uid 10002 --no-create-home --shell /usr/sbin/nologin signer
+USER 10002
 
 EXPOSE 8100
 

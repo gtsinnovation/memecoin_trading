@@ -74,7 +74,32 @@ def redact(text) -> str:
 
 
 class SolanaRpcError(Exception):
+    """Transport-level or node-level failure. For a broadcast, a transport
+    failure is AMBIGUOUS: the node may have accepted the transaction before
+    the connection dropped."""
     pass
+
+
+class SolanaRpcRejected(SolanaRpcError):
+    """The node answered with a JSON-RPC error: it definitively refused."""
+    pass
+
+
+# Expected genesis hashes (docs.anza.xyz/clusters/available). The network a
+# node serves is a property of its GENESIS, not of the hostname an operator
+# typed. A hostname check trusts the operator's label; this asks the chain.
+GENESIS_HASHES = {
+    "devnet": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
+    "testnet": "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY",
+    "mainnet": "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
+}
+
+
+def network_for_genesis(genesis_hash) -> str:
+    for name, h in GENESIS_HASHES.items():
+        if genesis_hash == h:
+            return name
+    return "unknown"
 
 
 async def _rpc_call(client: httpx.AsyncClient, method: str, params: list):
@@ -96,9 +121,28 @@ async def _rpc_call(client: httpx.AsyncClient, method: str, params: list):
             f"{method} failed: {type(e).__name__}: {redact(e)}") from None
     except ValueError as e:
         raise SolanaRpcError(f"{method} failed: unparseable response ({redact(e)})") from None
+    if not isinstance(data, dict):
+        raise SolanaRpcError(f"{method} failed: response is not a JSON-RPC object")
     if "error" in data:
-        raise SolanaRpcError(f"{method} failed: {redact(data['error'])}")
+        raise SolanaRpcRejected(f"{method} failed: {redact(data['error'])}")
+    if "result" not in data:
+        raise SolanaRpcError(f"{method} failed: response carries no result")
     return data["result"]
+
+
+async def get_genesis_hash(client: httpx.AsyncClient) -> str:
+    result = await _rpc_call(client, "getGenesisHash", [])
+    if not isinstance(result, str):
+        raise SolanaRpcError("getGenesisHash returned a non-string result")
+    return result
+
+
+async def get_balance_lamports(client: httpx.AsyncClient, pubkey: str) -> int:
+    result = await _rpc_call(client, "getBalance", [pubkey, {"commitment": "confirmed"}])
+    value = (result or {}).get("value") if isinstance(result, dict) else None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise SolanaRpcError("getBalance returned no usable lamport value")
+    return value
 
 
 async def get_latest_blockhash(client: httpx.AsyncClient) -> str:

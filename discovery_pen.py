@@ -135,8 +135,15 @@ async def capture(conn, client: httpx.AsyncClient) -> Dict[str, int]:
     """
     seen = stored = undated = 0
     last_error: Optional[str] = None
+    # The SAME per-provider throttle discovery uses. GeckoTerminal's free
+    # limit is shared by this sweep and discovery's fallback pool walk; the
+    # sweep used to fire its pages back-to-back outside that throttle, so
+    # the two together could exceed the limit and 429 each other -- and a
+    # 429 here costs pen coverage silently.
+    from token_discovery import _throttle
     for page in range(1, PEN_CAPTURE_PAGES + 1):
         try:
+            await _throttle("geckoterminal")
             resp = await client.get(
                 f"{GECKOTERMINAL_BASE}/api/v2/networks/solana/new_pools",
                 params={"page": page}, timeout=20.0)

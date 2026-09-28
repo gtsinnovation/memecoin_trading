@@ -143,7 +143,11 @@ accordingly before going further.
 
 ---
 
-## Part 2b (recommended): give the signer its own least-privilege DB role
+## Part 2b (required before Stage 4): give the signer its own least-privilege DB role
+
+The signer refuses to start outside devnet while connected as a database
+superuser, and warns on devnet. A superuser connection could rewrite the
+order ledger its daily caps are counted from.
 
 `signer_service/.env`'s `DATABASE_URL` defaults to the `postgres`
 superuser, which works but hands a service that talks to a signing API
@@ -156,8 +160,9 @@ signer container cannot alter positions, settings, or P&L.
 
 | Table | Access | Why |
 |---|---|---|
-| `app_settings` | SELECT | re-check `run_status` and the capital cap |
-| `active_positions` | SELECT | sum currently-deployed capital |
+| `app_settings` | SELECT | re-check `run_status` (and a cap that can only *tighten* its own) |
+| `active_positions` | SELECT | cross-check the reservation; sum other deployed capital |
+| `signer_orders` | SELECT, INSERT, UPDATE | its own order ledger: idempotency and daily caps |
 | `execution_audit_log` | INSERT | record every attempt, including refusals |
 
 Note it is **not** purely read-only: it must be able to append to the
@@ -169,6 +174,8 @@ signer's credentials can add audit rows but never erase them.
 -- Run once, as the postgres superuser:
 --   docker compose exec db psql -U postgres -d memecoin_trading
 
+-- Generate the password with `openssl rand -hex 24` (hex only -- it goes in
+-- a URL). Never paste it into chat, a ticket, or a commit.
 CREATE ROLE signer_svc LOGIN PASSWORD 'choose-a-strong-password-here';
 
 GRANT CONNECT ON DATABASE memecoin_trading TO signer_svc;
@@ -176,6 +183,7 @@ GRANT USAGE   ON SCHEMA public              TO signer_svc;
 
 GRANT SELECT ON app_settings, active_positions TO signer_svc;
 GRANT INSERT ON execution_audit_log            TO signer_svc;
+GRANT SELECT, INSERT, UPDATE ON signer_orders  TO signer_svc;
 
 -- SERIAL columns need the sequence too, or every INSERT fails with
 -- "permission denied for sequence execution_audit_log_id_seq".
@@ -208,60 +216,63 @@ superuser with extra steps.
 
 ## Part 3: Run the smoke test
 
+Every signer endpoint that can touch Turnkey is authenticated with an HMAC
+(`signer_auth.py`), and `/execute` only signs an order the pipeline has
+reserved in its ledger. So the smoke test runs through a small script in
+the `web` container instead of curl -- it does exactly what the pipeline
+does. First, the one-time shared secret (the SAME value in both files):
+
+```
+# PowerShell -- generates 64 hex characters without echoing them
+$b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
+$s = ($b | ForEach-Object { $_.ToString('x2') }) -join ''
+Add-Content .env "SIGNER_SHARED_SECRET=$s"
+Add-Content signer_service\.env "SIGNER_SHARED_SECRET=$s"
+Remove-Variable s, b
+```
+
+Then set the signer's own caps in `signer_service/.env` (see its
+`.env.example`): `MAX_TRADE_USD`, `SIGNER_MAX_ORDERS_PER_DAY`, and
+optionally `SIGNER_MAX_TOTAL_DEPLOYED_USD` / `SIGNER_MAX_DAILY_USD`
+(both required outside devnet). These come from the signer's environment,
+not from the dashboard: the web app can no longer raise a limit the
+signer enforces against it.
+
 ```
 docker compose --profile stage3 up -d --build
 ```
 
-This starts `signer` alongside `db` and `web` (it's excluded from a plain
-`docker compose up` — see docker-compose.yml's comments). Then, from the
-host:
-
 **1. Confirm authentication works, without signing anything:**
 ```
-curl http://localhost:8000/  # unrelated -- just confirms "web" is up
-docker compose exec web curl -s http://signer:8100/whoami
+docker compose exec web python stage3_smoke.py whoami
 ```
-(The signer has no port published to the host on purpose, so this is
-called from inside the `web` container's network, not `curl localhost`.)
-A successful response echoes back your organization/user identity. An
-error here means the Turnkey credentials in `signer_service/.env` are
-wrong before you even get to signing — fix that first.
+A successful response echoes back your organization/user identity. A 401
+means the two `SIGNER_SHARED_SECRET` values differ; a 500/502 means the
+Turnkey credentials in `signer_service/.env` are wrong.
 
 **2. Attempt a real (devnet) sign + broadcast:**
 ```
-docker compose exec web curl -s -X POST http://signer:8100/execute \
-  -H "Content-Type: application/json" \
-  -d '{"token_address": "<whatever you put in ALLOWED_EXECUTION_TOKENS>", "requested_usd": 5}'
+docker compose exec web python stage3_smoke.py execute --token <a mint in ALLOWED_EXECUTION_TOKENS> --usd 5
 ```
-A success response looks like:
-```json
-{"executed": true, "confirmed": true, "tx_signature": "...", "network": "devnet", "reason": "broadcast and confirmed"}
-```
-Look up `tx_signature` on
+Expect `HTTP 200 -> EXECUTED` with a `tx_signature`. Look it up on
 [explorer.solana.com/?cluster=devnet](https://explorer.solana.com/?cluster=devnet)
-or [solscan.io](https://solscan.io) (devnet toggle) — you should see a
-real, tiny, self-to-self SOL transfer from your Turnkey wallet. That
-transaction landing on-chain is the actual proof this works: real
-signing, inside Turnkey's enclave, broadcast to a real (if valueless)
-network, independently re-validated by `policy_guard.py` before any of
-it happened.
+-- a tiny self-to-self SOL transfer from your Turnkey wallet. The signer
+also checks the RPC's **genesis hash** before signing anything: devnet
+mode refuses a node whose chain is not devnet, whatever its hostname says.
 
-**3. Check the audit trail:**
+**3. Check the audit trail and the order ledger:**
 ```
 docker compose exec db psql -U postgres -d memecoin_trading -c "SELECT * FROM execution_audit_log ORDER BY id DESC LIMIT 5;"
+docker compose exec db psql -U postgres -d memecoin_trading -c "SELECT * FROM signer_orders ORDER BY created_at DESC LIMIT 5;"
 ```
-You should see the attempt recorded with `outcome = 'SIGNED_BROADCAST'`
-and the same `tx_signature`.
 
-**4. Confirm the refusal paths actually refuse.** Try a request for a
-token NOT in `ALLOWED_EXECUTION_TOKENS`, and one with `requested_usd`
-above `MAX_TRADE_USD` — both should come back `"executed": false` with a
-`403`, and show up in `execution_audit_log` as `REFUSED_POLICY`. Also try
-pausing trading from the dashboard (the existing Pause Trading button)
-and confirm `/execute` then refuses with `run_status is 'PAUSED_MANUAL'`
-— this is the same kill-switch/pause control from earlier stages now
-reaching all the way through to the signer, independent of whether the
-main pipeline itself is even looking at it.
+**4. Confirm the refusal paths actually refuse.** A token not in
+`ALLOWED_EXECUTION_TOKENS`, and a `--usd` above `MAX_TRADE_USD`, must both
+come back `HTTP 403 -> VOID` and appear as `REFUSED_POLICY`. Pause trading
+from the dashboard and confirm the refusal names `PAUSED_MANUAL`. Re-sending
+an order id (`stage3_smoke.py order <id>` shows its outcome) can never sign
+twice: `/execute` answers a known `client_order_id` with `409` and the first
+outcome.
 
 If all four checks pass, the signing plumbing is proven end-to-end on
 devnet.
@@ -280,10 +291,12 @@ ENABLE_STAGE3_EXECUTION=true
 ```
 then `docker compose up -d --build` (restart `web`; `signer` is already
 running from Part 3). See README.md's Stage 3 section for exactly what
-changes in the pipeline's behavior when this is on — it stays entirely
-additive (an extra call after a position is already recorded the way it
-always was) and never blocks or slows the simulated flow if the signer
-is unreachable or refuses.
+changes in the pipeline's behavior when this is on. The ledger row is
+written as `PENDING_EXECUTION` (a capital reservation that is not marked or
+closed), then becomes `EXECUTED`, is removed on a definitive refusal, or is
+held as `EXECUTION_UNKNOWN` until the signer confirms either way -- the
+pipeline re-asks every minute through the read-only `GET /orders/{id}`. A
+refused order no longer leaves a phantom position in the P&L.
 
 ## What's next (Stage 4, not built yet)
 

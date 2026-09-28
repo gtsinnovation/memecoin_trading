@@ -987,7 +987,10 @@ async def discover_candidates(client: httpx.AsyncClient,
         # under a minute -- every row flagged "examined and failed" without a
         # single liquidity measurement ever being taken -- and the only log
         # line is the reassuring one below.
-        _cache["fetched_at"] = now - DISCOVERY_CACHE_TTL_S + DISCOVERY_FAILURE_RETRY_S
+        # Stamped at COMPLETION, not at the start: a throttled sweep takes
+        # tens of seconds, and stamping its start shortened every TTL and
+        # backoff by that much.
+        _cache["fetched_at"] = time.monotonic() - DISCOVERY_CACHE_TTL_S + DISCOVERY_FAILURE_RETRY_S
         # Record the floors this attempt ran under even though it yielded
         # nothing. The floor-change check above is what lets a settings edit
         # take effect before the TTL expires, and it compares against this
@@ -1005,7 +1008,7 @@ async def discover_candidates(client: httpx.AsyncClient,
         return []
 
     _cache["candidates"] = candidates
-    _cache["fetched_at"] = now
+    _cache["fetched_at"] = time.monotonic()   # at completion; see the failure branch
     _cache["floors"] = floors
     # The per-source breakdown matters more than the total. The total is
     # pinned near the sum of the sources' fixed page sizes and barely moves

@@ -197,6 +197,43 @@ untouched unless you explicitly run `docker compose down -v` (which
 deletes the volume — see the schema-changes note above for the
 non-destructive path).
 
+## Rotating the Postgres password
+
+`POSTGRES_PASSWORD` is **required** (Compose refuses to start without it)
+and must never be a default. The database volume keeps whatever password
+it was *initialised* with, so changing `.env` alone locks the app out.
+Rotate in this order -- the new value is generated locally, goes straight
+into the database and `.env`, and is never printed:
+
+Linux/macOS (bash):
+```
+NEW=$(openssl rand -hex 24)
+printf "ALTER USER postgres PASSWORD '%s';\n" "$NEW" | docker exec -i trading_postgres_db psql -U postgres -d memecoin_trading
+sed -i '/^POSTGRES_PASSWORD=/d' .env && echo "POSTGRES_PASSWORD=$NEW" >> .env
+unset NEW
+docker compose up -d
+```
+
+Windows (PowerShell):
+```
+$b = New-Object byte[] 24; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
+$p = ($b | ForEach-Object { $_.ToString('x2') }) -join ''
+"ALTER USER postgres PASSWORD '$p';" | docker exec -i trading_postgres_db psql -U postgres -d memecoin_trading
+$lines = [IO.File]::ReadAllLines("$PWD\.env") | Where-Object { $_ -notmatch '^\s*POSTGRES_PASSWORD=' }
+[IO.File]::WriteAllLines("$PWD\.env", [string[]]($lines + "POSTGRES_PASSWORD=$p"))
+Remove-Variable p, b, lines
+docker compose up -d
+```
+
+Plain `docker exec`, not `docker compose exec`: while `.env` lacks the
+variable, every `docker compose` command refuses to parse the file -- by
+design. The `ALTER USER` runs over the container's local socket, which the
+postgres image trusts, so it needs no current password. The statement is
+piped on stdin rather than passed as an argument, so it never appears in
+a process list. `docker compose up -d` then recreates `web` with the new
+`DATABASE_URL`. If you use the scoped `signer_svc` role, its password is
+separate and lives only in `signer_service/.env`.
+
 ## Backups
 
 The simplest approach is a scheduled `pg_dump` to a file, copied off the

@@ -24,7 +24,10 @@ DATABASE_URL defaults to the same connection main.py uses if you don't
 set up a separate role, but a scoped one is stronger defense-in-depth.
 """
 import os
+import math
+import time
 import logging
+import collections
 from dataclasses import dataclass
 from typing import Optional
 
@@ -32,33 +35,72 @@ import asyncpg
 
 logger = logging.getLogger("signer_service.policy_guard")
 
-# NOTE: this module does NOT open its own connection -- check_execution_allowed
-# receives the pool from main.py, which builds it from main.py's DATABASE_URL.
-# Setting a separate read-only URL here would have no effect. The least-
-# privilege role in STAGE3_SETUP.md Part 2b is configured through the
-# service's single DATABASE_URL, not a second one.
+# NOTE: this module does NOT open its own connection -- main.py passes the
+# connection it holds inside the reservation transaction, so the checks and
+# the order reservation are one atomic step under one advisory lock.
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 ALLOWED_EXECUTION_TOKENS = [
     addr.strip() for addr in os.environ.get("ALLOWED_EXECUTION_TOKENS", "").split(",") if addr.strip()
 ]
-MAX_TRADE_USD = float(os.environ.get("MAX_TRADE_USD", "0"))
+
+
+def _env_amount(name: str) -> float:
+    """A cap from this service's own environment. Anything that is not a
+    finite, non-negative number becomes 0.0 -- which REFUSES.
+
+    float("nan") parses, and a NaN cap passes every comparison against it:
+    `requested > nan` is False, so MAX_TRADE_USD=nan meant "no per-trade cap"
+    while assert_caps_consistent (`nan > ceiling`, also False) waved it
+    through at startup.
+    """
+    raw = os.environ.get(name, "0")
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return v if math.isfinite(v) and v >= 0 else 0.0
+
+
+# CAPS COME FROM THIS SERVICE'S ENVIRONMENT, NOT FROM THE DATABASE.
+#
+# app_settings is written by the web app -- by its settings form. A cap the
+# signer read from there was a cap the web app could raise, so a compromised
+# or buggy web app could lift the very limit this layer exists to hold
+# against it. app_settings may now only TIGHTEN these (see _effective_total_cap).
+MAX_TRADE_USD = _env_amount("MAX_TRADE_USD")
+MAX_TOTAL_DEPLOYED_USD = _env_amount("SIGNER_MAX_TOTAL_DEPLOYED_USD")
+MAX_DAILY_USD = _env_amount("SIGNER_MAX_DAILY_USD")
+MAX_ORDERS_PER_DAY = int(_env_amount("SIGNER_MAX_ORDERS_PER_DAY"))
 
 # The pipeline carries its own hard ceiling as a source constant
-# (execution_rails.ABSOLUTE_MAX_POSITION_USD). These two caps, plus Turnkey's
-# own enclave policy, are three independent limits on the same quantity, and
-# nothing used to reconcile them -- an operator could raise MAX_TRADE_USD in
-# an env file and silently exceed the ceiling the pipeline believes is
-# absolute. The mismatch is now refused at startup rather than discovered by
-# a trade that should not have been possible.
+# (execution_rails.ABSOLUTE_MAX_POSITION_USD). These caps, plus Turnkey's own
+# enclave policy, are independent limits on the same quantity; a signer cap
+# above the source ceiling is refused at startup.
 try:
+    import execution_rails
     from execution_rails import ABSOLUTE_MAX_POSITION_USD
 except Exception:  # pragma: no cover - the constant is mirrored if unavailable
+    execution_rails = None
     ABSOLUTE_MAX_POSITION_USD = 250.0
+
+DEVNET_MODE = "devnet_transfer_test"
 
 
 def assert_caps_consistent() -> None:
-    """Refuse to start when this signer's cap exceeds the pipeline's ceiling."""
+    """Refuse to start on a cap set that cannot be what the operator meant."""
+    for name in ("MAX_TRADE_USD", "SIGNER_MAX_TOTAL_DEPLOYED_USD", "SIGNER_MAX_DAILY_USD",
+                 "SIGNER_MAX_ORDERS_PER_DAY"):
+        raw = os.environ.get(name)
+        if raw is None or raw.strip() == "":
+            continue
+        try:
+            ok = math.isfinite(float(raw)) and float(raw) >= 0
+        except ValueError:
+            ok = False
+        if not ok:
+            raise RuntimeError(f"{name} is set to a value that is not a finite, non-negative "
+                               f"number. Refusing to start rather than treat it as unlimited.")
     if MAX_TRADE_USD > ABSOLUTE_MAX_POSITION_USD:
         raise RuntimeError(
             f"MAX_TRADE_USD (${MAX_TRADE_USD:.2f}) exceeds the pipeline's absolute ceiling "
@@ -66,6 +108,46 @@ def assert_caps_consistent() -> None:
             f"a signer that would sign more than the pipeline believes is possible is not a "
             f"safety layer. Lower MAX_TRADE_USD, or raise the source constant in a reviewed commit."
         )
+    if execution_rails is None:
+        raise RuntimeError("execution_rails.py is missing from this image -- the pre-signature "
+                           "rails cannot run. Rebuild the signer image.")
+
+
+class InProcessLedger:
+    """Reservations this PROCESS has made in the last 24 hours.
+
+    The daily caps are counted from signer_orders, and a database role with
+    DELETE on that table could reset them. This counter lives only in the
+    signer's memory, which nothing outside the container can touch; the cap
+    applies to the LARGER of the two. A restart clears it, so it narrows the
+    gap rather than closing it -- the database count and Turnkey's own policy
+    remain.
+    """
+    WINDOW_S = 86_400.0
+
+    def __init__(self):
+        self._events = collections.deque()
+
+    def _trim(self, now: float) -> None:
+        while self._events and now - self._events[0][0] > self.WINDOW_S:
+            self._events.popleft()
+
+    def record(self, usd: float, now: Optional[float] = None) -> None:
+        now = time.monotonic() if now is None else now
+        self._trim(now)
+        self._events.append((now, float(usd)))
+
+    def totals(self, now: Optional[float] = None):
+        now = time.monotonic() if now is None else now
+        self._trim(now)
+        return len(self._events), sum(u for _, u in self._events)
+
+
+LEDGER = InProcessLedger()
+
+# Statuses that consume a daily allowance: anything that was, or may have
+# been, signed. REFUSED and FAILED never reached a signature.
+COUNTED_STATUSES = ("RESERVED", "SIGNED_BROADCAST", "UNKNOWN")
 
 
 @dataclass
@@ -74,65 +156,127 @@ class PolicyResult:
     reason: str
 
 
-async def check_execution_allowed(pool: asyncpg.Pool, token_address: str,
-                                    requested_usd: float) -> PolicyResult:
-    """The one function this module exists for. Every check below is
-    read directly from Postgres or from this service's own env config --
-    nothing here is taken on the caller's word. Returns as soon as any
-    check fails (order doesn't matter for correctness, but cheapest/most
-    obviously-wrong checks go first)."""
+def _effective_total_cap(env_cap: float, settings_cap) -> Optional[float]:
+    """The total-deployment cap: the SMALLER of this service's env cap and the
+    app_settings value. None when neither is set (no cap)."""
+    caps = [env_cap] if env_cap > 0 else []
+    try:
+        if settings_cap is not None:
+            v = float(settings_cap)
+            if math.isfinite(v) and v > 0:
+                caps.append(v)
+    except (TypeError, ValueError):
+        pass
+    return min(caps) if caps else None
 
-    if requested_usd <= 0:
-        return PolicyResult(False, f"requested amount must be positive, got {requested_usd}")
+
+async def check_execution_allowed(conn: "asyncpg.Connection", token_address: str,
+                                  requested_usd: float, client_order_id: str,
+                                  sol_lamports: Optional[int],
+                                  mode: str = DEVNET_MODE) -> PolicyResult:
+    """Every check before an order may be reserved. Nothing here is taken on
+    the caller's word: caps come from this service's environment, counts from
+    its own order ledger and memory, state from the database. Must run inside
+    main._reserve's transaction, under its advisory lock."""
+    devnet = mode == DEVNET_MODE
+    try:
+        requested = float(requested_usd)
+    except (TypeError, ValueError):
+        return PolicyResult(False, "requested amount is not a number")
+    if not (math.isfinite(requested) and requested > 0):
+        return PolicyResult(False, f"requested amount must be a positive finite number, got {requested_usd}")
 
     if not ALLOWED_EXECUTION_TOKENS:
         return PolicyResult(False, "ALLOWED_EXECUTION_TOKENS is not configured on the signer service -- refusing all execution until it is (see STAGE3_SETUP.md)")
-
     if token_address not in ALLOWED_EXECUTION_TOKENS:
         return PolicyResult(False, f"{token_address} is not on this signer's ALLOWED_EXECUTION_TOKENS allowlist")
 
     if MAX_TRADE_USD <= 0:
         return PolicyResult(False, "MAX_TRADE_USD is not configured (or is zero) on the signer service -- refusing all execution until it is")
+    if requested > MAX_TRADE_USD:
+        return PolicyResult(False, f"requested ${requested:.2f} exceeds this signer's MAX_TRADE_USD (${MAX_TRADE_USD:.2f})")
+    if MAX_ORDERS_PER_DAY <= 0:
+        return PolicyResult(False, "SIGNER_MAX_ORDERS_PER_DAY is not configured (or is zero) -- refusing all execution until it is")
 
-    if requested_usd > MAX_TRADE_USD:
-        return PolicyResult(False, f"requested ${requested_usd:.2f} exceeds this signer's MAX_TRADE_USD (${MAX_TRADE_USD:.2f})")
+    settings_row = await conn.fetchrow(
+        "SELECT run_status, max_total_capital_usd FROM app_settings WHERE id = 1;")
+    if settings_row is None:
+        return PolicyResult(False, "app_settings row is missing -- cannot verify run_status, refusing")
+    run_status = settings_row["run_status"]
+    if run_status != "RUNNING":
+        return PolicyResult(False, f"run_status is '{run_status}', not RUNNING -- trading is paused or stopped")
 
-    async with pool.acquire() as conn:
-        settings_row = await conn.fetchrow("SELECT run_status, max_total_capital_usd FROM app_settings WHERE id = 1;")
-        if settings_row is None:
-            return PolicyResult(False, "app_settings row is missing -- cannot verify run_status, refusing")
+    # The request must describe a reservation the pipeline actually wrote:
+    # same token, same size, still pending. A request with no ledger row is
+    # an order nothing will ever mark, close or count.
+    position = await conn.fetchrow(
+        "SELECT token_address, allocated_usd::float AS allocated_usd, execution_status "
+        "FROM active_positions WHERE client_order_id::text = $1;", client_order_id)
+    if position is None:
+        return PolicyResult(False, f"no ledger reservation exists for order {client_order_id}")
+    if position["execution_status"] != "PENDING_EXECUTION":
+        return PolicyResult(False, f"order {client_order_id} is '{position['execution_status']}', not PENDING_EXECUTION")
+    if position["token_address"] != token_address:
+        return PolicyResult(False, f"order {client_order_id} reserved a different token")
+    if abs(float(position["allocated_usd"]) - requested) > 0.01:
+        return PolicyResult(False, f"order {client_order_id} reserved ${float(position['allocated_usd']):.2f}, "
+                                   f"not the ${requested:.2f} requested")
 
-        run_status = settings_row["run_status"]
-        if run_status != "RUNNING":
-            return PolicyResult(False, f"run_status is '{run_status}', not RUNNING -- trading is paused or stopped")
+    if not devnet and MAX_TOTAL_DEPLOYED_USD <= 0:
+        # Required from THIS service's env with real funds. A cap present
+        # only in app_settings is one the web app can raise.
+        return PolicyResult(False,
+            "SIGNER_MAX_TOTAL_DEPLOYED_USD is not configured -- refusing real-funds execution "
+            "(a cap set only in the dashboard is not a limit the signer can rely on)")
+    total_cap = _effective_total_cap(MAX_TOTAL_DEPLOYED_USD, settings_row["max_total_capital_usd"])
+    if total_cap is None:
+        if not devnet:
+            return PolicyResult(False,
+                "no total-deployment cap is configured (SIGNER_MAX_TOTAL_DEPLOYED_USD) -- refusing "
+                "to execute with real funds against an unbounded limit")
+        logger.warning("No total-deployment cap configured -- acceptable on devnet only.")
+    else:
+        # EXCLUDING this order's own row. The pipeline writes the reservation
+        # before calling, so counting it AND adding requested_usd charged every
+        # order twice -- a $50 cap refused a $30 order with $0 deployed.
+        deployed_other = await conn.fetchval(
+            "SELECT COALESCE(SUM(allocated_usd), 0)::float FROM active_positions "
+            "WHERE client_order_id::text <> $1;", client_order_id)
+        deployed_other = float(deployed_other or 0.0)
+        if not math.isfinite(deployed_other):
+            return PolicyResult(False, "deployed capital is not a finite number -- refusing")
+        if deployed_other + requested > total_cap:
+            return PolicyResult(False,
+                f"requested ${requested:.2f} would push deployed capital to "
+                f"${deployed_other + requested:.2f}, over the cap of ${total_cap:.2f}")
 
-        max_total_capital_usd = settings_row["max_total_capital_usd"]
-        if max_total_capital_usd is None:
-            # schema.sql seeds app_settings with this NULL, and NULL is
-            # documented as "no cap" -- so on a stock database one of the four
-            # checks this module is credited with simply does not run. That is
-            # a legitimate operator choice on devnet, where the amount is a
-            # fixed 1000 lamports and requested_usd is notional. It is NOT a
-            # legitimate default once a real swap is sized from requested_usd,
-            # so mainnet mode refuses rather than skipping.
-            if os.environ.get("SIGNER_MODE", "devnet_transfer_test") != "devnet_transfer_test":
-                return PolicyResult(False,
-                    "max_total_capital_usd is NULL (no cap configured) -- refusing to execute "
-                    "with real funds against an unbounded capital limit. Set it in app_settings.")
-            logger.warning(
-                "max_total_capital_usd is NULL -- the total-capital check is not running. "
-                "Acceptable on devnet; set a cap before Stage 4."
-            )
-        if max_total_capital_usd is not None:
-            currently_allocated = await conn.fetchval(
-                "SELECT COALESCE(SUM(allocated_usd), 0.0)::float FROM active_positions;"
-            )
-            if (float(currently_allocated) + requested_usd) > float(max_total_capital_usd):
-                return PolicyResult(
-                    False,
-                    f"requested ${requested_usd:.2f} would push total allocated capital to "
-                    f"${float(currently_allocated) + requested_usd:.2f}, over the configured cap "
-                    f"of ${float(max_total_capital_usd):.2f}"
-                )
+    row = await conn.fetchrow(
+        "SELECT COUNT(*)::int AS n, COALESCE(SUM(requested_usd), 0)::float AS usd "
+        "FROM signer_orders WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '24 hours' "
+        "AND status = ANY($1::text[]);", list(COUNTED_STATUSES))
+    mem_n, mem_usd = LEDGER.totals()
+    orders_24h = max(int(row["n"]), mem_n)
+    usd_24h = max(float(row["usd"]), mem_usd)
+    if MAX_DAILY_USD > 0:
+        if usd_24h + requested > MAX_DAILY_USD:
+            return PolicyResult(False,
+                f"24h signed notional would reach ${usd_24h + requested:.2f}, over "
+                f"SIGNER_MAX_DAILY_USD (${MAX_DAILY_USD:.2f})")
+    elif not devnet:
+        return PolicyResult(False, "SIGNER_MAX_DAILY_USD is not configured -- refusing real-funds execution")
+
+    # The pre-signature rails (execution_rails.py): account-level refusals
+    # that do not depend on the token. They existed, fully tested, and were
+    # called from nowhere.
+    verdict = execution_rails.check_entry_rails(
+        mode="LIVE", run_status=run_status, requested_usd=requested,
+        live_max_position_usd=MAX_TRADE_USD, max_position_usd=MAX_TRADE_USD,
+        orders_sent_today=orders_24h, max_orders_per_day=MAX_ORDERS_PER_DAY,
+        sol_lamports=sol_lamports, quote_balance_usd=None,
+        # The devnet self-transfer spends lamports only. Every swap mode must
+        # prove a quote balance.
+        quote_balance_required=not devnet)
+    if not verdict.ok:
+        return PolicyResult(False, f"execution rail: {verdict.reason}")
 
     return PolicyResult(True, "all checks passed")

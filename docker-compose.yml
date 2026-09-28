@@ -1,8 +1,19 @@
+# Bounded container logs. Docker's default json-file driver never rotates, so
+# a months-long run filled the disk with log lines -- and a full disk stops
+# Postgres, which stops everything. 5 x 10 MB per container.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   db:
     image: postgres:15-alpine
     container_name: trading_postgres_db
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: ${DB_MEM_LIMIT:-1g}
     environment:
       # So `docker compose exec db psql` renders timestamps in the same zone
       # the dashboard does. Storage is unchanged: timestamptz values are
@@ -10,13 +21,16 @@ services:
       TZ: ${APP_TIMEZONE:-America/New_York}
       PGTZ: ${APP_TIMEZONE:-America/New_York}
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret}
+      # REQUIRED -- no fallback. The old ":-secret" default meant a missing
+      # .env line silently produced a database whose password is printed in
+      # this public repository. Compose now refuses to start instead.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env -- see .env.example}
       POSTGRES_DB: memecoin_trading
     # LOOPBACK ONLY. "5432:5432" published Postgres on every interface: the LAN
     # here, and on a VPS the whole internet -- Docker-published ports are
     # written straight into iptables and BYPASS ufw, so a host firewall does
     # not cover them. Combined with the fallback password below, that was an
-    # internet-facing trading database. Host tools still reach it on
+    # internet-facing trading database (the fallback is gone too). Host tools still reach it on
     # localhost:5432; the containers reach it on the compose network as `db`
     # and never used this mapping at all.
     ports:
@@ -35,14 +49,29 @@ services:
     build: .
     container_name: trading_agent_network
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: ${WEB_MEM_LIMIT:-1536m}
+    pids_limit: 512
+    # Non-root image user (see Dockerfile) plus no privilege escalation and no
+    # Linux capabilities: a web-facing Python process needs none of them.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Nothing in the app writes to its filesystem; /tmp is the only scratch.
+    read_only: true
+    tmpfs:
+      - /tmp
     # Reports (unhealthy) in `docker compose ps` once the pipeline has not
     # STARTED a tick for HEALTH_MAX_TICK_AGE_S -- a dead worker and a hung one
     # both look like that. python, not curl: python:3.11-slim ships no curl.
     #
-    # NOTE: plain Docker does NOT restart a container for being unhealthy;
-    # `restart:` only fires when the process exits. This makes a stall VISIBLE.
-    # Recovering from one automatically is a separate decision -- see the
-    # audit report.
+    # Plain Docker does NOT restart a container for being unhealthy --
+    # `restart:` fires only when the process exits. RECOVERY is therefore done
+    # in-process: main.py's watchdog thread exits the process (status 1) once
+    # the heartbeat is WATCHDOG_EXIT_AFTER_S stale or a worker has died, and
+    # the restart policy above brings it back. No autoheal sidecar: that would
+    # need the Docker socket, which is root on the host.
     healthcheck:
       test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=5).status == 200 else 1)"]
       interval: 60s
@@ -52,7 +81,20 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:-secret}@db:5432/memecoin_trading
+      # Same required variable as the db service, so the two cannot drift.
+      # Hex only (openssl rand -hex 24): characters like @ : / # would break
+      # this URL.
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@db:5432/memecoin_trading
+      # Every database call is bounded (engine.db_connect, main._apg_*).
+      - DB_CONNECT_TIMEOUT_S=${DB_CONNECT_TIMEOUT_S:-10}
+      - DB_STATEMENT_TIMEOUT_MS=${DB_STATEMENT_TIMEOUT_MS:-60000}
+      - DB_IDLE_TX_TIMEOUT_MS=${DB_IDLE_TX_TIMEOUT_MS:-120000}
+      # Self-recovery: exit (and let `restart:` bring the container back)
+      # when no pipeline iteration has STARTED for this long, or when any
+      # background worker has died. Longer than HEALTH_MAX_TICK_AGE_S, so a
+      # stall shows as (unhealthy) before it is acted on.
+      - WATCHDOG_EXIT_ENABLED=${WATCHDOG_EXIT_ENABLED:-true}
+      - WATCHDOG_EXIT_AFTER_S=${WATCHDOG_EXIT_AFTER_S:-900}
       # Display timezone for the dashboard clock and log lines. Any IANA zone
       # name; America/New_York applies EDT/EST automatically, which a fixed
       # offset like "EST5" would not. Stored timestamps are unaffected --
@@ -150,6 +192,8 @@ services:
       - GMGN_USER_AGENT=${GMGN_USER_AGENT:-memecoin-trading-agent/1.0}
       - PEN_SNAPSHOT_ATTEMPTS=${PEN_SNAPSHOT_ATTEMPTS:-3}
       - JUPITER_CACHE_TTL_S=${JUPITER_CACHE_TTL_S:-120}
+      # Per-mint caches are swept of expired entries past this size.
+      - CACHE_MAX_ENTRIES=${CACHE_MAX_ENTRIES:-5000}
       - LIMIT_FILL_WINDOW_MINUTES=${LIMIT_FILL_WINDOW_MINUTES:-60}
       - PAPER_FEE_PERCENT_PER_SIDE=${PAPER_FEE_PERCENT_PER_SIDE:-0.25}
       - PAPER_HORIZONS_MINUTES=${PAPER_HORIZONS_MINUTES:-30,60,120}
@@ -222,6 +266,10 @@ services:
       # smoke test yourself.
       - SIGNER_SERVICE_URL=${SIGNER_SERVICE_URL:-http://signer:8100}
       - ENABLE_STAGE3_EXECUTION=${ENABLE_STAGE3_EXECUTION:-false}
+      # HMAC key authenticating web -> signer (signer_auth.py). The SAME value
+      # must be in signer_service/.env. Empty is fine while Stage 3 is off;
+      # with it on, an empty or short secret refuses every execution.
+      - SIGNER_SHARED_SECRET=${SIGNER_SHARED_SECRET:-}
     depends_on:
       db:
         condition: service_healthy
@@ -248,6 +296,18 @@ services:
     container_name: trading_signer_service
     restart: unless-stopped
     profiles: ["stage3"]
+    logging: *default-logging
+    mem_limit: ${SIGNER_MEM_LIMIT:-512m}
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # The service holds the Turnkey key; its own code needs no writable
+    # filesystem at all.
+    read_only: true
+    tmpfs:
+      - /tmp
     env_file:
       - ./signer_service/.env
     depends_on:

@@ -194,11 +194,15 @@ Three independent layers decide whether anything actually gets signed:
 1. **The pipeline's own gate** (`I_ACCOUNTANT` in `engine.py`, unchanged
    from earlier stages) — decides whether to open a position at all.
 2. **The signer service's own re-validation**
-   (`signer_service/policy_guard.py`) — re-derives run_status, a
-   separate `ALLOWED_EXECUTION_TOKENS` allowlist, a per-trade cap
-   (`MAX_TRADE_USD`), and the total-capital cap directly from the
-   database, trusting nothing the pipeline claims. Every attempt,
-   approved or refused, is written to `execution_audit_log`.
+   (`signer_service/policy_guard.py`) — authenticates the caller (an HMAC
+   over every request, `signer_auth.py`), refuses any `client_order_id` it
+   has seen before (its own `signer_orders` ledger), checks the pipeline
+   really reserved this exact order, verifies the RPC's genesis hash, and
+   applies caps from **its own environment** — per trade, total deployed,
+   24h notional and 24h order count, plus the pre-signature rails in
+   `execution_rails.py`. The dashboard's capital cap can only tighten
+   those, never raise them. Every attempt, approved or refused, is written
+   to `execution_audit_log`, and signed rows are never pruned.
 3. **Turnkey's own policy engine**, enforced inside its enclave,
    configured directly in your Turnkey org (program allowlist,
    destination allowlist, amount caps) — independent of every line of
@@ -381,8 +385,14 @@ For deploying this to a public server instead of running it locally, see
   design (see the Pause/resume section above) — so a paused run still has
   open exposure until those positions individually hit their own
   take-profit/stop-loss.
-- **Watchdog `SHUTDOWN` stops the background pipeline loop only.** The web
-  server and dashboard stay up (so you can still see the last state and
-  sign in), but nothing more happens — including position monitoring —
-  until you restart the container. If you rely on this, prefer
-  `RESTART_ALL` unless you specifically want a hard stop.
+- **Watchdog `SHUTDOWN` halts new entries, not the loop.** It sets
+  `run_status = SHUTDOWN_WATCHDOG`, which blocks entries exactly like a
+  pause, while open positions keep being marked and closed at their own
+  take-profit/stop-loss. (It used to stop the whole loop, which also stopped
+  position monitoring until the container was restarted.) Resume from the
+  dashboard as for any pause.
+- **A stalled or dead pipeline restarts itself.** A watchdog thread exits
+  the process when no pipeline iteration has started for
+  `WATCHDOG_EXIT_AFTER_S` (default 900s), or when a background worker has
+  died; `restart: unless-stopped` brings the container back. Set
+  `WATCHDOG_EXIT_ENABLED=false` to only report (`/health` still goes 503).

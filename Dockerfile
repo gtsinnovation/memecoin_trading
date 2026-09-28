@@ -26,6 +26,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the application files
 COPY . .
 
+# Run as an unprivileged user. The app never writes to its own directory
+# (PYTHONDONTWRITEBYTECODE is set above), so root bought nothing but a larger
+# blast radius: code execution in a root container owns everything in it.
+RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin app
+USER 10001
+
 EXPOSE 8000
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

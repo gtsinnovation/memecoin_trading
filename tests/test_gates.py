@@ -118,6 +118,98 @@ def run(psycopg2, engine, dsn) -> Suite:
             cur.execute("UPDATE app_settings SET run_status='RUNNING', run_status_reason=NULL, "
                         "kill_switch_max_consecutive_losses=NULL WHERE id=1;")
         engine._settings_cache["data"] = None
+
+        print("\n[SETTINGS] a pause during an in-flight read is never cached over")
+        # The read that started BEFORE the pause must not write its RUNNING
+        # row into the cache after it.
+        rows = iter([{"run_status": "RUNNING"}, {"run_status": "PAUSED_MANUAL"}])
+
+        class _Cur:
+            def __init__(self, *a, **k): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def execute(self, sql):
+                self.row = next(rows)
+                if self.row["run_status"] == "RUNNING":
+                    engine.invalidate_settings_cache()   # the pause lands mid-read
+            def fetchone(self): return self.row
+
+        class _Conn:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def cursor(self, **k): return _Cur()
+            def close(self): pass
+
+        real_connect = engine.db_connect
+        engine.db_connect = lambda: _Conn()
+        try:
+            engine.invalidate_settings_cache()
+            got = engine.get_app_settings()
+        finally:
+            engine.db_connect = real_connect
+        s.check("the caller sees the post-pause row", (got or {}).get("run_status"), "PAUSED_MANUAL")
+        s.check("and the cache holds it, not the stale RUNNING",
+                (engine._settings_cache["data"] or {}).get("run_status"), "PAUSED_MANUAL")
+        engine.invalidate_settings_cache()
+
+        print("\n[LEDGER] live stop-outs fill at the market, net of costs")
+        # The kill switch sums closed_positions. Booking a gap-down AT the
+        # stop capped every live loss at the stop distance, so a rug read as
+        # -7.5% and a streak of them could never reach a max-loss threshold.
+        real_fetch = engine._fetch_position_prices
+        GAP, NANT, OK, PEND = make_address(31), make_address(32), make_address(33), make_address(34)
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE closed_positions; TRUNCATE active_positions;")
+            for tok, slip, status in ((GAP, 1.0, "PAPER"), (NANT, None, "PAPER"),
+                                      (OK, None, "EXECUTED"), (PEND, None, "PENDING_EXECUTION")):
+                cur.execute(
+                    "INSERT INTO active_positions (token_symbol, token_address, allocated_usd, "
+                    "entry_trigger, target_exit_price, invalidation_level_price, "
+                    "last_simulated_price, entry_slippage_percent, execution_status) "
+                    "VALUES ('P', %s, 100, 1.0, 1.1506, 0.9247, 1.0, %s, %s);", (tok, slip, status))
+        engine._fetch_position_prices = lambda addrs: {
+            GAP: 0.30, NANT: float("nan"), OK: 0.95, PEND: 0.10}
+        try:
+            closed = engine.evaluate_open_positions()
+        finally:
+            engine._fetch_position_prices = real_fetch
+        with conn.cursor() as cur:
+            cur.execute("SELECT exit_price, realized_pnl_percent, gross_pnl_percent, cost_percent, "
+                        "realized_pnl_usd FROM closed_positions WHERE token_address=%s;", (GAP,))
+            row = cur.fetchone()
+            s.check_true("a gap through the stop closes the position", row is not None)
+            if row:
+                s.check_true("the gap fills at the market (0.30), not the stop (0.9247)",
+                             abs(float(row[0]) - 0.30) < 1e-9)
+                s.check_true("gross P&L is the real -70%", abs(float(row[2]) + 70.0) < 1e-6)
+                s.check_true("costs are charged: 2 x 0.25 fee + 2 x 1.0 slippage",
+                             abs(float(row[3]) - 2.5) < 1e-9)
+                s.check_true("realized (what the kill switch sums) is NET",
+                             abs(float(row[1]) + 72.5) < 1e-6 and abs(float(row[4]) + 72.5) < 1e-6)
+            cur.execute("SELECT last_simulated_price::text FROM active_positions WHERE token_address=%s;", (NANT,))
+            nan_row = cur.fetchone()
+            s.check_true("a NaN price leaves the position open and unmarked",
+                         nan_row is not None and nan_row[0] != "NaN")
+            cur.execute("SELECT count(*) FROM active_positions WHERE token_address=%s;", (OK,))
+            s.check("a price between the barriers keeps the position open", cur.fetchone()[0], 1)
+        s.check("only the barrier breach is reported closed", len(closed), 1)
+        with conn.cursor() as cur:
+            cur.execute("SELECT execution_status, last_simulated_price FROM active_positions "
+                        "WHERE token_address=%s;", (PEND,))
+            row = cur.fetchone()
+        s.check_true("a PENDING_EXECUTION reservation is neither closed nor marked "
+                     "(the signer has not confirmed it exists)",
+                     row is not None and row[0] == "PENDING_EXECUTION" and float(row[1]) == 1.0)
+        s.check_true("an unmeasured entry slippage is stored as NULL, not 0.0",
+                     engine.entry_slippage_for({"slippage_data_missing": True,
+                                                "estimated_slippage_percent": 0.0}) is None)
+        s.check_true("an absent missing-flag is treated as unmeasured",
+                     engine.entry_slippage_for({"estimated_slippage_percent": 0.4}) is None)
+        s.check_true("a measured slippage is kept",
+                     engine.entry_slippage_for({"slippage_data_missing": False,
+                                                "estimated_slippage_percent": 0.4}) == 0.4)
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE closed_positions; TRUNCATE active_positions;")
     finally:
         conn.close()
     return s

@@ -125,6 +125,23 @@ def run() -> Suite:
     ]:
         s.check_true(label, not rails.check_entry_rails(**{**ok, field: bad}).ok)
 
+    # NaN: every comparison against it is False, so a NaN ceiling, count or
+    # balance used to read as the most permissive value possible.
+    nan, inf = float("nan"), float("inf")
+    for field, bad in [("requested_usd", nan), ("requested_usd", inf),
+                       ("live_max_position_usd", nan), ("max_position_usd", nan),
+                       ("max_orders_per_day", nan), ("orders_sent_today", nan),
+                       ("sol_lamports", nan), ("quote_balance_usd", nan)]:
+        s.check_true(f"a {bad} {field} must refuse",
+                     not rails.check_entry_rails(**{**ok, field: bad}).ok)
+    s.check_true("a NaN ceiling collapses to zero, not to unlimited",
+                 rails.position_ceiling_usd(nan, 50.0) == 0.0)
+    s.check_true("the devnet self-transfer may skip the quote balance",
+                 rails.check_entry_rails(**{**ok, "quote_balance_usd": None,
+                                             "quote_balance_required": False}).ok)
+    s.check_true("but the default still requires it",
+                 not rails.check_entry_rails(**{**ok, "quote_balance_usd": None}).ok)
+
     # The source constant must bound a database row that tries to exceed it.
     s.check_true("the hard-coded ceiling must cap oversized config values",
                  rails.position_ceiling_usd(10_000.0, 10_000.0) == rails.ABSOLUTE_MAX_POSITION_USD)
@@ -141,5 +158,7 @@ def run() -> Suite:
     s.check_true("a degraded route must refuse", not rails.requote_still_acceptable(9.0, 2.0).ok)
     s.check_true("a re-quote with no impact figure must refuse rather than sign blind", not rails.requote_still_acceptable(None, 2.0).ok)
     s.check_true("an unreadable tolerance must refuse", not rails.requote_still_acceptable(1.0, None).ok)
+    s.check_true("a NaN impact must refuse", not rails.requote_still_acceptable(float("nan"), 2.0).ok)
+    s.check_true("a NaN tolerance must refuse", not rails.requote_still_acceptable(1.0, float("nan")).ok)
 
     return s

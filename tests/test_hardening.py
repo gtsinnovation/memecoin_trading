@@ -12,6 +12,58 @@ import paper_trading as pt
 import execution_rails as rails
 
 
+def _ledger_uses_barrier_exit() -> bool:
+    """engine.evaluate_open_positions calls paper_trading.barrier_exit and
+    never assigns the stop level as the exit price. Parsed, not imported:
+    engine needs psycopg2 and langgraph, and this suite must run without."""
+    import ast as _ast, os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    tree = _ast.parse(open(_os.path.join(root, "engine.py"), encoding="utf-8").read())
+    fn = next((n for n in tree.body if isinstance(n, _ast.FunctionDef)
+               and n.name == "evaluate_open_positions"), None)
+    if fn is None:
+        return False
+    calls = {n.func.attr for n in _ast.walk(fn)
+             if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Attribute)}
+    stop_as_fill = any(
+        isinstance(n, _ast.Assign) and "invalidation_level_price" in _ast.unparse(n.value)
+        and any("next_price" in _ast.unparse(t) for t in n.targets)
+        and "barrier_exit" not in _ast.unparse(n.value)
+        for n in _ast.walk(fn))
+    return "barrier_exit" in calls and "net_pnl_percent" in calls and not stop_as_fill
+
+
+def _deploy_hardening() -> list:
+    """Container and credential settings that must not quietly regress.
+
+    Each was a real exposure: a public default Postgres password, root
+    processes in both images, and a signing endpoint anyone on the network
+    could call. They are configuration, so nothing else would catch a revert.
+    """
+    import os as _os, re as _re
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    read = lambda rel: open(_os.path.join(root, rel), encoding="utf-8").read()
+    compose, web_df, signer_df = (read("docker-compose.yml"), read("Dockerfile"),
+                                  read("signer_service/Dockerfile"))
+    problems = []
+    if _re.search(r"POSTGRES_PASSWORD:-", compose):
+        problems.append("compose gives POSTGRES_PASSWORD a fallback value")
+    if compose.count("POSTGRES_PASSWORD:?") < 2:
+        problems.append("POSTGRES_PASSWORD is not required in both db and web")
+    if not _re.search(r'"127\.0\.0\.1:5432:5432"', compose):
+        problems.append("Postgres is published beyond loopback")
+    for name, df in (("web", web_df), ("signer", signer_df)):
+        if not _re.search(r"^USER\s+\S+", df, _re.M):
+            problems.append(f"{name} image runs as root")
+    if "signer_auth.py" not in signer_df:
+        problems.append("signer image does not ship signer_auth.py")
+    if compose.count("no-new-privileges:true") < 2:
+        problems.append("web and signer must both set no-new-privileges")
+    if "max-size" not in compose:
+        problems.append("container logs are not rotated")
+    return problems
+
+
 def _stray_percent_signs():
     """Percent signs in a query string that psycopg2 will read as parameters.
 
@@ -175,6 +227,8 @@ def run() -> Suite:
     # the kind of thing that gets "fixed" by setting it again.
     s.check("every knob every shipped module reads is forwarded by compose",
             _compose_coverage(), [])
+    s.check("deployment hardening holds (no default password, non-root images, signer auth shipped)",
+            _deploy_hardening(), [])
 
     # --- unmeasured slippage must never be free ---
     fee_only = round(pt.PAPER_FEE_PERCENT_PER_SIDE * 2.0, 4)
@@ -217,6 +271,20 @@ def run() -> Suite:
     # The realised loss must actually reach the tail.
     s.check_true("a rug books near total loss, not the stop distance",
                  pt.net_pnl_percent(1.0, pt.decide_exit(0.01, 1.15, 0.925, 5)[1], 0.0)[0] < -90.0)
+    # The live ledger uses barrier_exit (no time exit). It must be the SAME
+    # rule, and engine.evaluate_open_positions must actually call it: the
+    # ledger used to book gaps AT the stop, hiding them from the kill switch.
+    s.check("barrier_exit books a gap at the market",
+            pt.barrier_exit(0.01, 1.15, 0.925), ("STOPPED_OUT", 0.01))
+    s.check("barrier_exit fills a take-profit AT the target",
+            pt.barrier_exit(1.40, 1.15, 0.925), ("TARGET_HIT", 1.15))
+    s.check_true("barrier_exit has no time exit",
+                 pt.barrier_exit(1.0, 1.15, 0.925)[0] is None)
+    for px in (0.01, 0.93, 1.0, 1.2):
+        s.check_true(f"decide_exit and barrier_exit agree at {px} before the timeout",
+                     pt.decide_exit(px, 1.15, 0.925, 5) == pt.barrier_exit(px, 1.15, 0.925))
+    s.check_true("the live ledger exits through the shared barrier rule",
+                 _ledger_uses_barrier_exit())
 
     # --- dropout classification ---
     s.check("an unpriceable token is classified as dropped",

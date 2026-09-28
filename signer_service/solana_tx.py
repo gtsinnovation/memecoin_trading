@@ -149,7 +149,9 @@ def verify_jupiter_swap_transaction(swap_transaction_b64: str, *,
                                       sim_result: Optional[dict],
                                       input_mint: str,
                                       output_mint: str,
-                                      max_input_raw: int):
+                                      max_input_raw: int,
+                                      owner_pre_lamports: Optional[int],
+                                      max_lamports_spend: Optional[int]):
     """Check an inbound Jupiter transaction BEFORE it is sent for signing.
 
     This closes the other half of the trust loop. reassemble_signed_*
@@ -179,6 +181,8 @@ def verify_jupiter_swap_transaction(swap_transaction_b64: str, *,
         input_mint=input_mint,
         output_mint=output_mint,
         max_input_raw=max_input_raw,
+        owner_pre_lamports=owner_pre_lamports,
+        max_lamports_spend=max_lamports_spend,
     )
     if not result.ok:
         raise ValueError(

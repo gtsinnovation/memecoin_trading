@@ -37,9 +37,9 @@ import sys
 from typing import Optional
 from urllib.parse import urlparse
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 import asyncpg
 import httpx
 
@@ -48,6 +48,7 @@ try:
     import solana_tx
     import solana_rpc
     import turnkey_client
+    import signer_auth
 except Exception as import_error:
     print("\n" + "!" * 50)
     print("CRITICAL IMPORT EXCEPTION IN signer_service:")
@@ -65,35 +66,93 @@ DEVNET_TEST_TRANSFER_LAMPORTS = int(os.environ.get("DEVNET_TEST_TRANSFER_LAMPORT
 # The shipped .env.example default is 0, which refuses everything -- an
 # operator who sets the allowlist but not the cap previously got no signal.
 MAX_TRADE_USD_UNSET_WARNING = policy_guard.MAX_TRADE_USD <= 0
+# HMAC key shared with the web app (signer_auth.py). None refuses everything.
+AUTH_SECRET = signer_auth.load_secret()
+# Serialises reservation across every signer process: checks + insert happen
+# under this transaction-scoped lock, so two concurrent orders cannot both
+# pass a cap that only one of them fits under.
+RESERVATION_LOCK_KEY = 7_311_993_001
 
 _pool: Optional[asyncpg.Pool] = None
 _http_client: Optional[httpx.AsyncClient] = None
+# The network the RPC endpoint actually serves, established from its genesis
+# hash. None until verified; nothing is signed while it is None.
+_GENESIS = {"network": None}
+
+
+async def _verify_genesis() -> Optional[str]:
+    """Asks the chain which network this is. Returns the name, or None when
+    the RPC could not be reached (which is not the same as a mismatch)."""
+    try:
+        genesis = await solana_rpc.get_genesis_hash(_http_client)
+    except Exception as e:
+        logger.warning(f"getGenesisHash failed ({e}) -- network not yet verified.")
+        return None
+    _GENESIS["network"] = solana_rpc.network_for_genesis(genesis)
+    return _GENESIS["network"]
+
+
+def _genesis_refusal(network: Optional[str]) -> Optional[str]:
+    """Why this mode may not sign on this network, or None."""
+    if network is None:
+        return "the RPC's network could not be verified (getGenesisHash unreachable) -- refusing to sign blind"
+    if SIGNER_MODE == "devnet_transfer_test" and network != "devnet":
+        return (f"SIGNER_MODE=devnet_transfer_test but the RPC's genesis hash is {network}'s -- "
+                f"refusing: this mode must only ever sign on devnet")
+    return None
 
 
 @app.on_event("startup")
 async def startup():
     global _pool, _http_client
-    _pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=3)
+    # Bounded: a policy query stuck on a lock must fail (and refuse), not hold
+    # the request -- and the reservation lock -- forever.
+    _pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=3,
+                                      timeout=10, command_timeout=15)
     _http_client = httpx.AsyncClient()
     resolved = _resolve_network()
-    logger.info(f"signer_service started. SIGNER_MODE={SIGNER_MODE} network={resolved}")
+    logger.info(f"signer_service started. SIGNER_MODE={SIGNER_MODE} network(host)={resolved}")
 
-    # SIGNER_MODE did NOT gate the network, despite two comments claiming it
-    # did. devnet_transfer_test never reads SOLANA_RPC_URL, so pointing that
-    # variable at mainnet and leaving the mode alone signed and broadcast a
-    # REAL mainnet transfer paying real fees. Refuse to start on that
-    # combination rather than document it as safe.
     # Refuse to start on an inconsistent cap set before anything can be signed.
     policy_guard.assert_caps_consistent()
 
-    if SIGNER_MODE == "devnet_transfer_test" and resolved != "devnet":
+    if AUTH_SECRET is None:
+        logger.error(f"{signer_auth.SECRET_ENV} is not set (or shorter than "
+                     f"{signer_auth.MIN_SECRET_LEN} characters) -- every authenticated "
+                     f"endpoint will refuse until it is. See STAGE3_SETUP.md.")
+
+    # SIGNER_MODE did NOT gate the network, despite two comments claiming it
+    # did. The hostname test below is kept as a fast first refusal; the
+    # GENESIS HASH check after it is the authoritative one, because a hostname
+    # is only what the operator typed.
+    if SIGNER_MODE == "devnet_transfer_test" and resolved not in ("devnet", "unknown"):
         raise RuntimeError(
             f"SIGNER_MODE=devnet_transfer_test but the configured RPC resolves to "
             f"'{resolved}' (endpoint {solana_rpc.safe_endpoint(solana_rpc.SOLANA_RPC_URL)}). Refusing to "
             f"start: this mode signs and broadcasts a real transfer, and it must only "
-            f"ever do so on devnet. Set SOLANA_RPC_URL to a devnet endpoint, or set "
-            f"SOLANA_NETWORK explicitly if you are using a private devnet provider."
+            f"ever do so on devnet. Set SOLANA_RPC_URL to a devnet endpoint."
         )
+    network = await _verify_genesis()
+    if network is not None and _genesis_refusal(network):
+        raise RuntimeError(_genesis_refusal(network) + " Refusing to start.")
+
+    # A signer holding a superuser connection can rewrite its own order
+    # ledger, audit log and the positions it cross-checks. STAGE3_SETUP.md
+    # Part 2b creates a scoped role; with real funds it is mandatory.
+    try:
+        async with _pool.acquire() as conn:
+            is_super = await conn.fetchval(
+                "SELECT rolsuper FROM pg_roles WHERE rolname = current_user;")
+    except Exception as e:
+        is_super = None
+        logger.warning(f"Could not read this service's database role: {e}")
+    if is_super:
+        if SIGNER_MODE != "devnet_transfer_test":
+            raise RuntimeError("The signer is connected as a database SUPERUSER. Refusing to start "
+                               "outside devnet -- create the scoped signer_svc role (STAGE3_SETUP.md "
+                               "Part 2b) and point DATABASE_URL at it.")
+        logger.warning("The signer is connected as a database superuser. Acceptable on devnet; "
+                       "use the scoped signer_svc role (STAGE3_SETUP.md Part 2b) before Stage 4.")
 
     # Unbounded env input that policy_guard never sees -- it is not measured
     # in USD, so MAX_TRADE_USD does not constrain it. 0.1 SOL is already
@@ -110,6 +169,8 @@ async def startup():
             "MAX_TRADE_USD is 0 or unset -- every /execute request will be refused "
             "until it's configured. See STAGE3_SETUP.md."
         )
+    if policy_guard.MAX_ORDERS_PER_DAY <= 0:
+        logger.warning("SIGNER_MAX_ORDERS_PER_DAY is 0 or unset -- every /execute request will be refused.")
     if not policy_guard.ALLOWED_EXECUTION_TOKENS:
         logger.warning("ALLOWED_EXECUTION_TOKENS is empty -- every /execute request will be refused until it's configured. See STAGE3_SETUP.md.")
 
@@ -131,6 +192,10 @@ class ExecuteRequest(BaseModel):
     token_address: str = Field(min_length=1, max_length=128)
     token_symbol: Optional[str] = Field(default=None, max_length=50)
     requested_usd: float
+    # The idempotency key (active_positions.client_order_id, a UUID). One key
+    # is one order, ever: signer_orders' primary key makes a replay or retry
+    # return the first outcome instead of signing again.
+    client_order_id: str = Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9-]+$")
 
     @field_validator("requested_usd")
     @classmethod
@@ -171,16 +236,76 @@ async def _write_audit_log(token_address: str, token_symbol: Optional[str], requ
         return False
 
 
+async def _reserve(req: ExecuteRequest, sol_lamports: Optional[int], network: str):
+    """Policy checks and the order reservation, as ONE locked transaction.
+
+    Returns (policy_result, None) for a new order, or (None, existing_row)
+    when this client_order_id was seen before -- in which case nothing is
+    checked and nothing will be signed.
+    """
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock($1);", RESERVATION_LOCK_KEY)
+            existing = await conn.fetchrow(
+                "SELECT status, tx_signature, reason, network FROM signer_orders "
+                "WHERE client_order_id = $1;", req.client_order_id)
+            if existing is not None:
+                return None, existing
+            policy = await policy_guard.check_execution_allowed(
+                conn, req.token_address, req.requested_usd, req.client_order_id,
+                sol_lamports, SIGNER_MODE)
+            await conn.execute(
+                "INSERT INTO signer_orders (client_order_id, token_address, requested_usd, "
+                "status, reason, network) VALUES ($1, $2, $3, $4, $5, $6);",
+                req.client_order_id, req.token_address, req.requested_usd,
+                "RESERVED" if policy.allowed else "REFUSED", policy.reason, network)
+    if policy.allowed:
+        policy_guard.LEDGER.record(req.requested_usd)
+    return policy, None
+
+
+async def _finish(client_order_id: str, status: str, reason: str,
+                  tx_signature: Optional[str]) -> None:
+    """Records the order's outcome. A failure here leaves it RESERVED, which
+    still counts against every cap -- the safe direction."""
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE signer_orders SET status = $2, reason = $3, tx_signature = $4, "
+                "updated_at = CURRENT_TIMESTAMP WHERE client_order_id = $1;",
+                client_order_id, status, reason, tx_signature)
+    except Exception as e:
+        logger.critical(f"Could not record outcome {status} for order {client_order_id}: {e} "
+                        f"-- it stays RESERVED and counted.")
+
+
+def _auth_or_401(request: Request, body: bytes):
+    ok, why = signer_auth.verify(
+        AUTH_SECRET, request.method, request.url.path, body,
+        request.headers.get(signer_auth.HEADER_TS), request.headers.get(signer_auth.HEADER_SIG))
+    if ok:
+        return None
+    # Logged, deliberately NOT audited: an unauthenticated caller must not be
+    # able to write rows into the audit log.
+    logger.warning(f"Refused unauthenticated {request.method} {request.url.path}: {why}")
+    return JSONResponse({"executed": False, "order_status": None,
+                         "reason": f"unauthenticated: {why}"}, status_code=401)
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "signer_mode": SIGNER_MODE}
+    return {"status": "ok", "signer_mode": SIGNER_MODE,
+            "network_verified": _GENESIS["network"]}
 
 
 @app.get("/whoami")
-async def whoami():
+async def whoami(request: Request):
     """Convenience endpoint for the STAGE3_SETUP.md smoke test -- confirms
     the configured Turnkey credentials actually authenticate, without
-    attempting to sign anything."""
+    attempting to sign anything. Authenticated: it spends the Turnkey key."""
+    denied = _auth_or_401(request, b"")
+    if denied is not None:
+        return denied
     try:
         result = await turnkey_client.get_whoami(_http_client)
         return result
@@ -190,18 +315,37 @@ async def whoami():
         return JSONResponse({"error": f"Turnkey request failed: {e}"}, status_code=502)
 
 
+@app.get("/orders/{client_order_id}")
+async def order_status(client_order_id: str, request: Request):
+    """Read-only outcome lookup for the web app's reconciliation. It can
+    never cause a signature, which is why reconciliation uses it instead of
+    re-sending /execute."""
+    denied = _auth_or_401(request, b"")
+    if denied is not None:
+        return denied
+    try:
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT status, tx_signature, reason, network FROM signer_orders "
+                "WHERE client_order_id = $1;", client_order_id)
+    except Exception as e:
+        return JSONResponse({"found": None, "reason": f"order ledger unreadable: {type(e).__name__}"},
+                            status_code=503)
+    if row is None:
+        return JSONResponse({"found": False, "order_status": None}, status_code=404)
+    return {"found": True, "order_status": row["status"], "tx_signature": row["tx_signature"],
+            "reason": row["reason"], "network": row["network"]}
+
+
 def _resolve_network() -> str:
-    """Which network the audit log records.
+    """Which network the RPC URL's HOST names -- a first, cheap check only.
 
     Was: `"devnet" if "devnet" in SOLANA_RPC_URL else "mainnet"`. That is a
     substring test on an operator-supplied URL that routinely contains an
     opaque API key -- `https://mainnet.helius-rpc.com/?api-key=8f3devnet91`
     is labelled devnet, and a local validator at 127.0.0.1:8899 is labelled
-    mainnet. This is the column an auditor reads to answer "did real money
-    move", so a coin-flip on an API key's characters is not acceptable.
-
-    SOLANA_NETWORK is authoritative when set. Otherwise the URL's HOST is
-    inspected -- never the query string or path, where the secrets live.
+    mainnet. SOLANA_NETWORK is authoritative for the LABEL when set; the
+    genesis hash (_verify_genesis) is authoritative for what may be SIGNED.
     """
     explicit = os.environ.get("SOLANA_NETWORK", "").strip().lower()
     if explicit in ("devnet", "testnet", "mainnet"):
@@ -221,38 +365,86 @@ def _resolve_network() -> str:
     return "unknown"
 
 
+def _reply(status_code: int, order_status: Optional[str], reason: str, **extra):
+    body = {"executed": False, "order_status": order_status, "reason": reason}
+    body.update(extra)
+    return JSONResponse(body, status_code=status_code)
+
+
 @app.post("/execute")
-async def execute(req: ExecuteRequest):
-    network = _resolve_network()
-
+async def execute(request: Request):
+    """Authenticate, then parse. The HMAC covers the RAW body, so it is
+    verified before a single byte is interpreted."""
+    raw = await request.body()
+    denied = _auth_or_401(request, raw)
+    if denied is not None:
+        return denied
     try:
-        policy_result = await policy_guard.check_execution_allowed(_pool, req.token_address, req.requested_usd)
-    except Exception as e:
-        # Fails closed for FUNDS (nothing is signed) but previously failed OPEN
-        # for AUDITING: a DB outage produced a stream of anonymous 500s with no
-        # record of what was attempted. The audit log lives in the same
-        # Postgres so it cannot record this either -- but the caller deserves a
-        # structured refusal rather than a bare stack trace.
-        reason = f"Policy re-validation could not run ({type(e).__name__}: {e}) -- refusing."
-        logger.error(reason)
-        return JSONResponse({"executed": False, "reason": reason}, status_code=503)
+        req = ExecuteRequest.model_validate_json(raw)
+    except ValidationError as e:
+        return _reply(422, None, f"invalid request: {e.error_count()} field error(s)")
+    return await _execute(req)
 
-    if not policy_result.allowed:
-        await _write_audit_log(req.token_address, req.token_symbol, req.requested_usd,
-                                 "REFUSED_POLICY", policy_result.reason, None, network)
-        return JSONResponse({"executed": False, "reason": policy_result.reason}, status_code=403)
 
+async def _execute(req: ExecuteRequest):
+    # The label an auditor reads: the chain's own answer when we have it.
+    network = _GENESIS["network"] or _resolve_network()
+
+    # Mode first: an unimplemented mode never reserves anything.
     if SIGNER_MODE == "mainnet_jupiter_swap":
         reason = "SIGNER_MODE=mainnet_jupiter_swap is not implemented yet -- that's Stage 4. Refusing rather than half-executing a real swap."
         await _write_audit_log(req.token_address, req.token_symbol, req.requested_usd,
                                  "REFUSED_POLICY", reason, None, network)
-        return JSONResponse({"executed": False, "reason": reason}, status_code=501)
-
+        return _reply(501, None, reason)
     if SIGNER_MODE != "devnet_transfer_test":
         reason = f"Unknown SIGNER_MODE '{SIGNER_MODE}'."
         await _write_audit_log(req.token_address, req.token_symbol, req.requested_usd,
                                  "ERROR", reason, None, network)
-        return JSONResponse({"executed": False, "reason": reason}, status_code=500)
+        return _reply(501, None, reason)
+
+    # Which chain is this, really? Verified once, from the genesis hash.
+    if _GENESIS["network"] is None:
+        await _verify_genesis()
+    refusal = _genesis_refusal(_GENESIS["network"])
+    if refusal:
+        await _write_audit_log(req.token_address, req.token_symbol, req.requested_usd,
+                                 "REFUSED_POLICY", refusal, None, network)
+        return _reply(503, None, refusal)
+    network = _GENESIS["network"]
+
+    # The wallet's SOL balance, for the fee rail. Unreadable is None, which
+    # the rail refuses -- never an assumed sufficient balance.
+    try:
+        sol_lamports = await solana_rpc.get_balance_lamports(
+            _http_client, turnkey_client.TURNKEY_SOLANA_WALLET_ADDRESS)
+    except Exception as e:
+        logger.warning(f"getBalance failed: {e}")
+        sol_lamports = None
+
+    try:
+        policy_result, existing = await _reserve(req, sol_lamports, network)
+    except Exception as e:
+        # Fails closed for FUNDS (nothing is reserved or signed). The audit
+        # log lives in the same Postgres, so it cannot record this either --
+        # but the caller deserves a structured refusal, not a stack trace.
+        reason = f"Policy re-validation could not run ({type(e).__name__}: {e}) -- refusing."
+        logger.error(reason)
+        return _reply(503, None, reason)
+
+    if existing is not None:
+        # IDEMPOTENCY. Same key, same answer -- never a second signature.
+        reason = (f"duplicate client_order_id: this order was already processed "
+                  f"({existing['status']}) -- returning its outcome, not signing again")
+        await _write_audit_log(req.token_address, req.token_symbol, req.requested_usd,
+                                 "REFUSED_DUPLICATE", reason, existing["tx_signature"], network)
+        return _reply(409, existing["status"], reason, tx_signature=existing["tx_signature"],
+                      executed=existing["status"] == "SIGNED_BROADCAST",
+                      client_order_id=req.client_order_id)
+
+    if not policy_result.allowed:
+        await _write_audit_log(req.token_address, req.token_symbol, req.requested_usd,
+                                 "REFUSED_POLICY", policy_result.reason, None, network)
+        return _reply(403, "REFUSED", policy_result.reason, client_order_id=req.client_order_id)
 
     # --- devnet_transfer_test: prove the custody+signing+broadcast path,
     # not a real trade (see module docstring). ---
@@ -267,44 +459,72 @@ async def execute(req: ExecuteRequest):
     except Exception as e:
         reason = f"Failed to build the devnet test transaction: {e}"
         logger.error(reason)
+        await _finish(req.client_order_id, "FAILED", reason, None)
         await _write_audit_log(req.token_address, req.token_symbol, req.requested_usd,
                                  "ERROR", reason, None, network)
-        return JSONResponse({"executed": False, "reason": reason}, status_code=500)
+        return _reply(500, "FAILED", reason, client_order_id=req.client_order_id)
 
     try:
         signed_hex = await turnkey_client.sign_solana_transaction(_http_client, unsigned_tx)
     except turnkey_client.TurnkeyConfigError as e:
         reason = str(e)
+        await _finish(req.client_order_id, "FAILED", reason, None)
         await _write_audit_log(req.token_address, req.token_symbol, req.requested_usd,
                                  "ERROR", reason, None, network)
-        return JSONResponse({"executed": False, "reason": reason}, status_code=500)
+        return _reply(500, "FAILED", reason, client_order_id=req.client_order_id)
     except turnkey_client.TurnkeySigningError as e:
         reason = str(e)
         logger.warning(f"Turnkey refused to sign: {reason}")
+        await _finish(req.client_order_id, "REFUSED", reason, None)
         await _write_audit_log(req.token_address, req.token_symbol, req.requested_usd,
                                  "REFUSED_TURNKEY", reason, None, network)
-        return JSONResponse({"executed": False, "reason": reason}, status_code=403)
+        return _reply(403, "REFUSED", reason, client_order_id=req.client_order_id)
     except Exception as e:
         # Only the two typed exceptions were caught. An httpx timeout, a
         # connect error, or a malformed JSON body is none of them -- so a
         # request that Turnkey may have COMPLETED (the signature exists; the
         # response was lost on the way back) escaped unhandled and unlogged,
         # leaving a "did we sign or not?" question with no record to settle it.
+        # UNKNOWN keeps it counted against every cap.
         reason = f"Turnkey call failed before a result was known: {type(e).__name__}: {e}"
         logger.error(reason)
+        await _finish(req.client_order_id, "UNKNOWN", reason, None)
         await _write_audit_log(req.token_address, req.token_symbol, req.requested_usd,
                                  "ERROR", reason, None, network)
-        return JSONResponse({"executed": False, "reason": reason}, status_code=502)
+        return _reply(502, "UNKNOWN", reason, client_order_id=req.client_order_id)
 
     try:
         signed_tx_bytes = solana_tx.reassemble_signed_sol_transfer(unsigned_tx, signed_hex)
-        tx_signature = await solana_rpc.send_raw_transaction(_http_client, signed_tx_bytes)
     except Exception as e:
-        reason = f"Signed successfully but broadcast failed: {e}"
+        # The integrity check refused what Turnkey returned: nothing is sent.
+        reason = f"Refusing to broadcast what Turnkey returned: {e}"
         logger.error(reason)
+        await _finish(req.client_order_id, "FAILED", reason, None)
         await _write_audit_log(req.token_address, req.token_symbol, req.requested_usd,
                                  "ERROR", reason, None, network)
-        return JSONResponse({"executed": False, "reason": reason}, status_code=502)
+        return _reply(502, "FAILED", reason, client_order_id=req.client_order_id)
+
+    try:
+        tx_signature = await solana_rpc.send_raw_transaction(_http_client, signed_tx_bytes)
+    except solana_rpc.SolanaRpcRejected as e:
+        # The node answered and refused (e.g. preflight failure): definitive.
+        reason = f"Signed, but the node rejected the broadcast: {e}"
+        logger.error(reason)
+        await _finish(req.client_order_id, "FAILED", reason, None)
+        await _write_audit_log(req.token_address, req.token_symbol, req.requested_usd,
+                                 "ERROR", reason, None, network)
+        return _reply(502, "FAILED", reason, client_order_id=req.client_order_id)
+    except Exception as e:
+        # A transport failure on sendTransaction is AMBIGUOUS: the node may
+        # have accepted it before the connection dropped. It used to be
+        # reported as "broadcast failed", i.e. as if nothing had happened.
+        reason = (f"Signed, but the broadcast outcome is unknown ({e}) -- the transaction "
+                  f"may be on-chain until its blockhash expires")
+        logger.error(reason)
+        await _finish(req.client_order_id, "UNKNOWN", reason, None)
+        await _write_audit_log(req.token_address, req.token_symbol, req.requested_usd,
+                                 "ERROR", reason, None, network)
+        return _reply(502, "UNKNOWN", reason, client_order_id=req.client_order_id)
 
     # The transaction is ALREADY on-chain at this point. confirm_transaction
     # was the one await in this handler with no try/except: a 429 or a dropped
@@ -320,9 +540,11 @@ async def execute(req: ExecuteRequest):
         reason = (f"broadcast, but the confirmation check failed ({e}) -- the transaction "
                   f"IS on-chain; check tx_signature on an explorer")
         logger.error(reason)
+    await _finish(req.client_order_id, "SIGNED_BROADCAST", reason, tx_signature)
     audited = await _write_audit_log(req.token_address, req.token_symbol, req.requested_usd,
                              "SIGNED_BROADCAST", reason, tx_signature, network)
     if not audited:
         reason += " -- WARNING: the execution audit row could not be written; this transaction is on-chain with no local record"
-    return {"executed": True, "confirmed": confirmed, "tx_signature": tx_signature,
-            "network": network, "reason": reason, "audit_logged": audited}
+    return {"executed": True, "order_status": "SIGNED_BROADCAST", "confirmed": confirmed,
+            "tx_signature": tx_signature, "network": network, "reason": reason,
+            "audit_logged": audited, "client_order_id": req.client_order_id}

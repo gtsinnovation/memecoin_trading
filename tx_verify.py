@@ -232,7 +232,9 @@ def verify_simulation(sim_result: Optional[Dict[str, Any]],
                       owner: Optional[str],
                       input_mint: Optional[str],
                       output_mint: Optional[str],
-                      max_input_raw: Optional[int]) -> VerifyResult:
+                      max_input_raw: Optional[int],
+                      owner_pre_lamports: Optional[int] = None,
+                      max_lamports_spend: Optional[int] = None) -> VerifyResult:
     """Check what the transaction WOULD do, from an RPC simulation.
 
     Reads the simulated pre/post token balances for our own wallet and asserts
@@ -242,6 +244,18 @@ def verify_simulation(sim_result: Optional[Dict[str, Any]],
 
     Every argument is Optional and None refuses. A simulation that could not be
     run is not a simulation that passed.
+
+    TOKEN BALANCES ARE NOT THE WHOLE WALLET. Two drains passed the original
+    check, because it only looked at the input and output mints:
+      * native SOL. A System Program transfer (an allow-listed program) moves
+        lamports, which appear in no token-balance row. The caller must
+        simulate with `accounts: {addresses: [owner]}` and pass the owner's
+        pre-simulation lamports; the post value is read from
+        sim_result["accounts"][0]["lamports"] and the drop is bounded by
+        max_lamports_spend (fees + account rent + any native-SOL input).
+      * every OTHER mint the wallet holds. An SPL transfer (also allow-listed)
+        can empty a third token account without touching either swap mint.
+        No mint other than the input may decrease.
     """
     if sim_result is None:
         return VerifyResult(False, reasons=["simulation did not run -- refusing to sign unsimulated"])
@@ -249,6 +263,8 @@ def verify_simulation(sim_result: Optional[Dict[str, Any]],
         return VerifyResult(False, reasons=["owner or mint missing -- cannot check simulated balances"])
     if max_input_raw is None:
         return VerifyResult(False, reasons=["no authorised input amount -- cannot bound the spend"])
+    if owner_pre_lamports is None or max_lamports_spend is None:
+        return VerifyResult(False, reasons=["no lamport baseline or bound -- cannot rule out a native-SOL drain"])
 
     err = sim_result.get("err")
     if err:
@@ -284,7 +300,29 @@ def verify_simulation(sim_result: Optional[Dict[str, Any]],
     if post_out - pre_out <= 0:
         return VerifyResult(False, reasons=["simulation receives none of the requested token"])
 
-    return VerifyResult(True, detail=f"simulated spend {spent} raw, receive {post_out - pre_out} raw")
+    # Every other mint we hold: no decrease. A mint whose post row vanished
+    # counts as zero -- closing a token account is how you empty one.
+    for mint in sorted({row.get("mint") for row in pre if row.get("owner") == owner}):
+        if mint in (input_mint, output_mint) or mint is None:
+            continue
+        before, after = amount_for(pre, mint) or 0, amount_for(post, mint) or 0
+        if after < before:
+            return VerifyResult(False, reasons=[
+                f"simulation decreases our balance of unrelated mint {mint} by {before - after}"])
+
+    accounts = sim_result.get("accounts")
+    post_lamports = None
+    if isinstance(accounts, list) and accounts and isinstance(accounts[0], dict):
+        post_lamports = accounts[0].get("lamports")
+    if not isinstance(post_lamports, int) or isinstance(post_lamports, bool):
+        return VerifyResult(False, reasons=["simulation did not report our post-transaction lamports"])
+    lamports_spent = int(owner_pre_lamports) - post_lamports
+    if lamports_spent > int(max_lamports_spend):
+        return VerifyResult(False, reasons=[
+            f"simulation spends {lamports_spent} lamports, above the authorised {int(max_lamports_spend)}"])
+
+    return VerifyResult(True, detail=(f"simulated spend {spent} raw + {lamports_spent} lamports, "
+                                      f"receive {post_out - pre_out} raw"))
 
 
 def verify_before_signing(base64_transaction: str, *,
@@ -292,7 +330,9 @@ def verify_before_signing(base64_transaction: str, *,
                           sim_result: Optional[Dict[str, Any]],
                           input_mint: Optional[str],
                           output_mint: Optional[str],
-                          max_input_raw: Optional[int]) -> VerifyResult:
+                          max_input_raw: Optional[int],
+                          owner_pre_lamports: Optional[int] = None,
+                          max_lamports_spend: Optional[int] = None) -> VerifyResult:
     """Both checks. Either one refusing refuses the whole transaction."""
     try:
         decoded = decode_transaction(base64_transaction)
@@ -303,7 +343,8 @@ def verify_before_signing(base64_transaction: str, *,
     if not structural.ok:
         return structural
 
-    simulated = verify_simulation(sim_result, expected_fee_payer, input_mint, output_mint, max_input_raw)
+    simulated = verify_simulation(sim_result, expected_fee_payer, input_mint, output_mint,
+                                  max_input_raw, owner_pre_lamports, max_lamports_spend)
     if not simulated.ok:
         return simulated
 

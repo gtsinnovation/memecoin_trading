@@ -28,8 +28,22 @@ CREATE TABLE IF NOT EXISTS active_positions (
     target_exit_price NUMERIC,          -- take-profit level; position closes here on the upside
     invalidation_level_price NUMERIC,   -- stop-loss level; position closes here on the downside
     last_simulated_price NUMERIC,       -- most recent price the exit-monitor walked this position to
-    captured_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    captured_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    -- Slippage measured at entry, charged on both sides at close. NULL means
+    -- UNMEASURED and is costed at paper_trading's stand-in, never at zero.
+    entry_slippage_percent NUMERIC,
+    -- Stage 3 lifecycle. 'PAPER' when execution is off. With it on, a row is
+    -- written 'PENDING_EXECUTION' (a capital reservation, never marked or
+    -- closed), then becomes 'EXECUTED', is deleted on a definitive refusal,
+    -- or becomes 'EXECUTION_UNKNOWN' when the outcome could not be learned.
+    execution_status VARCHAR(24) NOT NULL DEFAULT 'PAPER',
+    -- Idempotency key the signer dedupes on (signer_orders). A retried or
+    -- replayed request with the same key can never be signed twice.
+    client_order_id UUID NOT NULL DEFAULT gen_random_uuid(),
+    tx_signature VARCHAR(128)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_active_positions_client_order_id
+    ON active_positions(client_order_id);
 
 -- Realized outcomes: a position is moved here (and removed from active_positions)
 -- once it hits its take-profit or stop-loss level, so this table is the source
@@ -45,7 +59,11 @@ CREATE TABLE IF NOT EXISTS closed_positions (
     realized_pnl_usd NUMERIC NOT NULL,
     realized_pnl_percent NUMERIC NOT NULL,
     opened_at TIMESTAMP WITH TIME ZONE NOT NULL,
-    closed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    closed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    -- realized_pnl_* are NET of these costs from this column's introduction.
+    -- Rows with cost_percent NULL predate it and are GROSS.
+    gross_pnl_percent NUMERIC,
+    cost_percent NUMERIC
 );
 
 CREATE TABLE IF NOT EXISTS system_alerts (
@@ -110,13 +128,31 @@ CREATE TABLE IF NOT EXISTS execution_audit_log (
     token_address VARCHAR(128) NOT NULL,
     token_symbol VARCHAR(50),
     requested_usd NUMERIC NOT NULL,
-    outcome VARCHAR(20) NOT NULL,        -- 'REFUSED_POLICY', 'REFUSED_TURNKEY', 'SIGNED_BROADCAST', 'ERROR'
+    outcome VARCHAR(20) NOT NULL,        -- 'REFUSED_POLICY', 'REFUSED_TURNKEY', 'REFUSED_DUPLICATE', 'SIGNED_BROADCAST', 'ERROR'
     reason TEXT NOT NULL,                -- policy_guard's reason, Turnkey's failure detail, or the error
     tx_signature VARCHAR(128),           -- Solana transaction signature, only set on SIGNED_BROADCAST
     network VARCHAR(20) NOT NULL DEFAULT 'devnet', -- 'devnet' or 'mainnet' -- never trust this alone; cross-check SOLANA_RPC_URL
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_execution_audit_created_at ON execution_audit_log(created_at);
+
+-- The signer's OWN order ledger (signer_service/main.py). One row per
+-- client_order_id, inserted BEFORE anything is signed; the primary key is
+-- what makes a replayed or retried request unable to sign twice. The signer's
+-- daily order and notional caps are counted from here, not from any table
+-- the web app writes. Grant the web role SELECT at most -- see STAGE3_SETUP.md.
+CREATE TABLE IF NOT EXISTS signer_orders (
+    client_order_id VARCHAR(64) PRIMARY KEY,
+    token_address VARCHAR(128) NOT NULL,
+    requested_usd NUMERIC NOT NULL,
+    status VARCHAR(20) NOT NULL,      -- RESERVED, SIGNED_BROADCAST, REFUSED, FAILED, UNKNOWN
+    reason TEXT,
+    tx_signature VARCHAR(128),
+    network VARCHAR(20),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_signer_orders_created_at ON signer_orders(created_at);
 
 -- Holder-count samples over time, so E_BREADTH can compute how fast a
 -- token is gaining holders. A single point-in-time holder count says
@@ -360,3 +396,13 @@ CREATE INDEX IF NOT EXISTS ix_paper_trades_rejected_by ON paper_trades(rejected_
 -- Retention prunes paper_price_path on observed_at alone.
 CREATE INDEX IF NOT EXISTS idx_price_path_observed_at ON paper_price_path(observed_at);
 
+
+-- Horizon dropout per hour (paper_trading.record_horizon_dropout). Counts are
+-- row-ticks; read dropped/due as a rate. Experiment metadata: never pruned.
+CREATE TABLE IF NOT EXISTS paper_horizon_dropout (
+    hour TIMESTAMP WITH TIME ZONE PRIMARY KEY,
+    due INTEGER NOT NULL DEFAULT 0,
+    marked INTEGER NOT NULL DEFAULT 0,
+    dropped_no_price INTEGER NOT NULL DEFAULT 0,
+    dropped_no_basis INTEGER NOT NULL DEFAULT 0
+);

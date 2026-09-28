@@ -49,7 +49,7 @@ def run(main) -> Suite:
 
     # --- signer gate: four independent refusals ---
     live = {"position_logged": True, "token_address": "MintAddr111", "token_symbol": "T",
-            "max_safe_position_usd": 25.0}
+            "max_safe_position_usd": 25.0, "client_order_id": "0b9d2c1e-order-key"}
     payload, refusal = main.signer_request_or_reason(live, True)
     s.check_true("a complete live state produces a payload", payload is not None and refusal is None)
     s.check("the payload carries the size", payload["requested_usd"], 25.0)
@@ -69,6 +69,13 @@ def run(main) -> Suite:
                  main.signer_request_or_reason({**live, "max_safe_position_usd": 0}, True)[0] is None)
     s.check_true("a negative size sends nothing",
                  main.signer_request_or_reason({**live, "max_safe_position_usd": -5}, True)[0] is None)
+    s.check("the payload carries the idempotency key", payload["client_order_id"], "0b9d2c1e-order-key")
+    s.check_true("an unkeyed order sends nothing",
+                 main.signer_request_or_reason({**live, "client_order_id": None}, True)[0] is None)
+    s.check_true("an infinite size sends nothing",
+                 main.signer_request_or_reason({**live, "max_safe_position_usd": float("inf")}, True)[0] is None)
+    s.check_true("a NaN size sends nothing",
+                 main.signer_request_or_reason({**live, "max_safe_position_usd": float("nan")}, True)[0] is None)
     s.check_true("an empty state sends nothing", main.signer_request_or_reason({}, True)[0] is None)
     s.check_true("a None state sends nothing", main.signer_request_or_reason(None, True)[0] is None)
     s.check_true("every refusal explains itself",
@@ -219,4 +226,171 @@ def run(main) -> Suite:
         s.check_true("exactly at the limit is still healthy (strictly greater fails)", ok)
     finally:
         hb["at"] = saved
+
+    # --- watchdog: a stall or a dead worker must RECOVER, not just show -----
+    hb = main._PIPELINE_HEARTBEAT
+    saved, saved_deaths = hb["at"], list(main._WORKER_DEATHS)
+    try:
+        main._WORKER_DEATHS.clear()
+        hb["at"] = None
+        s.check_true("no iteration yet, inside the startup grace: no exit",
+                     main.watchdog_verdict(now=100.0, started_at=0.0) is None)
+        s.check_true("no iteration ever, past the grace: exit",
+                     main.watchdog_verdict(now=main.WATCHDOG_STARTUP_GRACE_S + 1, started_at=0.0))
+        hb["at"] = 1000.0
+        s.check_true("a recent iteration: no exit",
+                     main.watchdog_verdict(now=1010.0, started_at=0.0) is None)
+        s.check_true("a stale heartbeat: exit",
+                     main.watchdog_verdict(now=1000.0 + main.WATCHDOG_EXIT_AFTER_S + 1, started_at=0.0))
+        s.check_true("the exit threshold is past the health threshold, so a stall is seen first",
+                     main.WATCHDOG_EXIT_AFTER_S > main.HEALTH_MAX_TICK_AGE_S)
+        main._WORKER_DEATHS.append("pipeline")
+        s.check_true("a dead worker: exit even with a fresh heartbeat",
+                     "pipeline" in (main.watchdog_verdict(now=1001.0, started_at=0.0) or ""))
+    finally:
+        hb["at"] = saved
+        main._WORKER_DEATHS[:] = saved_deaths
+
+    # --- a slow dashboard viewer must not stall the trading loop -----------
+    import asyncio as _aio0, time as _t0
+
+    class _WS:
+        def __init__(self, mode): self.mode, self.got, self.closed = mode, [], False
+        async def send_text(self, p):
+            if self.mode == "hang":
+                await _aio0.sleep(3600)
+            if self.mode == "boom":
+                raise RuntimeError("socket gone")
+            self.got.append(p)
+        async def close(self): self.closed = True
+
+    mgr = main.WebSocketConnectionManager()
+    mgr.SEND_TIMEOUT_S = 0.2
+    good, hang, boom = _WS("ok"), _WS("hang"), _WS("boom")
+    mgr.active_connections[:] = [good, hang, boom]
+    t0 = _t0.monotonic()
+
+    async def _bounded():
+        try:
+            await _aio0.wait_for(mgr.broadcast({"x": 1}), timeout=5.0)
+            return True
+        except _aio0.TimeoutError:
+            return False
+    finished = _aio0.run(_bounded())
+    s.check_true("a hung client cannot hold the broadcast past its timeout",
+                 finished and _t0.monotonic() - t0 < 2.0)
+    s.check("the healthy client still got the message", len(good.got), 1)
+    s.check_true("hung and failed clients are dropped",
+                 mgr.active_connections == [good])
+    mgr.disconnect(hang)   # already gone -- must not raise
+    s.check_true("disconnect is idempotent", True)
+
+    # --- Stage 3 ledger lifecycle -------------------------------------------
+    f = main.execution_fate
+    s.check("a broadcast order is EXECUTED", f(200, {"order_status": "SIGNED_BROADCAST"}), "EXECUTED")
+    s.check("a refused order is VOID", f(403, {"order_status": "REFUSED"}), "VOID")
+    s.check("a pre-reservation refusal is VOID", f(401, {"executed": False}), "VOID")
+    s.check("a policy outage before reserving is VOID", f(503, {}), "VOID")
+    s.check("a reserved-but-unfinished order is UNKNOWN", f(502, {"order_status": "UNKNOWN"}), "UNKNOWN")
+    s.check("a 500 with no order status is UNKNOWN, never VOID", f(500, {}), "UNKNOWN")
+    s.check("an unparseable body is UNKNOWN", f(200, None), "UNKNOWN")
+    s.check("order_status outranks the HTTP code", f(403, {"order_status": "SIGNED_BROADCAST"}), "EXECUTED")
+
+    import asyncio as _aio, json as _json, httpx as _httpx
+    import signer_auth as _sa
+    conn = main.db_connect()
+    conn.autocommit = True
+
+    def reserve(addr):
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO active_positions (token_symbol, token_address, allocated_usd, "
+                        "entry_trigger, execution_status) VALUES ('S', %s, 10, 1.0, "
+                        "'PENDING_EXECUTION') RETURNING client_order_id::text;", (addr,))
+            return cur.fetchone()[0]
+
+    def status_of(order_id):
+        with conn.cursor() as cur:
+            cur.execute("SELECT execution_status, tx_signature FROM active_positions "
+                        "WHERE client_order_id::text = %s;", (order_id,))
+            return cur.fetchone()
+
+    saved_secret, saved_enabled = main.SIGNER_SHARED_SECRET, main.ENABLE_STAGE3_EXECUTION
+    seen = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE active_positions;")
+        main.SIGNER_SHARED_SECRET = b"k" * 40
+        main.ENABLE_STAGE3_EXECUTION = True
+
+        def signer(reply_status, reply_body):
+            def handler(req):
+                body = req.content
+                ok, why = _sa.verify(main.SIGNER_SHARED_SECRET, req.method, req.url.path, body,
+                                     req.headers.get(_sa.HEADER_TS), req.headers.get(_sa.HEADER_SIG))
+                seen.append((req.method, req.url.path, ok, _json.loads(body) if body else None))
+                return _httpx.Response(reply_status, json=reply_body)
+            return _httpx.AsyncClient(transport=_httpx.MockTransport(handler))
+
+        async def go(client, order_id, addr):
+            async with client:
+                await main.maybe_execute_via_signer(client, {
+                    "position_logged": True, "token_address": addr, "token_symbol": "S",
+                    "max_safe_position_usd": 10.0, "client_order_id": order_id})
+
+        oid = reserve("LIFE1")
+        _aio.run(go(signer(200, {"executed": True, "order_status": "SIGNED_BROADCAST",
+                                 "tx_signature": "SIG1", "network": "devnet"}), oid, "LIFE1"))
+        s.check_true("the request reached the signer HMAC-authenticated", seen and seen[-1][2])
+        s.check("and carried the idempotency key", seen[-1][3]["client_order_id"], oid)
+        s.check("an executed order becomes EXECUTED with its signature", status_of(oid), ("EXECUTED", "SIG1"))
+
+        oid = reserve("LIFE2")
+        _aio.run(go(signer(403, {"executed": False, "order_status": "REFUSED", "reason": "cap"}), oid, "LIFE2"))
+        s.check("a refused order leaves NO phantom position", status_of(oid), None)
+
+        oid = reserve("LIFE3")
+        _aio.run(go(signer(502, {"executed": False, "order_status": "UNKNOWN"}), oid, "LIFE3"))
+        s.check("an unknown outcome is held, not dropped and not assumed",
+                status_of(oid), ("EXECUTION_UNKNOWN", None))
+
+        def boom(req):
+            raise _httpx.ConnectError("signer down")
+        oid4 = reserve("LIFE4")
+        _aio.run(go(_httpx.AsyncClient(transport=_httpx.MockTransport(boom)), oid4, "LIFE4"))
+        s.check("a transport failure is UNKNOWN (the request may have landed)",
+                status_of(oid4)[0], "EXECUTION_UNKNOWN")
+
+        main.SIGNER_SHARED_SECRET = None
+        oid5 = reserve("LIFE5")
+        n = len(seen)
+        _aio.run(go(signer(200, {"order_status": "SIGNED_BROADCAST"}), oid5, "LIFE5"))
+        s.check("with no shared secret nothing is sent", len(seen), n)
+        s.check("and the reservation is released", status_of(oid5), None)
+        main.SIGNER_SHARED_SECRET = b"k" * 40
+
+        # Reconciliation asks read-only and settles by the answer.
+        def recon_handler(req):
+            ok, _ = _sa.verify(main.SIGNER_SHARED_SECRET, req.method, req.url.path, b"",
+                               req.headers.get(_sa.HEADER_TS), req.headers.get(_sa.HEADER_SIG))
+            seen.append((req.method, req.url.path, ok, None))
+            if req.url.path.endswith(oid):
+                return _httpx.Response(200, json={"order_status": "SIGNED_BROADCAST", "tx_signature": "SIG3"})
+            return _httpx.Response(404, json={"found": False})
+
+        async def recon():
+            async with _httpx.AsyncClient(transport=_httpx.MockTransport(recon_handler)) as c:
+                return await main.reconcile_pending_executions(c, now=1e9)
+        main._RECONCILE_STATE["at"] = None
+        settled = _aio.run(recon())
+        s.check("reconciliation settles both unknown orders", settled, 2)
+        s.check_true("using GET only -- it can never cause a signature",
+                     all(m == "GET" for m, p, ok, b in seen[-2:]) and all(ok for m, p, ok, b in seen[-2:]))
+        s.check("a signer-confirmed order becomes EXECUTED", status_of(oid), ("EXECUTED", "SIG3"))
+        s.check("an order the signer never recorded is released", status_of(oid4), None)
+        s.check("a second pass inside the interval does nothing", _aio.run(recon()), 0)
+    finally:
+        main.SIGNER_SHARED_SECRET, main.ENABLE_STAGE3_EXECUTION = saved_secret, saved_enabled
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE active_positions;")
+        conn.close()
     return s

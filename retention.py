@@ -63,7 +63,13 @@ _POLICIES = (
      "log_level IN ('DEBUG', 'INFO', 'WARN')"),
     ("system_alerts", "created_at", SEVERE_ALERT_RETENTION_HOURS,
      "log_level NOT IN ('DEBUG', 'INFO', 'WARN')"),
-    ("execution_audit_log", "created_at", AUDIT_RETENTION_HOURS, None),
+    # ONLY policy refusals. Every row that records a signature, a Turnkey
+    # refusal or an error is the record of whether funds may have moved, and
+    # is kept for good -- pruning them after 14 days deleted the one trail an
+    # auditor needs, on a schedule. They are also rare; refusals are the
+    # volume.
+    ("execution_audit_log", "created_at", AUDIT_RETENTION_HOURS,
+     "outcome = 'REFUSED_POLICY'"),
     ("token_holder_samples", "sampled_at", HOLDER_SAMPLE_RETENTION_HOURS, None),
     ("paper_price_path", "observed_at", PRICE_PATH_RETENTION_HOURS, None),
 )
@@ -115,10 +121,14 @@ async def retention_worker(dsn: str, connect=None) -> None:
         return
     if connect is None:
         import asyncpg
-        connect = lambda: asyncpg.connect(dsn=dsn)
+        # Bounded like every other connection: a sweep stuck on a lock must
+        # fail and retry next interval, not hold the worker forever.
+        connect = lambda: asyncpg.connect(
+            dsn=dsn, timeout=float(os.environ.get("DB_CONNECT_TIMEOUT_S", "10")),
+            command_timeout=float(os.environ.get("DB_STATEMENT_TIMEOUT_MS", "60000")) / 1000.0)
     logger.info(
         f"retention: every {RETENTION_INTERVAL_S}s | alerts {ALERT_RETENTION_HOURS}h "
-        f"(routine) / {SEVERE_ALERT_RETENTION_HOURS}h (ERROR+) | audit {AUDIT_RETENTION_HOURS}h | "
+        f"(routine) / {SEVERE_ALERT_RETENTION_HOURS}h (ERROR+) | audit refusals {AUDIT_RETENTION_HOURS}h, executions NEVER | "
         f"holder samples {HOLDER_SAMPLE_RETENTION_HOURS}h | "
         f"price path {PRICE_PATH_RETENTION_HOURS}h | "
         f"paper_trades + paper_horizon_returns NEVER")

@@ -89,7 +89,16 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
             cur.execute("SELECT count(*) FROM paper_trades WHERE token_address=%s "
                         "AND (net_pnl_percent IS NOT NULL OR exit_price IS NOT NULL);", (dead,))
             s.check("no P&L or exit price fabricated", int(cur.fetchone()[0]), 0)
-        s.check("no longer priced every tick", dead in paper_trading.open_token_addresses(conn), False)
+        # Pricing is bounded by the PATH window, not by abandonment. Within it
+        # the token is still asked for (so the ordered path does not depend on
+        # the production outcome -- see open_token_addresses); past it, it
+        # stops. "Forever" is what this block guards against, and still does.
+        s.check("still priced inside the path window",
+                dead in paper_trading.open_token_addresses(conn),
+                paper_trading.UNPRICEABLE_ABANDON_MINUTES + 20 < paper_trading.PATH_WINDOW_MINUTES)
+        age(dead, paper_trading.PATH_WINDOW_MINUTES + 20)
+        s.check("no longer priced once past the path window",
+                dead in paper_trading.open_token_addresses(conn), False)
 
         young = make_address(11)
         rec(_snap(young)); age(young, 5)
@@ -318,6 +327,74 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
         age(veteran, paper_trading.UNPRICEABLE_ABANDON_MINUTES + 120)
         stats = paper_trading.mark_to_market(conn, {})
         s.check_true("sustained silence still abandons", stats["abandoned_no_price"] >= 1)
+
+        print("\n[GAP FILL] a LIMIT that fills on a gap through its stop stops out on that mark")
+        # Fill and stop on the same mark. The stop-out used to wait for the
+        # next tick; a token that then went silent was ABANDONED with no P&L,
+        # so the worst LIMIT outcomes left the sample.
+        gapper = make_address(43)
+        rec(_snap(gapper))
+        with conn.cursor() as cur:
+            cur.execute("SELECT entry_trigger_price, invalidation_level_price FROM paper_trades "
+                        "WHERE token_address=%s AND entry_model='LIMIT';", (gapper,))
+            trig, stop = (float(x) for x in cur.fetchone())
+        gap_price = stop * 0.5
+        paper_trading.mark_to_market(conn, {gapper: gap_price})
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, exit_reason, fill_price, exit_price, net_pnl_percent "
+                        "FROM paper_trades WHERE token_address=%s AND entry_model='LIMIT';", (gapper,))
+            st, why, fp, xp, net = cur.fetchone()
+        s.check("the gap fills AND stops on the same mark", (st, why), ("CLOSED", "STOPPED_OUT"))
+        s.check_true("filled at the trigger (the conservative basis)", abs(float(fp) - trig) < 1e-12)
+        s.check_true("exited at the gap price, not the stop", abs(float(xp) - gap_price) < 1e-12)
+        s.check_true("the loss is the real one (~ -50% or worse vs the trigger)",
+                     float(net) < (gap_price / trig - 1) * 100 + 0.01)
+        cleaner = make_address(44)
+        rec(_snap(cleaner))
+        with conn.cursor() as cur:
+            cur.execute("SELECT entry_trigger_price, invalidation_level_price FROM paper_trades "
+                        "WHERE token_address=%s AND entry_model='LIMIT';", (cleaner,))
+            trig2, stop2 = (float(x) for x in cur.fetchone())
+        paper_trading.mark_to_market(conn, {cleaner: (trig2 + stop2) / 2})
+        with conn.cursor() as cur:
+            cur.execute("SELECT status FROM paper_trades WHERE token_address=%s "
+                        "AND entry_model='LIMIT';", (cleaner,))
+            s.check("a fill between trigger and stop stays OPEN", cur.fetchone()[0], "OPEN")
+
+        print("\n[FIRST EVAL] a token counts once, in the cohort of its first evaluation")
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE paper_trades CASCADE;")
+        flip = make_address(61)
+        rec(_snap(flip))                                          # APPROVED first
+        with conn.cursor() as cur:
+            cur.execute("UPDATE paper_trades SET evaluated_at = evaluated_at - INTERVAL '3 hours', "
+                        "status = 'CLOSED' WHERE token_address = %s;", (flip,))
+        rec(_snap(flip), {"termination_reason": "B_SENTINEL: thin"})  # then REJECTED
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(DISTINCT cohort) FROM paper_trades WHERE token_address=%s;", (flip,))
+            both = cur.fetchone()[0]
+            cur.execute("INSERT INTO paper_horizon_returns (paper_trade_id, horizon_minutes, price, "
+                        "return_percent, age_minutes_at_mark) SELECT id, 30, 1.1, 10, 30 FROM paper_trades "
+                        "WHERE token_address=%s AND entry_model='IMMEDIATE';", (flip,))
+        s.check("fixture: the token really is in both cohorts", both, 2)
+        hz = {(r["horizon_minutes"], r["cohort"]): r for r in paper_trading.horizon_summary(conn)}
+        s.check_true("it is counted in its FIRST cohort", (30, "APPROVED") in hz and hz[(30, "APPROVED")]["tokens"] == 1)
+        s.check_true("and not again in the later one", (30, "REJECTED") not in hz)
+
+        print("\n[DROPOUT] horizon dropout is persisted, not only logged")
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE paper_horizon_dropout;")
+        pt = paper_trading
+        tick = {pt.HORIZON_DUE_TOTAL: 10, pt.HORIZON_DROPPED_NO_PRICE: 3,
+                pt.HORIZON_DROPPED_NO_BASIS: 1, 30: 6}
+        pt.record_horizon_dropout(conn, tick)
+        pt.record_horizon_dropout(conn, tick)
+        pt.record_horizon_dropout(conn, {pt.HORIZON_DUE_TOTAL: 0})
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*), SUM(due), SUM(marked), SUM(dropped_no_price), "
+                        "SUM(dropped_no_basis) FROM paper_horizon_dropout;")
+            s.check("two ticks in one hour accumulate into one row",
+                    tuple(int(x) for x in cur.fetchone()), (1, 20, 12, 6, 2))
 
         print("\n[FILL RATE] an unfilled LIMIT expires without needing a price")
         # "The trigger was never touched in 60 minutes" is a determinate fact

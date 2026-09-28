@@ -538,6 +538,32 @@ def horizon_dropout_summary(marks: Dict[int, int]) -> Dict[str, Any]:
     }
 
 
+def record_horizon_dropout(conn, marks: Dict[int, int]) -> None:
+    """Accumulates this tick's dropout into one row per hour.
+
+    Dropout was only ever LOGGED -- a warning line that rotates away -- so the
+    one number that says how survivor-biased the horizon statistics are could
+    not be read back for any past period. Hourly buckets keep it at 24 rows a
+    day, and the table is never pruned: it describes the experiment.
+
+    Counts are row-TICKS (a row still due next tick is counted again), so read
+    the ratio, not the totals.
+    """
+    d = horizon_dropout_summary(marks)
+    if not d["due"]:
+        return
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO paper_horizon_dropout (hour, due, marked, dropped_no_price, dropped_no_basis)
+            VALUES (date_trunc('hour', CURRENT_TIMESTAMP), %s, %s, %s, %s)
+            ON CONFLICT (hour) DO UPDATE SET
+                due = paper_horizon_dropout.due + EXCLUDED.due,
+                marked = paper_horizon_dropout.marked + EXCLUDED.marked,
+                dropped_no_price = paper_horizon_dropout.dropped_no_price + EXCLUDED.dropped_no_price,
+                dropped_no_basis = paper_horizon_dropout.dropped_no_basis + EXCLUDED.dropped_no_basis;
+        """, (d["due"], d["marked"], d["dropped_no_price"], d["dropped_no_basis"]))
+
+
 def _finite_positive(value) -> Optional[float]:
     """A usable price, or None. Rejects None, non-numerics, <= 0, NaN and inf.
 
@@ -695,6 +721,24 @@ def _as_mark(value) -> tuple:
     return (float(value), None, None)
 
 
+def barrier_exit(price: float, target: Optional[float],
+                 stop: Optional[float]) -> Tuple[Optional[str], float]:
+    """The take-profit / stop-loss rule on its own, with no time exit.
+
+    Shared by the paper experiment (decide_exit, below) and the live ledger
+    (engine.evaluate_open_positions), which has no max-hold policy. One rule
+    in one place: the live ledger used to book stop-outs AT the stop, so a
+    gap from -3% to -99% between two marks recorded -7.5% -- and the kill
+    switch, which sums that ledger, could not see the loss that should have
+    tripped it.
+    """
+    if target is not None and price >= float(target):
+        return "TARGET_HIT", float(target)
+    if stop is not None and price <= float(stop):
+        return "STOPPED_OUT", min(float(price), float(stop))
+    return None, float(price)
+
+
 def decide_exit(price: float, target: Optional[float], stop: Optional[float],
                 held_minutes: Optional[float]) -> Tuple[Optional[str], float]:
     """Which exit (if any) a live trade takes at this price, and at what price.
@@ -715,10 +759,9 @@ def decide_exit(price: float, target: Optional[float], stop: Optional[float],
     whether the strategy survives -- could not be represented at all, in the
     direction that flatters it.
     """
-    if target is not None and price >= float(target):
-        return "TARGET_HIT", float(target)
-    if stop is not None and price <= float(stop):
-        return "STOPPED_OUT", min(float(price), float(stop))
+    reason, fill = barrier_exit(price, target, stop)
+    if reason is not None:
+        return reason, fill
     if float(held_minutes or 0) >= MAX_HOLD_MINUTES:
         return "TIMEOUT", float(price)
     return None, float(price)
@@ -935,18 +978,28 @@ def mark_to_market(conn, prices: Dict[str, float]) -> Dict[str, int]:
 
             if status == "PENDING_FILL":
                 if price <= float(trigger):
+                    # Filled AT the trigger even when the market is below it:
+                    # the conservative basis (a real resting limit on a gap
+                    # would do no worse).
                     cur.execute("""
                         UPDATE paper_trades
                         SET status = 'OPEN', fill_price = %s, filled_at = CURRENT_TIMESTAMP
                         WHERE id = %s;
                     """, (float(trigger), tid))
                     stats["filled"] += 1
-                elif float(age_min or 0) >= LIMIT_FILL_WINDOW_MINUTES:
-                    cur.execute(
-                        "UPDATE paper_trades SET status = 'EXPIRED', closed_at = CURRENT_TIMESTAMP WHERE id = %s;",
-                        (tid,))
-                    stats["expired"] += 1
-                continue
+                    # ...and the barriers are checked on the SAME mark. A gap
+                    # from above the trigger to below the stop used to fill and
+                    # stop there: the stop-out waited for the next tick, and a
+                    # token that then stopped pricing was ABANDONED with no P&L
+                    # -- the worst LIMIT outcomes left the sample entirely.
+                    status, fill_price, held_min = "OPEN", float(trigger), 0.0
+                else:
+                    if float(age_min or 0) >= LIMIT_FILL_WINDOW_MINUTES:
+                        cur.execute(
+                            "UPDATE paper_trades SET status = 'EXPIRED', closed_at = CURRENT_TIMESTAMP WHERE id = %s;",
+                            (tid,))
+                        stats["expired"] += 1
+                    continue
 
             # status == 'OPEN'
             basis = float(fill_price or 0.0)
@@ -1063,7 +1116,34 @@ def results_summary(conn) -> List[Dict[str, Any]]:
         cols = [d[0] for d in cur.description]
         rows = [dict(zip(cols, r)) for r in cur.fetchall()]
 
+        # TOKEN-WEIGHTED barrier P&L, beside the trade-weighted figures above.
+        # A token re-evaluated hourly while it lingered in discovery closed a
+        # dozen barrier trades; a token seen once closed one. The trade mean
+        # is therefore weighted by how long a token stayed LISTED -- which is
+        # correlated with how it performed. Each token is averaged first, then
+        # the tokens; `pct_tokens_positive` is the share of tokens whose own
+        # mean net return is above zero.
+        cur.execute("""
+            WITH per_token AS (
+                SELECT cohort, entry_model, token_address,
+                       AVG(net_pnl_percent) AS net
+                FROM paper_trades WHERE status = 'CLOSED'
+                GROUP BY 1, 2, 3
+            )
+            SELECT cohort, entry_model,
+                   ROUND(AVG(net), 2) AS mean_net_per_token,
+                   ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY net)::numeric, 2)
+                       AS median_net_per_token,
+                   ROUND(100.0 * AVG((net > 0)::int), 1) AS pct_tokens_positive
+            FROM per_token GROUP BY 1, 2;
+        """)
+        tw = {(r[0], r[1]): r[2:] for r in cur.fetchall()}
+
     for row in rows:
+        mean_tw, median_tw, pos_tw = tw.get((row["cohort"], row["entry_model"]), (None, None, None))
+        row["mean_net_per_token"] = mean_tw
+        row["median_net_per_token"] = median_tw
+        row["pct_tokens_positive"] = pos_tw
         row["win_rate"] = round((row["wins"] / row["n"]) * 100, 1) if row["n"] else None
         nc = row.get("exits_confirmed") or 0
         row["win_rate_confirmed"] = (
@@ -1122,7 +1202,21 @@ def horizon_summary(conn, min_txns_h1: Optional[int] = None) -> List[Dict[str, A
     """
     with conn.cursor() as cur:
         cur.execute("""
-            WITH marks AS (
+            -- FIRST EVALUATION ONLY: one observation per token, in the cohort
+            -- that evaluation assigned. A token can be approved at one
+            -- evaluation and rejected at the next; counted in BOTH arms, the
+            -- two samples shared tokens and were no longer independent, and
+            -- later evaluations exist only for tokens that SURVIVED in the
+            -- discovery list -- a selection on outcome. The same rule is used
+            -- by every decision section of stage2_check.sql (first_eval),
+            -- so "up" means the same thing everywhere: this token's return
+            -- at the horizon, from its first evaluation, was above zero.
+            WITH first_eval AS (
+                SELECT DISTINCT ON (token_address) id
+                FROM paper_trades WHERE entry_model = 'IMMEDIATE'
+                ORDER BY token_address, evaluated_at, id
+            ),
+            marks AS (
                 SELECT h.horizon_minutes, t.cohort, t.token_address,
                        h.return_percent AS ret,
                        h.return_percent
@@ -1130,6 +1224,7 @@ def horizon_summary(conn, min_txns_h1: Optional[int] = None) -> List[Dict[str, A
                          AS net_ret
                 FROM paper_horizon_returns h
                 JOIN paper_trades t ON t.id = h.paper_trade_id
+                JOIN first_eval f ON f.id = t.id
                 WHERE h.age_minutes_at_mark <= h.horizon_minutes * %s
                   AND (%s IS NULL OR t.txns_h1 >= %s)
             ),
