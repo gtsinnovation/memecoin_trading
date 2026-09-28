@@ -309,4 +309,40 @@ def run(market_data) -> Suite:
     s.check("unknown token omitted entirely", prices.get(SNDK), None)
     s.check("and no internal bookkeeping keys leak out",
             [k for k in prices if k.startswith("__")], [])
+
+    print("\n[MARK] one failing chunk does not take the later chunks with it")
+    # A single try used to wrap the whole chunk loop, so a 429 on chunk 1
+    # dropped every chunk after it -- and the address list is DISTINCT with a
+    # stable order, so it was the SAME tokens losing their marks every tick.
+    from tests.harness import make_address as _mk
+    n = md.PRICE_BATCH_SIZE
+    first = [_mk(9000 + i) for i in range(n)]          # chunk 1: will 429
+    later = _mk(9999)                                   # chunk 2: must survive
+
+    class _PartlyFailing:
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def get(self, url):
+            req = httpx.Request("GET", url)
+            if later not in url:
+                return httpx.Response(429, request=req)
+            return httpx.Response(200, request=req, json=[{
+                "baseToken": {"address": later, "symbol": "LATE"},
+                "quoteToken": {"address": "So11111111111111111111111111111111111111112",
+                               "symbol": "SOL"},
+                "priceUsd": "0.5", "priceNative": "0.003",
+                "liquidity": {"usd": 90000.0},
+            }])
+
+    real = md.httpx.Client
+    md.httpx.Client = lambda *a, **k: _PartlyFailing()
+    try:
+        got = md.fetch_current_prices_sync(first + [later])
+    finally:
+        md.httpx.Client = real
+    s.check_true("the token in the chunk AFTER the 429 is still priced", later in got)
+    s.check("and nothing from the failed chunk is invented",
+            [a for a in first if a in got], [])
     return s

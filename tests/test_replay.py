@@ -92,4 +92,49 @@ def run() -> Suite:
     s.check_true("the live target distance is one of the replayed targets",
                  any(abs(x - 15.06) < 0.01 for x in rx.TARGETS))
 
+    # --- cells are TOKEN-weighted, not trade-weighted ----------------------
+    # Paths are keyed by token, so a token evaluated several times contributes
+    # several overlapping stretches of ONE price series. Trade-weighting let a
+    # token that lingered in discovery outvote tokens seen once.
+    win = [(1.0, 1.20)]     # hits a 15.06 target
+    lose = [(1.0, 0.80)]    # hits a 7.53 stop
+    lingerer = [({"addr": "A", "basis": 1.0, "slip": 0.0}, win)] * 4
+    once = [({"addr": "B", "basis": 1.0, "slip": 0.0}, lose)]
+    c = rx.evaluate_cell(lingerer + once, 7.53, 15.06)
+    _, _, w = pt.net_pnl_percent(1.0, 1.1506, 0.0)
+    _, _, l = pt.net_pnl_percent(1.0, 0.80, 0.0)
+    s.check("two distinct tokens, whatever the trade count", c["tokens"], 2)
+    s.check("five trades were replayed", c["trades"], 5)
+    s.check_true("the mean is the mean of TOKEN means, not of trades",
+                 abs(c["mean"] - (w + l) / 2) < 1e-9)
+    s.check_true("and differs from the trade-weighted mean it replaced",
+                 abs(c["mean"] - (4 * w + l) / 5) > 1.0)
+
+    # --- a path that never resolves is counted, not hidden ------------------
+    # Dropping it would remove the tokens that stopped pricing -- the dead
+    # ones -- and flatter every cell. Booking it silently would hide how much
+    # of a cell is guesswork.
+    flat2 = [(1.0, 1.01), (2.0, 1.02)]
+    c = rx.evaluate_cell([({"addr": "C", "basis": 1.0, "slip": 0.0}, flat2)],
+                         7.53, 15.06)
+    s.check("an unresolved path is still booked", c["trades"], 1)
+    s.check("and is counted as unresolved", c["unresolved"], 1)
+
+    # --- production reconciliation -----------------------------------------
+    # Only CLOSED trades have a production outcome, and it too is token-
+    # weighted so it is comparable to the replay cell printed beside it.
+    rows = [
+        ({"addr": "A", "status": "CLOSED", "prod_net": 10.0}, win),
+        ({"addr": "A", "status": "CLOSED", "prod_net": 20.0}, win),
+        ({"addr": "B", "status": "CLOSED", "prod_net": -6.0}, lose),
+        ({"addr": "D", "status": "OPEN", "prod_net": None}, flat2),
+    ]
+    s.check("production mean is token-weighted over CLOSED trades only",
+            rx.production_mean(rows), (15.0 + -6.0) / 2)
+    s.check("no closed trades means no production number, not zero",
+            rx.production_mean([rows[3]]), None)
+
+    # --- short paths are no longer silently discarded -----------------------
+    s.check("a single post-entry sample is enough to be replayed", rx.MIN_SAMPLES, 1)
+
     return s

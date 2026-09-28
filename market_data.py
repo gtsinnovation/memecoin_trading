@@ -453,49 +453,61 @@ def fetch_current_marks_sync(token_addresses: List[str]) -> Dict[str, Dict[str, 
         with httpx.Client(timeout=15.0) as client:
             for i in range(0, len(unique), PRICE_BATCH_SIZE):
                 chunk = unique[i:i + PRICE_BATCH_SIZE]
-                url = f"{DEXSCREENER_BASE}/tokens/v1/solana/{','.join(chunk)}"
-                resp = client.get(url)
-                resp.raise_for_status()
-                # Attribute every pair to the address WE ASKED FOR, never to
-                # whatever came back. This endpoint returns pairs in which a
-                # requested token appears on EITHER side, so keying by
-                # baseToken.address filed the price under a different token
-                # entirely whenever ours was the quote side -- and left ours
-                # absent, which is the "No current price for X this tick"
-                # warning that ran on every tick for weeks. The token was
-                # never missing; it was misfiled.
-                wanted = {a.lower(): a for a in chunk}
-                for pair in (resp.json() or []):
-                    base_addr = str(((pair.get("baseToken") or {}).get("address")) or "").lower()
-                    quote_addr = str(((pair.get("quoteToken") or {}).get("address")) or "").lower()
-                    for side_addr in (base_addr, quote_addr):
-                        addr = wanted.get(side_addr)
-                        if not addr:
-                            continue
-                        value = _price_for_side(pair, addr)
-                        if value is None:
-                            continue
-                        # A token can appear in many pools; keep the deepest
-                        # pool's price, matching how fetch_dex_pair_data picks.
-                        liq = float((pair.get("liquidity") or {}).get("usd") or 0.0)
-                        if addr in marks and liq <= marks[addr]["liquidity_usd"]:
-                            continue
-                        txns = pair.get("txns") or {}
-                        m5, h1 = txns.get("m5"), txns.get("h1")
+                # One chunk failing -- a 429, a timeout, a malformed body -- must not
+                # take the chunks AFTER it down with it. A single try around the whole
+                # loop did exactly that, and because the address list is DISTINCT with a
+                # stable order, it was the SAME tokens losing their marks every time:
+                # sparser paths, late horizon marks, and after 180 silent minutes an
+                # ABANDONED trade -- concentrated on whichever tokens sorted last.
+                try:
+                    url = f"{DEXSCREENER_BASE}/tokens/v1/solana/{','.join(chunk)}"
+                    resp = client.get(url)
+                    resp.raise_for_status()
+                    # Attribute every pair to the address WE ASKED FOR, never to
+                    # whatever came back. This endpoint returns pairs in which a
+                    # requested token appears on EITHER side, so keying by
+                    # baseToken.address filed the price under a different token
+                    # entirely whenever ours was the quote side -- and left ours
+                    # absent, which is the "No current price for X this tick"
+                    # warning that ran on every tick for weeks. The token was
+                    # never missing; it was misfiled.
+                    wanted = {a.lower(): a for a in chunk}
+                    for pair in (resp.json() or []):
+                        base_addr = str(((pair.get("baseToken") or {}).get("address")) or "").lower()
+                        quote_addr = str(((pair.get("quoteToken") or {}).get("address")) or "").lower()
+                        for side_addr in (base_addr, quote_addr):
+                            addr = wanted.get(side_addr)
+                            if not addr:
+                                continue
+                            value = _price_for_side(pair, addr)
+                            if value is None:
+                                continue
+                            # A token can appear in many pools; keep the deepest
+                            # pool's price, matching how fetch_dex_pair_data picks.
+                            liq = float((pair.get("liquidity") or {}).get("usd") or 0.0)
+                            if addr in marks and liq <= marks[addr]["liquidity_usd"]:
+                                continue
+                            txns = pair.get("txns") or {}
+                            m5, h1 = txns.get("m5"), txns.get("h1")
 
-                        def _total(bucket):
-                            b = _opt_count(bucket, "buys")
-                            sl = _opt_count(bucket, "sells")
-                            if b is None and sl is None:
-                                return None
-                            return (b or 0) + (sl or 0)
+                            def _total(bucket):
+                                b = _opt_count(bucket, "buys")
+                                sl = _opt_count(bucket, "sells")
+                                if b is None and sl is None:
+                                    return None
+                                return (b or 0) + (sl or 0)
 
-                        marks[addr] = {
-                            "price": value,
-                            "liquidity_usd": liq,
-                            "txns_m5": _total(m5),
-                            "txns_h1": _total(h1),
-                        }
+                            marks[addr] = {
+                                "price": value,
+                                "liquidity_usd": liq,
+                                "txns_m5": _total(m5),
+                                "txns_h1": _total(h1),
+                            }
+                except Exception as e:
+                    logger.warning(f"Batch price lookup failed for chunk {i // PRICE_BATCH_SIZE + 1} "
+                                   f"({len(chunk)} tokens); continuing with the rest: "
+                                   f"{type(e).__name__}: {e}")
+                    continue
     except Exception as e:
         logger.warning(f"Batch price lookup failed: {e}")
 

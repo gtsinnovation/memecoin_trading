@@ -12,8 +12,15 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret}
       POSTGRES_DB: memecoin_trading
+    # LOOPBACK ONLY. "5432:5432" published Postgres on every interface: the LAN
+    # here, and on a VPS the whole internet -- Docker-published ports are
+    # written straight into iptables and BYPASS ufw, so a host firewall does
+    # not cover them. Combined with the fallback password below, that was an
+    # internet-facing trading database. Host tools still reach it on
+    # localhost:5432; the containers reach it on the compose network as `db`
+    # and never used this mapping at all.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       # Automatically executes schema.sql when the database initialization occurs
@@ -28,6 +35,20 @@ services:
     build: .
     container_name: trading_agent_network
     restart: unless-stopped
+    # Reports (unhealthy) in `docker compose ps` once the pipeline has not
+    # STARTED a tick for HEALTH_MAX_TICK_AGE_S -- a dead worker and a hung one
+    # both look like that. python, not curl: python:3.11-slim ships no curl.
+    #
+    # NOTE: plain Docker does NOT restart a container for being unhealthy;
+    # `restart:` only fires when the process exits. This makes a stall VISIBLE.
+    # Recovering from one automatically is a separate decision -- see the
+    # audit report.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=5).status == 200 else 1)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     ports:
       - "8000:8000"
     environment:
@@ -143,11 +164,14 @@ services:
       - RETENTION_INTERVAL_S=${RETENTION_INTERVAL_S:-900}
       - RETENTION_BATCH=${RETENTION_BATCH:-5000}
       - ALERT_RETENTION_HOURS=${ALERT_RETENTION_HOURS:-72}
+      - SEVERE_ALERT_RETENTION_HOURS=${SEVERE_ALERT_RETENTION_HOURS:-720}
       - AUDIT_RETENTION_HOURS=${AUDIT_RETENTION_HOURS:-336}
       - HOLDER_SAMPLE_RETENTION_HOURS=${HOLDER_SAMPLE_RETENTION_HOURS:-168}
       - PRICE_PATH_RETENTION_HOURS=${PRICE_PATH_RETENTION_HOURS:-336}
       # Ordered price path: resolution of the exit-policy replay.
       - PATH_SAMPLE_SECONDS=${PATH_SAMPLE_SECONDS:-30}
+      - PATH_WINDOW_MINUTES=${PATH_WINDOW_MINUTES:-360}
+      - HEALTH_MAX_TICK_AGE_S=${HEALTH_MAX_TICK_AGE_S:-600}
       # Exit-policy replay grid (replay_exits.py). The live 7.53/15.06 is
       # included on purpose so every cell has an anchor to compare against.
       - REPLAY_STOPS=${REPLAY_STOPS:-3,5,7.53,10,15,20}

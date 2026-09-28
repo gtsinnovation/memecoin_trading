@@ -815,82 +815,111 @@ GROUP BY mins, cohort
 ORDER BY mins, cohort;
 
 \echo ''
-\echo '=== 10f. IS IT THE GATES OR THE STOP? -- path vs endpoint ==='
--- The contradiction this section exists to resolve:
+\echo '=== 10f. IS IT THE GATES OR THE STOP? -- from the ORDERED path ==='
+-- Section 5 says approved tokens finish UP most of the time; section 11 says
+-- approved trades LOSE money. Both hold if tokens dip through the 7.53 stop on
+-- the way to finishing higher: the horizon measurement samples the endpoint,
+-- the barrier trade experiences the path.
 --
---   Section 5   approved tokens are UP 68 percent of the time at 120 minutes,
---               median +2.22
---   Section 11  approved IMMEDIATE trades average -5.41
+-- REBUILT on paper_price_path. The first version read min_price_seen /
+-- max_price_seen, and was wrong four ways:
+--   1. extremes carry NO ORDER, so "rose, then stopped" counted as "stopped
+--      on noise, then recovered" -- the one distinction this section exists for;
+--   2. LIMIT rows used price_at_evaluation as the basis, but a LIMIT enters on
+--      a ~7% pullback, so its real stop sits ~14% below evaluation price and
+--      would_stop came out near 100% BY CONSTRUCTION;
+--   3. the extremes were updated while PENDING_FILL, before any entry existed;
+--   4. every trade covered a different window depending on when production
+--      stopped pricing it.
+-- Now: basis is what the trade actually paid (fill_price for LIMIT, entry
+-- only once filled), the window is [entry, entry + 360 min], and recovery is
+-- tested strictly AFTER the first stop crossing.
 --
--- Both can be true. The horizon measurement samples the ENDPOINT; the barrier
--- trade experiences the PATH. A token that dips 9 percent and finishes +2 is
--- a win to section 5 and a stopped-out loss to section 11. If that is what is
--- happening, the gates are doing their job and the 7.53 percent stop is
--- giving the money back -- a completely different problem with a completely
--- different fix, and until now the evidence for it looked identical to "the
--- gates do not work".
---
--- MAE is maximum adverse excursion: the worst drawdown from entry before the
--- horizon. Read the last column. If the median MAE is deeper than the stop
--- distance, the stop was never survivable on this asset class and the trade
--- outcomes say nothing about the gates at all.
---
--- NULL for every row recorded before min_price_seen existed. Their paths were
--- never observed and must not be inferred from their endpoints.
-WITH p AS (
-    SELECT t.cohort, t.entry_model, t.discovery_source,
-           t.price_at_evaluation AS basis,
-           t.min_price_seen AS lo, t.max_price_seen AS hi,
-           t.status, t.exit_reason, t.net_pnl_percent,
-           100.0 * (t.min_price_seen - t.price_at_evaluation)
-                 / NULLIF(t.price_at_evaluation, 0) AS mae_pct,
-           100.0 * (t.max_price_seen - t.price_at_evaluation)
-                 / NULLIF(t.price_at_evaluation, 0) AS mfe_pct
+-- Only trades with a recorded path appear. Paths began when paper_price_path
+-- was created, so older trades are simply absent -- they are not zero.
+WITH trades AS (
+    SELECT t.id, t.token_address, t.cohort, t.entry_model,
+           CASE WHEN t.entry_model = 'LIMIT' THEN t.filled_at
+                ELSE t.evaluated_at END AS entered,
+           CASE WHEN t.entry_model = 'LIMIT' THEN t.fill_price
+                ELSE t.price_at_evaluation END AS basis
     FROM paper_trades t
-    WHERE t.min_price_seen IS NOT NULL
-      AND t.price_at_evaluation > 0
+    WHERE (t.entry_model = 'IMMEDIATE' AND t.price_at_evaluation > 0)
+       OR (t.entry_model = 'LIMIT' AND t.filled_at IS NOT NULL AND t.fill_price > 0)
+),
+path AS (
+    SELECT tr.id, tr.token_address, tr.cohort, tr.entry_model, tr.basis,
+           p.observed_at, p.price,
+           100.0 * (p.price - tr.basis) / tr.basis AS ret
+    FROM trades tr
+    JOIN paper_price_path p
+      ON p.token_address = tr.token_address
+     AND p.observed_at >= tr.entered
+     AND p.observed_at <= tr.entered + INTERVAL '360 minutes'
+),
+per_trade AS (
+    SELECT id, token_address, cohort, entry_model,
+           MIN(ret) AS mae, MAX(ret) AS mfe,
+           MIN(observed_at) FILTER (WHERE ret <= -7.53) AS first_stop
+    FROM path GROUP BY 1, 2, 3, 4
+),
+judged AS (
+    SELECT pt.*,
+           -- Recovery STRICTLY AFTER the first stop crossing. This is the cell
+           -- the first version could not compute: min/max had no order.
+           EXISTS (SELECT 1 FROM path q
+                   WHERE q.id = pt.id AND pt.first_stop IS NOT NULL
+                     AND q.observed_at > pt.first_stop AND q.ret > 0)
+               AS recovered_after_stop
+    FROM per_trade pt
 )
 SELECT cohort, entry_model,
-       COUNT(*)                                                   AS trades,
-       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY mae_pct)::numeric, 2)
-                                                                  AS median_mae,
-       ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY mae_pct)::numeric, 2)
-                                                                  AS p25_mae,
-       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY mfe_pct)::numeric, 2)
-                                                                  AS median_mfe,
-       -- How many would have been stopped out by the CURRENT distance, purely
-       -- from the path, whatever they finished at.
-       COUNT(*) FILTER (WHERE mae_pct <= -7.53)                    AS would_stop,
-       ROUND(100.0 * COUNT(*) FILTER (WHERE mae_pct <= -7.53)
-             / NULLIF(COUNT(*), 0), 0)                             AS would_stop_pct,
-       -- The damning cell: stopped out, and the token was ABOVE entry at its
-       -- best. The stop fired on noise the position then recovered from.
-       COUNT(*) FILTER (WHERE mae_pct <= -7.53 AND mfe_pct > 0)     AS stopped_but_rose
-FROM p
+       COUNT(*)                                                     AS trades,
+       COUNT(DISTINCT token_address)                                AS tokens,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY mae)::numeric, 2) AS median_mae,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY mfe)::numeric, 2) AS median_mfe,
+       COUNT(*) FILTER (WHERE first_stop IS NOT NULL)               AS hit_stop,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE first_stop IS NOT NULL)
+             / NULLIF(COUNT(*), 0), 0)                              AS hit_stop_pct,
+       -- THE cell: stopped, and then traded back above entry afterwards.
+       COUNT(*) FILTER (WHERE recovered_after_stop)                 AS stopped_then_recovered,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE recovered_after_stop)
+             / NULLIF(COUNT(*) FILTER (WHERE first_stop IS NOT NULL), 0), 0)
+                                                                    AS recovered_pct_of_stops
+FROM judged
 GROUP BY cohort, entry_model
 ORDER BY cohort, entry_model;
 
 \echo ''
 \echo '--- 10g. WHAT STOP DISTANCE WOULD THE PATHS HAVE SURVIVED? ---'
--- Not a recommendation -- a description of what the observed paths did. A
--- wider stop keeps more trades alive AND makes each loss bigger; this shows
--- only the first half, so it cannot on its own justify a change. It says
--- which distances are even in the running.
-WITH p AS (
-    SELECT t.cohort,
-           100.0 * (t.min_price_seen - t.price_at_evaluation)
-                 / NULLIF(t.price_at_evaluation, 0) AS mae_pct
+-- A description of the observed paths, NOT a recommendation. A wider stop
+-- keeps more trades alive AND makes each real loss bigger; this shows only the
+-- first half, so on its own it cannot justify a change. Use replay_exits.py for
+-- the trade-off, which applies the actual exit and cost rules.
+-- Same ordered path and basis as 10f; IMMEDIATE only, so the entry is unambiguous.
+WITH trades AS (
+    SELECT t.id, t.token_address, t.cohort, t.evaluated_at AS entered,
+           t.price_at_evaluation AS basis
     FROM paper_trades t
-    WHERE t.min_price_seen IS NOT NULL AND t.price_at_evaluation > 0
-      AND t.entry_model = 'IMMEDIATE'
+    WHERE t.entry_model = 'IMMEDIATE' AND t.price_at_evaluation > 0
+),
+mae AS (
+    SELECT tr.id, tr.cohort,
+           MIN(100.0 * (p.price - tr.basis) / tr.basis) AS mae
+    FROM trades tr
+    JOIN paper_price_path p
+      ON p.token_address = tr.token_address
+     AND p.observed_at >= tr.entered
+     AND p.observed_at <= tr.entered + INTERVAL '360 minutes'
+    GROUP BY 1, 2
 )
 SELECT cohort, COUNT(*) AS trades,
-       ROUND(100.0 * COUNT(*) FILTER (WHERE mae_pct > -5)  / NULLIF(COUNT(*),0), 0) AS survive_5pct,
-       ROUND(100.0 * COUNT(*) FILTER (WHERE mae_pct > -7.53)/ NULLIF(COUNT(*),0), 0) AS survive_current,
-       ROUND(100.0 * COUNT(*) FILTER (WHERE mae_pct > -12) / NULLIF(COUNT(*),0), 0) AS survive_12pct,
-       ROUND(100.0 * COUNT(*) FILTER (WHERE mae_pct > -20) / NULLIF(COUNT(*),0), 0) AS survive_20pct,
-       ROUND(100.0 * COUNT(*) FILTER (WHERE mae_pct > -35) / NULLIF(COUNT(*),0), 0) AS survive_35pct
-FROM p GROUP BY cohort ORDER BY cohort;
+       ROUND(100.0 * COUNT(*) FILTER (WHERE mae > -5)    / NULLIF(COUNT(*),0), 0) AS survive_5pct,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE mae > -7.53) / NULLIF(COUNT(*),0), 0) AS survive_current,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE mae > -12)   / NULLIF(COUNT(*),0), 0) AS survive_12pct,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE mae > -20)   / NULLIF(COUNT(*),0), 0) AS survive_20pct,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE mae > -35)   / NULLIF(COUNT(*),0), 0) AS survive_35pct
+FROM mae GROUP BY cohort ORDER BY cohort;
 
 \echo ''
 \echo '=== 11. EXIT CONFIRMATION -- were the wins traded, or just quoted? ==='

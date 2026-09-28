@@ -6,8 +6,10 @@ JSON-RPC over httpx) rather than pulling in a full RPC client library --
 the signer service only ever needs these three calls.
 """
 import os
+import re
 import asyncio
 import logging
+from urllib.parse import urlsplit
 from typing import Optional
 
 import httpx
@@ -29,18 +31,73 @@ logger = logging.getLogger("signer_service.solana_rpc")
 SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.devnet.solana.com")
 
 
+def safe_endpoint(url: str) -> str:
+    """scheme://host ONLY -- never the path, query string or userinfo.
+
+    Providers put the credential in different places: Helius and QuickNode in
+    the query (?api-key=...), Triton in the path (/<token>), some in userinfo.
+    The host alone is never secret and is all an operator needs to read a log.
+    """
+    try:
+        parts = urlsplit(url or "")
+        return f"{parts.scheme or 'https'}://{parts.hostname or '?'}"
+    except Exception:
+        return "<unparseable RPC URL>"
+
+
+def redact(text) -> str:
+    """Strip the configured RPC endpoint's path/query/userinfo from any text.
+
+    httpx.HTTPStatusError renders the FULL request URL into its message, and
+    the signer interpolates exception text into execution_audit_log rows, into
+    the JSON body it returns, and -- via the web app -- into system_alerts. A
+    429 on getLatestBlockhash therefore wrote the RPC key into three durable
+    places. This is applied at the source, in _rpc_call, so no downstream
+    `{e}` can re-leak it.
+    """
+    if text is None:
+        return ""
+    out = str(text)
+    host = None
+    try:
+        host = urlsplit(SOLANA_RPC_URL or "").hostname
+    except Exception:
+        pass
+    if SOLANA_RPC_URL:
+        out = out.replace(SOLANA_RPC_URL, safe_endpoint(SOLANA_RPC_URL))
+    if host:
+        # Any rendering of a URL on the configured host keeps only scheme+host,
+        # whatever normalisation httpx applied (trailing slash, re-encoding).
+        out = re.sub(r"(https?://)(?:[^@/\s'\"]*@)?(" + re.escape(host) + r")[^\s'\"]*",
+                     r"\1\2/<redacted>", out)
+    return out
+
+
 class SolanaRpcError(Exception):
     pass
 
 
 async def _rpc_call(client: httpx.AsyncClient, method: str, params: list):
-    resp = await client.post(SOLANA_RPC_URL, json={
-        "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
-    }, timeout=15.0)
-    resp.raise_for_status()
-    data = resp.json()
+    # Every transport failure is re-raised as SolanaRpcError with a REDACTED
+    # message, and `from None` drops the original from the chain -- otherwise
+    # a traceback would still print the httpx exception, full URL included.
+    try:
+        resp = await client.post(SOLANA_RPC_URL, json={
+            "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+        }, timeout=15.0)
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.HTTPStatusError as e:
+        raise SolanaRpcError(
+            f"{method} failed: HTTP {e.response.status_code} from "
+            f"{safe_endpoint(SOLANA_RPC_URL)}") from None
+    except httpx.HTTPError as e:
+        raise SolanaRpcError(
+            f"{method} failed: {type(e).__name__}: {redact(e)}") from None
+    except ValueError as e:
+        raise SolanaRpcError(f"{method} failed: unparseable response ({redact(e)})") from None
     if "error" in data:
-        raise SolanaRpcError(f"{method} failed: {data['error']}")
+        raise SolanaRpcError(f"{method} failed: {redact(data['error'])}")
     return data["result"]
 
 

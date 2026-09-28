@@ -34,10 +34,22 @@ def run() -> Suite:
     s.check_true("paper_horizon_returns is never on a retention timer",
                  "paper_horizon_returns" not in tables)
 
-    # An alert nobody has read yet is still owed to somebody. Pruning on age
-    # alone is how a CRITICAL worker-death notice disappears unseen.
-    alerts = [p for p in retention._POLICIES if p[0] == "system_alerts"][0]
-    s.check("undispatched alerts survive their age", alerts[3], "is_dispatched = TRUE")
+    # Alerts are pruned by SEVERITY. The first version keyed on
+    # is_dispatched = TRUE, and since nothing ever dispatches, that predicate
+    # matched no rows -- retention was a no-op that this suite reported as
+    # working. These assertions check what actually matters.
+    alerts = [p for p in retention._POLICIES if p[0] == "system_alerts"]
+    s.check("system_alerts has exactly two policies (routine, severe)", len(alerts), 2)
+    s.check_true("no alert policy depends on is_dispatched, which nothing sets",
+                 all("is_dispatched" not in (p[3] or "") for p in alerts))
+    routine = [p for p in alerts if "NOT IN" not in p[3]][0]
+    severe = [p for p in alerts if "NOT IN" in p[3]][0]
+    s.check_true("routine alerts ARE pruned (the policy has a real predicate)",
+                 "'INFO'" in routine[3] and "'WARN'" in routine[3])
+    s.check_true("ERROR and CRITICAL are kept strictly longer than routine traffic",
+                 severe[2] > routine[2])
+    s.check_true("the two predicates are complementary, so no level is never pruned",
+                 routine[3].replace("IN", "NOT IN", 1) == severe[3])
 
     # Batching is not a micro-optimisation: the tick loop shares this
     # database, and an unbounded DELETE over a day of alerts holds a lock

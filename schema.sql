@@ -353,3 +353,10 @@ CREATE TABLE IF NOT EXISTS paper_price_path (
 -- a recent row exists for a token. Both are this index.
 CREATE INDEX IF NOT EXISTS idx_price_path_token_time
     ON paper_price_path(token_address, observed_at);
+
+-- Index parity with migrate.sql (see the note there). Segmenting the rejected
+-- cohort by reason runs over the whole table.
+CREATE INDEX IF NOT EXISTS ix_paper_trades_rejected_by ON paper_trades(rejected_by);
+-- Retention prunes paper_price_path on observed_at alone.
+CREATE INDEX IF NOT EXISTS idx_price_path_observed_at ON paper_price_path(observed_at);
+

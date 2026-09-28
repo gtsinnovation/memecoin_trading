@@ -45,6 +45,7 @@ make live results worse than paper. Treat paper P&L as an optimistic
 upper bound, not a forecast.
 """
 import os
+import math
 import logging
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -83,6 +84,16 @@ LIMIT_FILL_WINDOW_MINUTES = float(os.environ.get("LIMIT_FILL_WINDOW_MINUTES", "6
 # this long, so capital-equivalent isn't tied up forever and every trade
 # eventually produces a result to measure.
 MAX_HOLD_MINUTES = float(os.environ.get("PAPER_MAX_HOLD_MINUTES", "360"))
+
+# How long after evaluation a token's ordered path keeps being sampled. Must be
+# at least MAX_HOLD_MINUTES: anything shorter truncates the path for exactly
+# the trades a wider stop would have kept open, and the exit replay then
+# compares policies over paths of different lengths. Costs roughly double the
+# concurrently-priced tokens versus the old horizon-only window.
+PATH_WINDOW_MINUTES = max(
+    float(os.environ.get("PATH_WINDOW_MINUTES", str(MAX_HOLD_MINUTES))),
+    MAX_HOLD_MINUTES)
+
 
 # After a token's paper trade resolves, how long before the same token may be
 # recorded again. Without this (and without the live-trade guard below) the
@@ -483,8 +494,19 @@ def open_token_addresses(conn) -> List[str]:
                OR (t.entry_model = 'IMMEDIATE'
                    AND t.evaluated_at > CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute')
                    AND (SELECT COUNT(*) FROM paper_horizon_returns h
-                        WHERE h.paper_trade_id = t.id) < %s);
-        """, (_max_horizon_window(), len(HORIZONS_MINUTES)))
+                        WHERE h.paper_trade_id = t.id) < %s)
+               -- THIRD REASON: the ordered-path window. Every token evaluated
+               -- within the maximum hold is priced, whatever production did
+               -- with it. Without this a token stopped out at minute 5 was
+               -- priced only until its horizons completed (~120-180 min) while
+               -- a token production held stayed priced to 360 -- so the path
+               -- LENGTH depended on the production OUTCOME, and replay_exits.py
+               -- replayed every wider-stop policy on paths the production stop
+               -- had already cut short. Pricing is a superset of what it was:
+               -- mark_to_market and mark_horizons ignore addresses they have
+               -- no due row for, so the only effect is more path samples.
+               OR t.evaluated_at > CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute');
+        """, (_max_horizon_window(), len(HORIZONS_MINUTES), PATH_WINDOW_MINUTES))
         return [r[0] for r in cur.fetchall()]
 
 
@@ -514,6 +536,24 @@ def horizon_dropout_summary(marks: Dict[int, int]) -> Dict[str, Any]:
         "marked": sum(v for k, v in marks.items() if k >= 0),
         "dropout_percent": round(100.0 * dropped / due, 2) if due else None,
     }
+
+
+def _finite_positive(value) -> Optional[float]:
+    """A usable price, or None. Rejects None, non-numerics, <= 0, NaN and inf.
+
+    NaN is the dangerous one: every comparison against it is False, so it
+    passes both a "must be positive" refusal and a "must be below the ceiling"
+    refusal, and LEAST/GREATEST in Postgres will happily store it.
+    """
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v) or v <= 0:
+        return None
+    return v
 
 
 def mark_horizons(conn, prices: Dict[str, float]) -> Dict[int, int]:
@@ -554,6 +594,25 @@ def mark_horizons(conn, prices: Dict[str, float]) -> Dict[int, int]:
         due = cur.fetchall()
 
         for tid, addr, basis, age_min in due:
+            # PATH EXTREMES FIRST, before any `continue`. mark_to_market stops
+            # updating a trade the moment it closes, so this function -- which
+            # keeps pricing a token for the whole horizon window regardless of
+            # barrier state -- is the only place the post-close path is seen.
+            #
+            # It used to sit AFTER the "has a horizon elapsed yet" skip below,
+            # so for the first 30 minutes of every trade it never ran at all:
+            # a trade stopped at minute 5 recorded nothing between minute 5 and
+            # minute 30, which is exactly the window where "did it recover
+            # after stopping us out" is decided.
+            px = _finite_positive(prices.get(addr))
+            if px is not None:
+                cur.execute("""
+                    UPDATE paper_trades
+                    SET min_price_seen = LEAST(COALESCE(min_price_seen, %s), %s),
+                        max_price_seen = GREATEST(COALESCE(max_price_seen, %s), %s)
+                    WHERE id = %s;
+                """, (px, px, px, px, tid))
+
             # Only rows with an ELAPSED horizon could have been marked this
             # tick, and only those belong in the dropout denominator. `due`
             # includes every row still missing any horizon -- mostly rows
@@ -573,20 +632,6 @@ def mark_horizons(conn, prices: Dict[str, float]) -> Dict[int, int]:
             basis = float(basis)
             age = float(age_min or 0.0)
             ret = ((float(price) / basis) - 1.0) * 100.0
-
-            # Keep the path extremes current here too. mark_to_market stops
-            # updating a trade the moment it closes, so without this the
-            # recorded low would always be the one that TRIGGERED the stop and
-            # never showed what the token did afterwards -- which is precisely
-            # the question "was the stop too tight" asks. This function keeps
-            # pricing a token for the whole horizon window regardless of
-            # barrier state, so it is the only place the full path is visible.
-            cur.execute("""
-                UPDATE paper_trades
-                SET min_price_seen = LEAST(COALESCE(min_price_seen, %s), %s),
-                    max_price_seen = GREATEST(COALESCE(max_price_seen, %s), %s)
-                WHERE id = %s;
-            """, (float(price), float(price), float(price), float(price), tid))
 
             for horizon in HORIZONS_MINUTES:
                 if age < horizon:
@@ -738,6 +783,29 @@ def record_path_samples(conn, prices: Dict[str, Any]) -> int:
     for addr, price in rows:
         params.extend([addr, price])
     params.append(PATH_SAMPLE_SECONDS)
+    # SAVEPOINT, because catching the exception is not enough on its own.
+    # psycopg2 marks the whole transaction ABORTED on any failed statement,
+    # and this runs inside the same `with conn:` as mark_to_market and
+    # mark_horizons. Without the savepoint, one failed path INSERT -- a lock
+    # timeout, a full disk, or simply a live database where migrate.sql has not
+    # yet created paper_price_path -- makes every later statement in the tick
+    # raise InFailedSqlTransaction. No fills, no exits, no horizon marks, on
+    # every tick, with only a WARNING to show for it: the exact opposite of the
+    # "never takes down marking" promise the except clause was written to keep.
+    #
+    # Only inside a transaction. Under autocommit every statement is its own
+    # transaction, a failure cannot poison the next one, and SAVEPOINT itself
+    # raises ("can only be used in transaction blocks") -- which would silently
+    # turn path sampling off for any autocommit caller.
+    use_savepoint = not getattr(conn, "autocommit", False)
+    if use_savepoint:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SAVEPOINT path_sample;")
+        except Exception as exc:
+            logger.warning(f"Path sampling skipped (could not set savepoint): "
+                           f"{type(exc).__name__}: {exc}")
+            return 0
     try:
         with conn.cursor() as cur:
             cur.execute(f"""
@@ -751,8 +819,20 @@ def record_path_samples(conn, prices: Dict[str, Any]) -> int:
                                           - (%s * INTERVAL '1 second')
                 );
             """, params)
-            return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            written = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            if use_savepoint:
+                cur.execute("RELEASE SAVEPOINT path_sample;")
+            return written
     except Exception as exc:
+        # Roll back to the savepoint, NOT the transaction: this undoes only the
+        # failed INSERT and leaves the connection usable for the barrier and
+        # horizon work that follows in the same tick.
+        if use_savepoint:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("ROLLBACK TO SAVEPOINT path_sample;")
+            except Exception:
+                pass
         logger.warning(f"Path sampling failed (replay resolution lost, "
                        f"marking unaffected): {type(exc).__name__}: {exc}")
         return 0

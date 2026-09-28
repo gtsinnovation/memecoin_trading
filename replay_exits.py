@@ -60,7 +60,10 @@ STOPS = [float(x) for x in os.environ.get(
     "REPLAY_STOPS", "3,5,7.53,10,15,20").split(",")]
 TARGETS = [float(x) for x in os.environ.get(
     "REPLAY_TARGETS", "3,5,7.5,10,15.06,25").split(",")]
-MIN_SAMPLES = int(os.environ.get("REPLAY_MIN_SAMPLES", "3"))
+# 1, not 3. A token with only one or two samples after entry is usually one
+# that stopped pricing fast -- i.e. died. Requiring three quietly removed the
+# worst outcomes from every cell of the surface.
+MIN_SAMPLES = int(os.environ.get("REPLAY_MIN_SAMPLES", "1"))
 
 
 def load_trades(conn, cohort: str) -> List[dict]:
@@ -68,7 +71,8 @@ def load_trades(conn, cohort: str) -> List[dict]:
     with conn.cursor() as cur:
         cur.execute("""
             SELECT t.id, t.token_address, t.price_at_evaluation,
-                   t.evaluated_at, t.assumed_slippage_percent
+                   t.evaluated_at, t.assumed_slippage_percent,
+                   t.status, t.net_pnl_percent
             FROM paper_trades t
             WHERE t.entry_model = 'IMMEDIATE'
               AND t.cohort = %s
@@ -79,18 +83,29 @@ def load_trades(conn, cohort: str) -> List[dict]:
             ORDER BY t.evaluated_at;
         """, (cohort,))
         return [{"id": r[0], "addr": r[1], "basis": float(r[2]),
-                 "entered": r[3], "slip": r[4]} for r in cur.fetchall()]
+                 "entered": r[3], "slip": r[4], "status": r[5],
+                 "prod_net": (None if r[6] is None else float(r[6]))}
+                for r in cur.fetchall()]
 
 
 def load_path(conn, addr: str, since) -> List[Tuple[float, float]]:
-    """(minutes_since_entry, price), in time order."""
+    """(minutes_since_entry, price), in time order, WITHIN the hold window.
+
+    Bounded above. paper_price_path is keyed by TOKEN, so an unbounded read
+    for a token evaluated at T0 and again at T0+24h returned samples from the
+    SECOND evaluation as though they were the first trade's path: a trade whose
+    pricing stopped at +2h would "reach" its next sample a day later, at
+    held=1440, and book a barrier or timeout at a price from another day.
+    """
     with conn.cursor() as cur:
         cur.execute("""
             SELECT EXTRACT(EPOCH FROM (observed_at - %s))/60.0, price
             FROM paper_price_path
-            WHERE token_address = %s AND observed_at >= %s
+            WHERE token_address = %s
+              AND observed_at >= %s
+              AND observed_at <= %s + (%s * INTERVAL '1 minute')
             ORDER BY observed_at;
-        """, (since, addr, since))
+        """, (since, addr, since, since, pt.MAX_HOLD_MINUTES))
         return [(float(a), float(b)) for a, b in cur.fetchall()]
 
 
@@ -117,6 +132,59 @@ def replay_one(path: List[Tuple[float, float]], basis: float,
     last = path[-1][1]
     _, _, net = pt.net_pnl_percent(basis, last, slippage)
     return "OPEN_AT_END", net
+
+
+def evaluate_cell(paths, stop_pct: float, target_pct: float) -> dict:
+    """One (stop, target) cell over many trades, TOKEN-weighted.
+
+    Token-weighted because paths are keyed by token: a token evaluated five
+    times contributes five overlapping stretches of ONE price series, and a
+    trade-weighted mean let a token that lingered in discovery outvote five
+    tokens seen once. Every other decision statistic in this project is
+    token-weighted; the replay has to be too, or its cells are not comparable
+    to anything.
+
+    A trade whose path ENDS before the max hold without touching either barrier
+    is UNRESOLVED -- we do not know what it would have done. It is still booked
+    at its last observed price in `mean` (dropping it would remove the tokens
+    that stopped pricing, i.e. the dead ones, and flatter every cell), but it
+    is counted separately so the reader can see how much of a cell rests on it.
+    """
+    by_token: dict = {}
+    unresolved = 0
+    trades = 0
+    for t, path in paths:
+        out = replay_one(path, t["basis"], stop_pct, target_pct, t["slip"])
+        if out is None:
+            continue
+        trades += 1
+        if out[0] == "OPEN_AT_END":
+            unresolved += 1
+        by_token.setdefault(t["addr"], []).append(out[1])
+    per_token = [sum(v) / len(v) for v in by_token.values()]
+    return {
+        "mean": (sum(per_token) / len(per_token)) if per_token else float("nan"),
+        "tokens": len(per_token),
+        "trades": trades,
+        "unresolved": unresolved,
+    }
+
+
+def production_mean(paths) -> Optional[float]:
+    """Token-weighted mean of what PRODUCTION actually booked for these trades.
+
+    Printed beside the live-policy cell. If the replay at the live (stop,
+    target) does not roughly reproduce this, the gap is replay error --
+    sampling resolution, truncated paths, a different fill rule -- and every
+    other cell carries the same error. Without this line there was no way to
+    tell a real policy difference from a flaw in the instrument.
+    """
+    by_token: dict = {}
+    for t, _ in paths:
+        if t.get("status") == "CLOSED" and t.get("prod_net") is not None:
+            by_token.setdefault(t["addr"], []).append(t["prod_net"])
+    per_token = [sum(v) / len(v) for v in by_token.values()]
+    return (sum(per_token) / len(per_token)) if per_token else None
 
 
 def main() -> int:
@@ -157,26 +225,41 @@ def main() -> int:
                   f"maximum.")
 
         span = [len(p) for _, p in paths]
-        print(f"  samples per trade: min {min(span)}, median "
-              f"{sorted(span)[len(span)//2]}, max {max(span)}")
+        tokens = len({t["addr"] for t, _ in paths})
+        print(f"  {tokens} distinct tokens; samples per trade: min {min(span)}, "
+              f"median {sorted(span)[len(span)//2]}, max {max(span)}")
 
         header = "  stop \\ target " + "".join(f"{t:>9.2f}" for t in TARGETS)
         print(header)
+        worst_unresolved = 0.0
+        live = None
         for stop_pct in STOPS:
-            cells = []
+            row = []
             for target_pct in TARGETS:
-                nets = []
-                for t, path in paths:
-                    out = replay_one(path, t["basis"], stop_pct,
-                                     target_pct, t["slip"])
-                    if out is not None:
-                        nets.append(out[1])
-                cells.append(sum(nets) / len(nets) if nets else float("nan"))
+                c = evaluate_cell(paths, stop_pct, target_pct)
+                row.append(c["mean"])
+                if c["trades"]:
+                    worst_unresolved = max(worst_unresolved,
+                                           c["unresolved"] / c["trades"])
+                if abs(stop_pct - 7.53) < 0.01 and abs(target_pct - 15.06) < 0.01:
+                    live = c
             mark = " *" if abs(stop_pct - 7.53) < 0.01 else "  "
             print(f"  {stop_pct:>6.2f}{mark}     "
-                  + "".join(f"{c:>9.2f}" for c in cells))
-        print("  (* = the stop distance currently running; "
-              "cells are MEAN net P&L per trade, after fees and slippage)")
+                  + "".join(f"{c:>9.2f}" for c in row))
+        print(f"  unresolved paths: up to {worst_unresolved:.0%} of trades in a "
+              f"cell ended before the max hold without touching a barrier, "
+              f"and are booked at their last price.")
+        prod = production_mean(paths)
+        if live is not None and prod is not None:
+            gap = live["mean"] - prod
+            print(f"  RECONCILIATION  replay at live policy: {live['mean']:.2f}   "
+                  f"production booked: {prod:.2f}   gap: {gap:+.2f}")
+            if abs(gap) > 2.0:
+                print("  WARNING: the replay does not reproduce production at the "
+                      "live policy. Every other cell carries this error -- read "
+                      "differences BETWEEN cells, never a cell's absolute level.")
+        print("  (* = the stop distance currently running; cells are TOKEN-"
+              "weighted mean net P&L, after fees and slippage)")
 
     conn.close()
     print("\nRead this as a surface, not a leaderboard. A single best cell "

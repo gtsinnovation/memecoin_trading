@@ -34,6 +34,10 @@ RETENTION_BATCH = int(os.environ.get("RETENTION_BATCH", "5000"))
 
 # Per-table age limits, in hours. None means "never prune".
 ALERT_RETENTION_HOURS = float(os.environ.get("ALERT_RETENTION_HOURS", "72"))
+# ERROR and CRITICAL are rare and are the rows someone may need after the
+# fact -- a worker death, a kill-switch trip. They are kept far longer than
+# the routine DEBUG/INFO/WARN traffic that makes up almost all of the volume.
+SEVERE_ALERT_RETENTION_HOURS = float(os.environ.get("SEVERE_ALERT_RETENTION_HOURS", "720"))
 AUDIT_RETENTION_HOURS = float(os.environ.get("AUDIT_RETENTION_HOURS", "336"))   # 14d
 HOLDER_SAMPLE_RETENTION_HOURS = float(os.environ.get("HOLDER_SAMPLE_RETENTION_HOURS", "168"))
 # The one genuinely high-volume table. At a 30-second sample and ~100 live
@@ -45,11 +49,20 @@ PRICE_PATH_RETENTION_HOURS = float(os.environ.get("PRICE_PATH_RETENTION_HOURS", 
 
 # (table, timestamp column, retention hours, extra predicate)
 #
-# The extra predicate on system_alerts is load-bearing: an UNDISPATCHED alert
-# is still owed to somebody, so age alone must not remove it. Pruning on time
-# only is how a CRITICAL worker-death notice disappears before anyone reads it.
+# system_alerts is split by SEVERITY, not by is_dispatched.
+#
+# The first version pruned only rows with is_dispatched = TRUE, to stop an
+# unread CRITICAL notice being aged out. The intent was sound and the effect
+# was nothing at all: no code anywhere ever sets is_dispatched to TRUE -- there
+# is no dispatcher -- so the predicate matched zero rows, every sweep deleted
+# nothing, and the table grew at roughly 100k rows a day while its test passed.
+# Severity is what the protection was actually about, and it is a column that
+# is always populated.
 _POLICIES = (
-    ("system_alerts", "created_at", ALERT_RETENTION_HOURS, "is_dispatched = TRUE"),
+    ("system_alerts", "created_at", ALERT_RETENTION_HOURS,
+     "log_level IN ('DEBUG', 'INFO', 'WARN')"),
+    ("system_alerts", "created_at", SEVERE_ALERT_RETENTION_HOURS,
+     "log_level NOT IN ('DEBUG', 'INFO', 'WARN')"),
     ("execution_audit_log", "created_at", AUDIT_RETENTION_HOURS, None),
     ("token_holder_samples", "sampled_at", HOLDER_SAMPLE_RETENTION_HOURS, None),
     ("paper_price_path", "observed_at", PRICE_PATH_RETENTION_HOURS, None),
@@ -88,7 +101,7 @@ async def prune_once(conn) -> dict:
             continue
         if total:
             logger.info(f"retention: pruned {total} rows from {table}")
-        deleted[table] = total
+        deleted[table] = deleted.get(table, 0) + total
     return deleted
 
 
@@ -105,7 +118,7 @@ async def retention_worker(dsn: str, connect=None) -> None:
         connect = lambda: asyncpg.connect(dsn=dsn)
     logger.info(
         f"retention: every {RETENTION_INTERVAL_S}s | alerts {ALERT_RETENTION_HOURS}h "
-        f"(dispatched only) | audit {AUDIT_RETENTION_HOURS}h | "
+        f"(routine) / {SEVERE_ALERT_RETENTION_HOURS}h (ERROR+) | audit {AUDIT_RETENTION_HOURS}h | "
         f"holder samples {HOLDER_SAMPLE_RETENTION_HOURS}h | "
         f"price path {PRICE_PATH_RETENTION_HOURS}h | "
         f"paper_trades + paper_horizon_returns NEVER")

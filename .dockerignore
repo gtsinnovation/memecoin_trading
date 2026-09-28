@@ -43,3 +43,18 @@ pgdata/
 *.md
 !README.md
 error.txt
+
+# Operational artefacts -- never runtime inputs, and each one baked into an
+# image layer is both permanent and a cache-buster: every report run changed
+# the build context, so every rebuild re-ran `COPY . .` from scratch.
+# run*.txt / web-crash.txt hold snapshots of live measurements and logs.
+run*.txt
+web-crash.txt
+*.log
+*.bak
+*.orig
+_to_delete/
+# .env variants. `.env` and `*.env` do not match `.env.bak` or `.env.local`,
+# which is exactly the file someone makes before editing the real one.
+.env.*
+!.env.example

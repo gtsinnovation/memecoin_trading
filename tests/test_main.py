@@ -173,4 +173,50 @@ def run(main) -> Suite:
     s.check("every kill-switch reason is either unverified-and-paused, or self-recording",
             unhandled, [])
 
+
+    # --- a NaN or inf anywhere in a snapshot means it is not evaluated -----
+    # float("NaN") parses cleanly and every comparison against it is False, so
+    # it passes "refuse if <= 0" AND "refuse if above the ceiling" at once.
+    # Traced through the gates it sizes a position at NaN and poisons the
+    # SUM()s behind the capital cap and the kill switch permanently.
+    nf = main.non_finite_fields
+    s.check("a clean snapshot has no bad fields",
+            nf({"price_usd": 1.2, "tradeable_depth_usd": 50000, "token_symbol": "X"}), [])
+    s.check("NaN slippage is caught", nf({"estimated_slippage_percent": float("nan")}),
+            ["estimated_slippage_percent"])
+    s.check("+inf depth is caught", nf({"tradeable_depth_usd": float("inf")}),
+            ["tradeable_depth_usd"])
+    s.check("-inf is caught too", nf({"price_change_m5": float("-inf")}), ["price_change_m5"])
+    s.check("every offending field is named, sorted",
+            nf({"b": float("nan"), "a": float("inf"), "c": 1.0}), ["a", "b"])
+    s.check("a measured zero is fine -- zero is a number, NaN is not",
+            nf({"estimated_slippage_percent": 0.0}), [])
+    s.check("booleans are not numbers here (flags must never be flagged)",
+            nf({"_slippage_data_missing": True, "holder_data_missing": False}), [])
+    s.check("None is an absence, handled by the gates' own rules, not this one",
+            nf({"estimated_slippage_percent": None}), [])
+    s.check("a non-dict is not crashed on", nf(None), [])
+
+    # --- /health: a stalled pipeline must LOOK stalled ----------------------
+    # Collection stopped for ~2 days and nothing noticed. The heartbeat is
+    # stamped at the top of every pipeline iteration, so a dead worker and a
+    # hung one both leave it stale -- which is what this reports.
+    hb = main._PIPELINE_HEARTBEAT
+    saved = hb["at"]
+    try:
+        hb["at"] = None
+        ok, d = main.pipeline_health(now=1000.0)
+        s.check("no tick yet reports starting, and is NOT healthy",
+                (ok, d["status"]), (False, "starting"))
+        hb["at"] = 1000.0
+        ok, d = main.pipeline_health(now=1005.0)
+        s.check("a recent tick is healthy", (ok, d["status"]), (True, "ok"))
+        ok, d = main.pipeline_health(now=1000.0 + main.HEALTH_MAX_TICK_AGE_S + 1)
+        s.check("a tick older than the limit is STALLED", (ok, d["status"]), (False, "stalled"))
+        s.check_true("and says how stale, so the log line is actionable",
+                     d["last_tick_age_s"] > main.HEALTH_MAX_TICK_AGE_S)
+        ok, _ = main.pipeline_health(now=1000.0 + main.HEALTH_MAX_TICK_AGE_S)
+        s.check_true("exactly at the limit is still healthy (strictly greater fails)", ok)
+    finally:
+        hb["at"] = saved
     return s

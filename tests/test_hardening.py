@@ -47,6 +47,32 @@ def _stray_percent_signs():
                     bad.append(f"{_os.path.basename(path)}:{node.lineno}")
     return sorted(set(bad))
 
+def _schema_parity():
+    """(indexes only in schema.sql, indexes only in migrate.sql, bad tables).
+
+    The test database is built from schema.sql. The LIVE database is only ever
+    upgraded by migrate.sql. Anything one defines and the other does not is a
+    difference between what the tests exercise and what production runs -- and
+    no test that builds from schema.sql can ever see it. Two retention indexes
+    lived only in schema.sql for exactly this reason, and every live retention
+    sweep ran as a sequential scan while the suite stayed green.
+    """
+    import re as _re, os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+
+    def read(name):
+        return open(_os.path.join(root, name), encoding="utf-8").read()
+
+    idx = _re.compile(r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+(\w+)", _re.I)
+    tbl = _re.compile(r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(\w+)", _re.I)
+    schema, migrate = read("schema.sql"), read("migrate.sql")
+    a, b = set(idx.findall(schema)), set(idx.findall(migrate))
+    # The original base tables predate migrate.sql, which only ALTERs them.
+    # Every table added SINCE must be creatable by migrate.sql.
+    base = {"active_positions", "system_alerts", "trading_sessions"}
+    missing_tables = sorted(set(tbl.findall(schema)) - set(tbl.findall(migrate)) - base)
+    return sorted(a - b), sorted(b - a), missing_tables
+
 def _compose_coverage():
     """Every knob the RUNTIME modules read, minus what compose forwards."""
     import ast as _ast, os as _os, glob as _glob
@@ -96,6 +122,15 @@ def _compose_coverage():
 
 def run() -> Suite:
     s = Suite("hardening")
+
+    # --- schema.sql and migrate.sql must describe the same database --------
+    only_schema, only_migrate, missing_tables = _schema_parity()
+    s.check("no index exists only in schema.sql (the live DB would lack it)",
+            only_schema, [])
+    s.check("no index exists only in migrate.sql (the tests would lack it)",
+            only_migrate, [])
+    s.check("every post-baseline table can be created by migrate.sql",
+            missing_tables, [])
 
     # --- no bare percent signs inside query strings ------------------------
     s.check("no query string contains a percent sign psycopg2 would misread",

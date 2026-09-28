@@ -37,3 +37,9 @@ _to_delete/
 # they contain a snapshot of live measurements rather than source.
 run-*.txt
 run*.txt
+
+# .env variants (see .dockerignore). `.env` alone does not match `.env.bak`.
+.env.*
+!.env.example
+web-crash.txt
+*.log

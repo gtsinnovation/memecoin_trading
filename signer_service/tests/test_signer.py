@@ -197,4 +197,46 @@ def run() -> Suite:
         turnkey_client.sign_solana_transaction = saved["sign"]
         solana_tx.reassemble_signed_sol_transfer = saved["reassemble"]
         signer_main.SIGNER_MODE = saved["mode"]
+
+    # --- the RPC credential never reaches an audit row, a response or a log -
+    # httpx.HTTPStatusError renders the FULL request URL into its message, and
+    # this service interpolates exception text into execution_audit_log, into
+    # the JSON it returns, and (via the web app) into system_alerts. Providers
+    # put the credential in the query (Helius), the path (Triton) or userinfo,
+    # so all three are exercised. Verified before this fix: the raw httpx text
+    # contained the key in every case.
+    import os as _os
+    import importlib as _importlib
+    import httpx as _httpx
+    key = "SUPERSECRETKEY123"
+    saved_url = _os.environ.get("SOLANA_RPC_URL")
+    try:
+        for label, url in (("query", f"https://devnet.helius-rpc.com/?api-key={key}"),
+                           ("path", f"https://example.rpcpool.com/{key}"),
+                           ("userinfo", f"https://user:{key}@rpc.example.com/")):
+            _os.environ["SOLANA_RPC_URL"] = url
+            rpc = _importlib.reload(solana_rpc)
+
+            def _429(req):
+                return _httpx.Response(429, request=req)
+
+            async def _call():
+                async with _httpx.AsyncClient(transport=_httpx.MockTransport(_429)) as c:
+                    try:
+                        await rpc._rpc_call(c, "getLatestBlockhash", [])
+                    except rpc.SolanaRpcError as e:
+                        return e
+            err = asyncio.run(_call())
+            s.check_true(f"a 429 is surfaced as SolanaRpcError ({label})", err is not None)
+            s.check_true(f"its message carries no credential ({label})", key not in str(err))
+            s.check_true(f"and the httpx original is not chained into tracebacks ({label})",
+                         err.__cause__ is None and err.__suppress_context__)
+            s.check_true(f"safe_endpoint keeps the host and drops the secret ({label})",
+                         key not in rpc.safe_endpoint(url))
+    finally:
+        if saved_url is None:
+            _os.environ.pop("SOLANA_RPC_URL", None)
+        else:
+            _os.environ["SOLANA_RPC_URL"] = saved_url
+        _importlib.reload(solana_rpc)
     return s

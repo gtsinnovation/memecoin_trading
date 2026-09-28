@@ -89,7 +89,7 @@ async def startup():
     if SIGNER_MODE == "devnet_transfer_test" and resolved != "devnet":
         raise RuntimeError(
             f"SIGNER_MODE=devnet_transfer_test but the configured RPC resolves to "
-            f"'{resolved}' (SOLANA_RPC_URL={solana_rpc.SOLANA_RPC_URL!r}). Refusing to "
+            f"'{resolved}' (endpoint {solana_rpc.safe_endpoint(solana_rpc.SOLANA_RPC_URL)}). Refusing to "
             f"start: this mode signs and broadcasts a real transfer, and it must only "
             f"ever do so on devnet. Set SOLANA_RPC_URL to a devnet endpoint, or set "
             f"SOLANA_NETWORK explicitly if you are using a private devnet provider."

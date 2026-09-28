@@ -387,3 +387,16 @@ CREATE TABLE IF NOT EXISTS paper_price_path (
 CREATE INDEX IF NOT EXISTS idx_price_path_token_time
     ON paper_price_path(token_address, observed_at);
 
+-- Index parity with schema.sql. These were added to schema.sql alongside
+-- retention.py but never here, so the LIVE database -- which is only ever
+-- upgraded by this file -- has been running every retention sweep as a
+-- sequential scan over the very tables that grew large enough to need
+-- pruning. tests/test_hardening.py now fails if the two files' index sets
+-- differ, so this class of drift cannot recur silently.
+CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON system_alerts(created_at);
+CREATE INDEX IF NOT EXISTS idx_holder_samples_sampled_at ON token_holder_samples(sampled_at);
+-- paper_price_path is pruned on observed_at ALONE, and the only index led with
+-- token_address, which that predicate cannot use. At ~290k rows a day this
+-- was a full scan of the largest table every 15 minutes.
+CREATE INDEX IF NOT EXISTS idx_price_path_observed_at ON paper_price_path(observed_at);
+

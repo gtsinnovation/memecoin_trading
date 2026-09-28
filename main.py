@@ -1,5 +1,6 @@
 # main.py
 import os
+import time
 import secrets
 import asyncio
 import json
@@ -217,6 +218,47 @@ def _login_page_html(error: bool = False) -> str:
     </html>
     """
 
+
+
+# ---------------------------------------------------------------------------
+# LIVENESS
+#
+# Collection stopped for ~2 days and nothing noticed: the container had no
+# healthcheck, _supervise only logs a dead worker, and a HUNG worker (an await
+# on a stalled DB socket) never finishes, so it is never reported at all.
+#
+# The heartbeat is stamped at the TOP of every pipeline iteration. That single
+# fact covers both failure modes: a dead worker stops stamping it, and so does
+# a hung one. /health reports unhealthy once it goes stale, which `docker
+# compose ps` then shows as (unhealthy).
+#
+# Monotonic, not wall-clock: a clock step on resume from sleep must not make a
+# live pipeline look dead, or a dead one look alive.
+# ---------------------------------------------------------------------------
+_PIPELINE_HEARTBEAT = {"at": None}
+HEALTH_MAX_TICK_AGE_S = float(os.environ.get("HEALTH_MAX_TICK_AGE_S", "600"))
+
+
+def pipeline_health(now: float = None) -> tuple:
+    """(healthy, detail) from the heartbeat. Pure, so it is testable."""
+    now = time.monotonic() if now is None else now
+    at = _PIPELINE_HEARTBEAT["at"]
+    if at is None:
+        return False, {"status": "starting", "last_tick_age_s": None}
+    age = now - at
+    if age > HEALTH_MAX_TICK_AGE_S:
+        return False, {"status": "stalled", "last_tick_age_s": round(age, 1),
+                       "limit_s": HEALTH_MAX_TICK_AGE_S}
+    return True, {"status": "ok", "last_tick_age_s": round(age, 1)}
+
+
+@app.get("/health")
+async def health():
+    """Unauthenticated on purpose -- a healthcheck carries no session. It
+    exposes only whether the pipeline is ticking and how long ago, nothing
+    about positions, settings or keys."""
+    ok, detail = pipeline_health()
+    return JSONResponse(detail, status_code=200 if ok else 503)
 
 @app.get("/auth/login")
 async def auth_login(request: Request):
@@ -650,6 +692,36 @@ def run_state_payload(settings_snapshot, run_duration_remaining_minutes=None) ->
         "show_realtime_balances": s.get("show_realtime_balances", True),
     }
 
+
+def non_finite_fields(snapshot) -> list:
+    """Top-level numeric fields of a snapshot that are NaN or +/-inf.
+
+    Any hit means the snapshot is not evaluated. NaN is the dangerous case:
+    float("NaN") parses without complaint, and EVERY comparison against it is
+    False -- so it passes a "refuse if <= 0" check AND a "refuse if above the
+    ceiling" check at the same time. Traced through the gates it passes
+    B_SENTINEL and G_ANCHOR, sizes a position at NaN, and writes NaN into a
+    NUMERIC column, after which SUM(allocated_usd) and SUM(realized_pnl_usd)
+    are NaN and the capital cap and every kill-switch check are permanently
+    off. Refusing the whole snapshot is simpler than mapping each field to its
+    _data_missing flag, and it cannot open a new hole the way a field missed in
+    that mapping would.
+    """
+    import math as _math
+    bad = []
+    if not isinstance(snapshot, dict):
+        return bad
+    for key, value in snapshot.items():
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            try:
+                if not _math.isfinite(float(value)):
+                    bad.append(key)
+            except (OverflowError, ValueError):
+                bad.append(key)
+    return sorted(bad)
+
 def _record_paper_candidate(snapshot: dict, final_state: dict) -> None:
     """Sync wrapper: paper_trading uses psycopg2 like the rest of the
     engine, and this runs in the pipeline's worker thread. Best-effort --
@@ -824,6 +896,10 @@ async def pipeline_executor_worker():
     # Bounded so one permanently unpriceable token cannot block the queue.
     _pen_misses: dict = {}
     while True:
+        # Stamped BEFORE the try, so every iteration counts -- including one
+        # that is about to fail. A stale stamp means no iteration has STARTED
+        # recently: the worker is dead or stuck, not merely unlucky.
+        _PIPELINE_HEARTBEAT["at"] = time.monotonic()
         try:
             candidates = WATCHLIST_TOKEN_ADDRESSES
             if not candidates and ENABLE_TOKEN_DISCOVERY:
@@ -1000,6 +1076,18 @@ async def pipeline_executor_worker():
                 continue
 
             target_token = snapshot["token_symbol"]
+
+            # Fail closed on NaN/inf before ANY gate sees the snapshot. See
+            # non_finite_fields for why a single NaN is enough to disable the
+            # capital cap and the kill switch permanently.
+            bad_fields = non_finite_fields(snapshot)
+            if bad_fields:
+                logger.warning(
+                    f"Refusing to evaluate ${target_token}: non-finite value(s) in "
+                    f"{', '.join(bad_fields)}. A NaN passes every comparison-based "
+                    f"gate, so this token is skipped rather than evaluated on it.")
+                await asyncio.sleep(3.0)
+                continue
 
             # These two are POPPED into real state fields rather than logged
             # and discarded. The numeric columns they describe are NOT NULL in
