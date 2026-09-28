@@ -498,8 +498,13 @@ def run() -> Suite:
         pg.MAX_TOTAL_DEPLOYED_USD, pg.MAX_DAILY_USD = 0.0, 0.0
         s.check_true("outside devnet, no total cap refuses",
                      not check(mode="mainnet_jupiter_swap").allowed)
+        # Isolated: every OTHER real-funds requirement is met, so only the
+        # missing env total cap can be what refuses.
+        pg.MAX_DAILY_USD = 30.0
+        r = check(FakeConn(settings_cap=100.0), mode="mainnet_jupiter_swap")
         s.check_true("outside devnet, a dashboard-only cap is not enough",
-                     not check(FakeConn(settings_cap=100.0), mode="mainnet_jupiter_swap").allowed)
+                     not r.allowed and "SIGNER_MAX_TOTAL_DEPLOYED_USD" in r.reason)
+        pg.MAX_DAILY_USD = 0.0
 
         import os as _os2
         saved_env = _os2.environ.get("MAX_TRADE_USD")
