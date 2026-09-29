@@ -1456,6 +1456,13 @@ async def pipeline_executor_worker():
                     f"Independent price sources disagree on ${target_token} by more than the "
                     f"configured tolerance -- one may be stale or quoting a different pool."
                 )
+            snapshot["price_disagreement_pct"] = snapshot.pop(
+                "_price_disagreement_pct", None)
+            snapshot["price_data_untrusted"] = bool(snapshot.pop(
+                "_price_data_untrusted", False))
+            snapshot["price_dex_usd"] = snapshot.pop("_price_dex_usd", None)
+            snapshot["price_jupiter_usd"] = snapshot.pop("_price_jupiter_usd", None)
+            snapshot["price_pair_address"] = snapshot.pop("_price_pair_address", None)
 
             # Holder velocity is the one breadth input that needs history
             # rather than a single API response, so it's computed here

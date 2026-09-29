@@ -87,6 +87,11 @@ class AgentNetworkState(TypedDict):
     # arrive as a permissive zero -- see market_microstructure.
     price_change_m5: Optional[float]
     price_change_h1: Optional[float]
+    price_disagreement_pct: Optional[float]
+    price_data_untrusted: bool
+    price_dex_usd: Optional[float]
+    price_jupiter_usd: Optional[float]
+    price_pair_address: Optional[str]
     txns_m5_buys: Optional[int]
     txns_m5_sells: Optional[int]
     top_10_holder_percentage: float    
@@ -819,6 +824,15 @@ def node_A_ORBIT(state: AgentNetworkState) -> Dict[str, Any]:
     the order layer act on; refusing a token because five minutes looked bad
     would make the same token flip verdicts hourly.
     """
+    if state.get("price_data_untrusted"):
+        delta = state.get("price_disagreement_pct")
+        reason = ("A_ORBIT: Price data unavailable for a trustworthy entry -- independent "
+                  f"prices differ by {delta}% (DexScreener={state.get('price_dex_usd')}, "
+                  f"Jupiter={state.get('price_jupiter_usd')}, "
+                  f"pair={state.get('price_pair_address')}).")
+        write_system_alert("ERROR", "A_ORBIT", reason)
+        return {"termination_reason": reason}
+
     flow = market_microstructure.check_flow_from_counts({
         "5m": {"buys": state.get("txns_m5_buys"), "sells": state.get("txns_m5_sells")},
         "1h": {"buys": state.get("txns_h1_buys"), "sells": state.get("txns_h1_sells")},
@@ -829,6 +843,12 @@ def node_A_ORBIT(state: AgentNetworkState) -> Dict[str, Any]:
     return {"execution_degraded": flow.severity is market_microstructure.Severity.DEGRADE,
             "flow_detail": flow.detail}
 def node_B_SENTINEL(state: AgentNetworkState) -> Dict[str, Any]:
+    # A_ORBIT can mark a candidate's price as untrusted before any strategy
+    # gate. Route it to the ordinary rejection/paper-recording path without
+    # evaluating liquidity or manufacturing a position from an ambiguous mark.
+    if state.get("termination_reason"):
+        return {"is_liquidity_safe": False}
+
     # Rule validation: minimum TRADEABLE DEPTH (one side of the pool), not
     # total value locked. Providers report TVL -- both sides summed -- which
     # is roughly double the depth a trade actually executes against. This
@@ -885,6 +905,16 @@ def node_C_VECTOR(state: AgentNetworkState) -> Dict[str, Any]:
 # entry, the risk/reward is unchanged by the fix below.
 STOP_DISTANCE_PERCENT = 7.53
 REWARD_RISK_MULTIPLE = 2.0
+# Initial paper-stage risk budget. Position notional is capped so a stop hit
+# plus stressed round-trip costs consumes no more than the configured share of
+# reference equity. The cost reserve matches paper_trading's current fallback
+# (0.25% fee + 3% slippage per side); gaps can still exceed this budget.
+REFERENCE_EQUITY_USD = float(os.environ.get("REFERENCE_EQUITY_USD", "1000"))
+MAX_TRADE_RISK_PERCENT = float(os.environ.get("MAX_TRADE_RISK_PERCENT", "0.5"))
+STRESSED_ROUND_TRIP_COST_PERCENT = float(
+    os.environ.get("STRESSED_ROUND_TRIP_COST_PERCENT", "6.5"))
+MAX_POSITION_NOTIONAL_USD = float(
+    os.environ.get("MAX_POSITION_NOTIONAL_USD", "1000"))
 
 
 def node_D_PULSE(state: AgentNetworkState) -> Dict[str, Any]:
@@ -1134,7 +1164,26 @@ def node_G_ANCHOR(state: AgentNetworkState) -> Dict[str, Any]:
         write_system_alert("WARN", "G_ANCHOR", reason)
         return {"termination_reason": reason}
 
-    safe_size = round(min(depth * 0.01, 1000.0), 2)
+    risk_fraction = (STOP_DISTANCE_PERCENT + STRESSED_ROUND_TRIP_COST_PERCENT) / 100.0
+    sizing_values = (REFERENCE_EQUITY_USD, MAX_TRADE_RISK_PERCENT,
+                     STRESSED_ROUND_TRIP_COST_PERCENT,
+                     MAX_POSITION_NOTIONAL_USD, risk_fraction)
+    if (not all(math.isfinite(value) for value in sizing_values)
+            or REFERENCE_EQUITY_USD <= 0 or MAX_TRADE_RISK_PERCENT <= 0
+            or STRESSED_ROUND_TRIP_COST_PERCENT < 0 or risk_fraction <= 0
+            or MAX_POSITION_NOTIONAL_USD <= 0):
+        reason = "G_ANCHOR: Risk-sizing configuration is invalid; refusing to size a position."
+        write_system_alert("ERROR", "G_ANCHOR", reason)
+        return {"termination_reason": reason}
+    risk_budget_usd = REFERENCE_EQUITY_USD * MAX_TRADE_RISK_PERCENT / 100.0
+    risk_limited_notional = risk_budget_usd / risk_fraction
+    size_ceiling = min(depth * 0.01, risk_limited_notional,
+                       MAX_POSITION_NOTIONAL_USD, REFERENCE_EQUITY_USD)
+    safe_size = math.floor(size_ceiling * 100.0) / 100.0
+    if not math.isfinite(safe_size) or safe_size <= 0:
+        reason = "G_ANCHOR: Calculated position size is invalid; refusing to approve the position."
+        write_system_alert("ERROR", "G_ANCHOR", reason)
+        return {"termination_reason": reason}
     return {"max_safe_position_usd": safe_size}
 def node_H_FUSE(state: AgentNetworkState) -> Dict[str, Any]:
     brief = f"Approved setup for ${state['token_symbol']}. Position Size Cap: ${state['max_safe_position_usd']}. Target Entry Trigger: {state['target_pullback_price']}."

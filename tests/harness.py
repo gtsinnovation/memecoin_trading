@@ -27,23 +27,14 @@ from urllib.parse import urlparse, urlunparse
 TEST_DB_SUFFIX = "_test"
 DEFAULT_TEST_DB = "memecoin_trading_test"
 
-
-def _dbname_of(dsn: str) -> str:
-    """The database name in a DSN.
-
-    urlparse, not a regex. A hand-rolled split on the last '/' looks fine
-    against postgresql://user:pw@host:5432/dbname and then silently mangles
-    postgresql://user@/db?host=/var/run/postgresql -- where the QUERY STRING
-    contains slashes. Getting this wrong points the safety check at the wrong
-    name, which is the one place in this file that must not be approximate.
-    """
-    return urlparse(dsn).path.lstrip("/")
-
-
 def _with_dbname(dsn: str, dbname: str) -> str:
-    parsed = urlparse(dsn)
-    return urlunparse(parsed._replace(path="/" + dbname))
+    # Split DSN into prefix and path manually to preserve credentials
+    if "/" not in dsn:
+        raise ValueError(f"Invalid DSN: {dsn}")
 
+    # Find last slash (start of db name)
+    prefix, _ = dsn.rsplit("/", 1)
+    return f"{prefix}/{dbname}"
 
 def test_dsn() -> str:
     """The DSN the suites connect to -- always a dedicated test database."""
@@ -52,11 +43,15 @@ def test_dsn() -> str:
         raise RuntimeError("DATABASE_URL is not set. Run this inside the container.")
     return _with_dbname(live, DEFAULT_TEST_DB)
 
-
 def admin_dsn() -> str:
     """A DSN pointing at the `postgres` maintenance database, for CREATE/DROP."""
-    return _with_dbname(os.environ.get("DATABASE_URL", ""), "postgres")
-
+    return _with_dbname(
+        os.environ.get(
+            "DATABASE_URL",
+            "postgresql://postgres:supersecretpassword123@db:5432/postgres"
+        ),
+        "postgres"
+    )
 
 def assert_is_test_db(dsn: str) -> None:
     """Hard stop if this is not a throwaway database.

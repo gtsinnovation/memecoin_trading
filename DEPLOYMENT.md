@@ -60,16 +60,16 @@ docker compose version   # sanity check
 
 ## 4. Lock down the firewall
 
-The app only needs to expose SSH (22) and the dashboard port (8000, or
-80/443 if you put a reverse proxy in front — see step 7) to the internet.
-**Postgres (5432) should never be reachable from outside the server** —
-`docker-compose.yml` publishes it to the host for local development
-convenience (connecting a DB GUI client), but on a public VPS the Hetzner
-Cloud Firewall should block it before it ever reaches the box.
+The server needs SSH (22) and the reverse-proxy ports (80/443). The web
+container's port 8000 is bound to host loopback for the reverse proxy and
+must not be opened in the firewall. **Postgres (5432) must never be
+reachable from outside the server.** Restrict 80/443 to a VPN or trusted
+operator IPs where possible: the current email-match sign-in does not
+verify identity, so TLS alone is not adequate public access control.
 
 **Console:** project → **Firewalls** → **Create Firewall**. Add inbound
-rules for TCP 22 (source `0.0.0.0/0, ::/0`) and TCP 8000 (same source; or
-80+443 instead if you're adding HTTPS per step 7). Leave everything else
+rules for TCP 22 (source `0.0.0.0/0, ::/0`) and TCP 80/443 (restrict
+sources to your VPN/operator IPs where possible). Leave everything else
 un-added — Hetzner Cloud Firewalls default-deny anything not explicitly
 allowed. Then attach the firewall to your server under its **Firewalls**
 tab.
@@ -78,7 +78,8 @@ tab.
 ```
 hcloud firewall create --name web-firewall
 hcloud firewall add-rule web-firewall --direction in --source-ips 0.0.0.0/0,::/0 --protocol tcp --port 22
-hcloud firewall add-rule web-firewall --direction in --source-ips 0.0.0.0/0,::/0 --protocol tcp --port 8000
+hcloud firewall add-rule web-firewall --direction in --source-ips 0.0.0.0/0,::/0 --protocol tcp --port 80
+hcloud firewall add-rule web-firewall --direction in --source-ips 0.0.0.0/0,::/0 --protocol tcp --port 443
 hcloud firewall apply-to-resource web-firewall --type server --server trading-app
 ```
 
@@ -145,15 +146,19 @@ docker compose ps                # both services should show healthy/running
 docker compose logs -f web       # watch it come up; Ctrl+C to stop watching
 ```
 
-Visit `http://<server-ip>:8000` and sign in with the Gmail address you put
-in `.env`.
+Do not open `http://<server-ip>:8000`. The app's session cookie is Secure
+by default and its port is host-loopback-only. Configure the reverse proxy
+below, then visit `https://<your-domain>`. Leave
+`SESSION_COOKIE_INSECURE` unset on the server. The current app sign-in only
+matches a typed email address; keep the dashboard behind a VPN or trusted
+identity proxy until real operator authentication is implemented.
 
-### Optional: HTTPS via a reverse proxy
+### Required for remote deployment: HTTPS via a reverse proxy
 
-Running the app directly on port 8000 over plain HTTP is fine for testing,
-but for anything real, put [Caddy](https://caddyserver.com) in front of it
-— it gets you a free, auto-renewing Let's Encrypt certificate with almost
-no configuration. First point a domain's DNS **A record** at the server's
+The session cookie is Secure by default, and exposing the app directly over
+HTTP would disclose operator sessions. Put [Caddy](https://caddyserver.com)
+in front of the loopback-bound app to obtain a free, auto-renewing Let's
+Encrypt certificate. First point a domain's DNS **A record** at the server's
 IP, then:
 
 ```
@@ -169,9 +174,8 @@ your-domain.example.com {
     reverse_proxy localhost:8000
 }
 ```
-and `systemctl reload caddy`. Update the Hetzner Cloud Firewall (step 4) to
-allow 80 and 443 instead of 8000, and you no longer need 8000 open to the
-internet at all (Caddy talks to the app over `localhost`).
+and `systemctl reload caddy`. Caddy talks to the app over `localhost:8000`;
+port 8000 stays closed to the internet.
 
 ## Applying schema changes later
 
@@ -268,6 +272,7 @@ was already started. Fix `.env`, then `docker compose up -d --build` to
 pick up the change.
 
 **Can't reach the dashboard at all.** Check the Hetzner Cloud Firewall
-(step 4) actually allows the port you're using (8000, or 80/443 if you set
-up Caddy), and that `docker compose ps` shows `web` as running/healthy —
-check `docker compose logs web` for a crash loop if not.
+(step 4) allows 80/443, Caddy is running, and `docker compose ps` shows
+`web` as running/healthy. Port 8000 is intentionally loopback-only; check
+`docker compose logs web` for a crash loop if the reverse proxy returns an
+error.

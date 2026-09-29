@@ -557,6 +557,13 @@ async def fetch_price_impact_pct(client: httpx.AsyncClient, token_address: str,
     """Estimated slippage/price-impact (as a percent) for a hypothetical
     USDC -> token_address swap of trade_size_usd, via Jupiter's quote
     endpoint. Returns None if the quote fails (e.g. no route exists)."""
+    # A USDC -> USDC quote is not a meaningful execution-cost probe. Avoid a
+    # guaranteed provider error when the reference mint appears as a candidate;
+    # returning None preserves G_ANCHOR's fail-closed handling.
+    if token_address.strip() == USDC_MINT:
+        logger.debug("Skipping Jupiter impact quote for the USDC reference mint.")
+        return None
+
     cached = _slippage_cache.get(token_address)
     if cached and (time.monotonic() - cached["at"]) < JUPITER_CACHE_TTL_S:
         return cached["value"]

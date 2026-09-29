@@ -134,23 +134,27 @@ FROM paper_trades WHERE entry_model = 'IMMEDIATE';
 -- The $USEFUL problem. A high no_txn_pct means discovery is surfacing dead
 -- tokens whose "price" is a stale last print -- pure noise, which dilutes
 -- any real signal rather than creating a false one.
--- Counts are per DISTINCT TOKEN, not per row. With a 60-minute re-entry
+-- Counts are per DISTINCT TOKEN in its FIRST assigned cohort, not per row
+-- or per every cohort it ever visited. With a 60-minute re-entry
 -- cooldown a token that stays in the discovery list all day is re-evaluated
 -- hourly, so one persistently-listed dead token could contribute 24 rows
 -- while 20 live tokens contribute 20 -- turning a true 5% dead rate into a
 -- reported 55%. This is the same row-vs-token error section 1 warns about.
 -- NULL txns_h1 (rows written before the column existed) is reported
 -- separately rather than counted as a dead token.
-SELECT cohort,
-       COUNT(DISTINCT token_address) AS tokens,
-       COUNT(DISTINCT token_address) FILTER (WHERE txns_h1 = 0) AS no_txns,
-       COUNT(DISTINCT token_address) FILTER (WHERE txns_h1 IS NULL) AS txns_unknown,
-       ROUND(100.0 * COUNT(DISTINCT token_address) FILTER (WHERE txns_h1 = 0)
-             / NULLIF(COUNT(DISTINCT token_address),0)) AS no_txn_pct,
-       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY txns_h1)::numeric, 0) AS median_txns_h1,
-       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY volume_h1_usd)::numeric, 0) AS median_vol_h1,
-       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY tradeable_depth_usd)::numeric, 0) AS median_depth
-FROM paper_trades WHERE entry_model = 'IMMEDIATE' GROUP BY cohort ORDER BY cohort;
+SELECT t.cohort,
+       COUNT(DISTINCT t.token_address) AS tokens,
+       COUNT(DISTINCT t.token_address) FILTER (WHERE t.txns_h1 = 0) AS no_txns,
+       COUNT(DISTINCT t.token_address) FILTER (WHERE t.txns_h1 IS NULL) AS txns_unknown,
+       ROUND(100.0 * COUNT(DISTINCT t.token_address) FILTER (WHERE t.txns_h1 = 0)
+             / NULLIF(COUNT(DISTINCT t.token_address),0)) AS no_txn_pct,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY t.txns_h1)::numeric, 0) AS median_txns_h1,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY t.volume_h1_usd)::numeric, 0) AS median_vol_h1,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY t.tradeable_depth_usd)::numeric, 0) AS median_depth
+FROM paper_trades t
+JOIN first_eval fe ON fe.id = t.id
+WHERE t.entry_model = 'IMMEDIATE'
+GROUP BY t.cohort ORDER BY t.cohort;
 
 \echo ''
 \echo '=== 3b. DROPOUT: trades abandoned because the token stopped pricing ==='
@@ -175,6 +179,19 @@ SELECT to_char(date_trunc('day', hour), 'YYYY-MM-DD') AS day,
        SUM(due) AS due, SUM(dropped_no_price) AS no_price, SUM(dropped_no_basis) AS no_basis,
        ROUND(100.0 * SUM(dropped_no_price + dropped_no_basis) / NULLIF(SUM(due), 0), 1) AS dropout_pct
 FROM paper_horizon_dropout GROUP BY 1 ORDER BY 1 DESC LIMIT 14;
+
+\echo ''
+\echo '--- 3d. PRICE INTEGRITY: candidates rejected before entry ---'
+-- An INVALID_DATA paper row is kept for the candidate funnel, but is never
+-- marked as a fill or included in return/path analysis.
+SELECT t.cohort,
+       COUNT(DISTINCT t.token_address) AS first_eval_tokens,
+       COUNT(DISTINCT t.token_address) FILTER (WHERE t.status = 'INVALID_DATA')
+           AS price_integrity_rejections
+FROM paper_trades t
+JOIN first_eval fe ON fe.id = t.id
+WHERE t.entry_model = 'IMMEDIATE'
+GROUP BY t.cohort ORDER BY t.cohort;
 
 \echo ''
 \echo '=== 4. STALENESS: how much of the sample is a repeated stale quote? ==='
@@ -391,21 +408,21 @@ ORDER BY horizon, ABS(CORR(r_ret, r_val)) DESC NULLS LAST;
 -- The funnel, by distinct token rather than by row. F_ATLAS is split by
 -- reason because its two refusals are opposite problems: concentration over
 -- the ceiling is the gate working, concentration that could not be measured
--- is a data-coverage failure, and roughly two thirds of its rejections have
--- been the latter. `reject_reason` is what makes that separable -- before it
+-- is a data-coverage failure. `reject_reason` is what makes that separable -- before it
 -- existed both recorded rejected_by='F_ATLAS'.
-SELECT COALESCE(rejected_by, '(approved)') AS gate,
+SELECT COALESCE(t.rejected_by, '(approved)') AS gate,
        CASE
-         WHEN reject_reason ILIKE '%unavailable%' OR reject_reason ILIKE '%could not be measured%'
+         WHEN t.reject_reason ILIKE '%unavailable%' OR t.reject_reason ILIKE '%could not be measured%'
            THEN 'unmeasurable'
-         WHEN reject_reason IS NULL THEN ''
+         WHEN t.reject_reason IS NULL THEN ''
          ELSE 'failed the rule'
        END AS kind,
-       COUNT(DISTINCT token_address) AS tokens,
-       ROUND(100.0 * COUNT(DISTINCT token_address)
-             / NULLIF(SUM(COUNT(DISTINCT token_address)) OVER (), 0), 1) AS pct
-FROM paper_trades
-WHERE entry_model = 'IMMEDIATE'
+       COUNT(DISTINCT t.token_address) AS tokens,
+       ROUND(100.0 * COUNT(DISTINCT t.token_address)
+             / NULLIF(SUM(COUNT(DISTINCT t.token_address)) OVER (), 0), 1) AS pct
+FROM paper_trades t
+JOIN first_eval fe ON fe.id = t.id
+WHERE t.entry_model = 'IMMEDIATE'
 GROUP BY 1, 2 ORDER BY tokens DESC;
 
 \echo ''
@@ -489,13 +506,14 @@ ORDER BY would_refuse_pct;
 -- This is also the health check for the recency arm. If holding-pen tokens
 -- stop appearing, the run quietly became a study of established tokens, and
 -- that fact needs to be visible here rather than remembered.
-SELECT COALESCE(discovery_source, '(pre-instrumentation)') AS population,
-       cohort,
-       COUNT(DISTINCT token_address) AS tokens,
-       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY tradeable_depth_usd)::numeric, 0) AS median_depth,
-       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY txns_h1)::numeric, 0) AS median_txns_h1
-FROM paper_trades
-WHERE entry_model = 'IMMEDIATE'
+SELECT COALESCE(t.discovery_source, '(pre-instrumentation)') AS population,
+       t.cohort,
+       COUNT(DISTINCT t.token_address) AS tokens,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY t.tradeable_depth_usd)::numeric, 0) AS median_depth,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY t.txns_h1)::numeric, 0) AS median_txns_h1
+FROM paper_trades t
+JOIN first_eval fe ON fe.id = t.id
+WHERE t.entry_model = 'IMMEDIATE'
 GROUP BY 1, 2 ORDER BY 1, 2;
 
 \echo ''
@@ -751,13 +769,11 @@ ORDER BY population, activity;
 
 \echo ''
 \echo '--- 10d. PRICE SANITY: could these moves physically have happened? ---'
--- Section 5 reports a REJECTED mean of 29,438 percent. The first version of
--- this section recomputed each extreme return from its own two recorded
--- prices and reported "consistent" -- which proved only that the ARITHMETIC
--- was right. It used the same two numbers that produced the return, so it
--- could never have found a wrong PRICE. That is the failure mode here: a
--- token recorded at 0.0000117 and then at 1.53 is a 130,000x move, and the
--- likelier explanation is the wrong side or the wrong pool than a token that
+-- This operational scan covers every evaluation (unlike the first-evaluation
+-- cohort statistics in Section 5). Group marks by trade/evaluation so one
+-- token's later re-entry cannot hide or manufacture a frozen-price finding.
+-- A token recorded at 0.0000117 and then at 1.53 is a 130,000x move; the
+-- likelier explanation is the wrong side or wrong pool than a token that
 -- actually did that in thirty minutes.
 --
 -- This version applies two tests that CAN fail.
@@ -775,7 +791,7 @@ ORDER BY population, activity;
 -- 60 and 120 minutes did not moon three times; its quote stopped updating. A
 -- frozen quote at an absurd level is the signature of a bad read, not a rally.
 WITH x AS (
-    SELECT t.cohort, t.discovery_source,
+    SELECT t.id AS trade_id, t.cohort, t.discovery_source,
            LEFT(t.token_address, 8) AS token,
            h.horizon_minutes AS mins,
            t.price_at_evaluation AS basis,
@@ -787,14 +803,14 @@ WITH x AS (
            f.distinct_marks, f.n_marks
     FROM paper_horizon_returns h
     JOIN paper_trades t ON t.id = h.paper_trade_id
-    -- Per-token mark spread, as its own aggregate. Postgres has no
+    -- Per-trade mark spread, as its own aggregate. Postgres has no
     -- COUNT(DISTINCT ...) OVER (...), so this cannot be a window function.
-    JOIN (SELECT t2.token_address,
+    JOIN (SELECT t2.id AS trade_id,
                  COUNT(DISTINCT h2.price) AS distinct_marks,
                  COUNT(*)                 AS n_marks
           FROM paper_horizon_returns h2
           JOIN paper_trades t2 ON t2.id = h2.paper_trade_id
-          GROUP BY t2.token_address) f ON f.token_address = t.token_address
+          GROUP BY t2.id) f ON f.trade_id = t.id
     WHERE h.return_percent > 1000          -- only the tail can distort a mean
 ),
 y AS (
@@ -824,22 +840,12 @@ LIMIT 15;
 
 \echo ''
 \echo '--- 10e. WHAT THE MEANS BECOME WITHOUT THE REFUTED ROWS ---'
--- TWO FIXES over the first version, both of which made it disagree with 10d.
---
--- 1. It applied only the PHYSICS test and ignored the FROZEN test that 10d
---    applies. So 10d could report a row as frozen while 10e silently kept it
---    in the mean -- which is exactly what happened at 60 minutes, where 10d
---    flagged JE3MdNMM and 10e refuted nothing at all. Two sections of the
---    same report contradicting each other is the defect this whole audit has
---    been about; it does not get an exemption for being mine.
---
--- 2. It used a single arbitrary threshold (10x hourly volume). A conclusion
---    that moves with a number nobody can justify is not a conclusion, so the
---    sensitivity is now shown across three of them. The 1x column is the
---    honest bar: needing MORE than the token's entire hourly volume, counting
---    sells as if they were buys, concentrated into a window a third as long,
---    is already impossible. 10x and 100x are shown so the reader can see the
---    answer does not depend on where the line is drawn.
+-- This is the first-evaluation cohort sensitivity, matching Section 5.
+-- Section 10d is a separate operational scan across every evaluation.
+-- Here, frozen quotes and >1,000% returns are screened per paper trade;
+-- the 1x/10x/100x columns show sensitivity to the volume plausibility bar.
+-- These diagnostics flag suspect prices; they do not prove that every
+-- unflagged quote was executable.
 --
 -- The median column is there to make the point: it does not move at all,
 -- whatever is dropped. That is the argument for reading sections 10 and 10b
@@ -854,12 +860,13 @@ WITH scored AS (
            f.distinct_marks, f.n_marks
     FROM paper_horizon_returns h
     JOIN paper_trades t ON t.id = h.paper_trade_id
-    JOIN (SELECT t2.token_address,
+    JOIN (SELECT t2.id AS trade_id,
                  COUNT(DISTINCT h2.price) AS distinct_marks,
                  COUNT(*)                 AS n_marks
           FROM paper_horizon_returns h2
           JOIN paper_trades t2 ON t2.id = h2.paper_trade_id
-          GROUP BY t2.token_address) f ON f.token_address = t.token_address
+          JOIN first_eval fe2 ON fe2.id = t2.id
+          GROUP BY t2.id) f ON f.trade_id = t.id
     JOIN first_eval fe ON fe.id = t.id
     WHERE h.age_minutes_at_mark <= h.horizon_minutes * :horizon_tolerance
       AND h.price > 0 AND t.price_at_evaluation > 0
@@ -927,8 +934,9 @@ WITH trades AS (
            CASE WHEN t.entry_model = 'LIMIT' THEN t.fill_price
                 ELSE t.price_at_evaluation END AS basis
     FROM paper_trades t
-    WHERE (t.entry_model = 'IMMEDIATE' AND t.price_at_evaluation > 0)
-       OR (t.entry_model = 'LIMIT' AND t.filled_at IS NOT NULL AND t.fill_price > 0)
+    WHERE t.status <> 'INVALID_DATA'
+      AND ((t.entry_model = 'IMMEDIATE' AND t.price_at_evaluation > 0)
+       OR (t.entry_model = 'LIMIT' AND t.filled_at IS NOT NULL AND t.fill_price > 0))
 ),
 path AS (
     SELECT tr.id, tr.token_address, tr.cohort, tr.entry_model, tr.basis,
@@ -984,7 +992,8 @@ WITH trades AS (
     SELECT t.id, t.token_address, t.cohort, t.evaluated_at AS entered,
            t.price_at_evaluation AS basis
     FROM paper_trades t
-    WHERE t.entry_model = 'IMMEDIATE' AND t.price_at_evaluation > 0
+    WHERE t.entry_model = 'IMMEDIATE' AND t.status <> 'INVALID_DATA'
+      AND t.price_at_evaluation > 0
 ),
 mae AS (
     SELECT tr.id, tr.cohort,

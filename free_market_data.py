@@ -70,6 +70,12 @@ JUPITER_PRICE_BASE = os.environ.get("JUPITER_PRICE_BASE", "https://api.jup.ag")
 # memecoin pools genuinely diverge, so this is a staleness/oddity signal to
 # log, not a reason to reject a token.
 PRICE_DISAGREEMENT_WARN_PCT = float(os.environ.get("PRICE_DISAGREEMENT_WARN_PCT", "10"))
+# At a 100% symmetric disagreement, one provider's price is at least 2x the
+# other. That is no longer a minor thin-pool difference: the selected mark is
+# too ambiguous to use for an entry or paper label. Lower the threshold only
+# with evidence from the target venue and token population.
+PRICE_DISAGREEMENT_REJECT_PCT = float(
+    os.environ.get("PRICE_DISAGREEMENT_REJECT_PCT", "100"))
 
 # An honest User-Agent. None of these providers has bot-blocked a plain
 # Python client (verified with test_provider_access.py), unlike GMGN --
@@ -273,8 +279,15 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
     dex_price = dex_data["price_usd"]
     jup_price = jup.get("price_usd")
     price_disagreement = False
-    if dex_price and jup_price and dex_price > 0:
-        delta_pct = abs(jup_price - dex_price) / dex_price * 100.0
+    price_disagreement_pct = None
+    price_data_untrusted = False
+    if dex_price is not None and jup_price is not None:
+        if dex_price <= 0 or jup_price <= 0:
+            delta_pct = float("inf")
+        else:
+            lower_price = min(dex_price, jup_price)
+            delta_pct = (max(dex_price, jup_price) / lower_price - 1.0) * 100.0
+        price_disagreement_pct = round(delta_pct, 3) if delta_pct != float("inf") else delta_pct
         if delta_pct > PRICE_DISAGREEMENT_WARN_PCT:
             price_disagreement = True
             logger.warning(
@@ -282,6 +295,11 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
                 f"vs Jupiter ${jup_price} ({delta_pct:.1f}% apart). Using DexScreener's, since "
                 f"that's the pool the slippage estimate is quoted against."
             )
+        if delta_pct > PRICE_DISAGREEMENT_REJECT_PCT:
+            price_data_untrusted = True
+            logger.error(
+                f"Quarantining {token_address}: independent price sources differ by "
+                f"{delta_pct:.1f}% (limit {PRICE_DISAGREEMENT_REJECT_PCT:.1f}%).")
 
     # RugCheck's figure is this provider's reading. The chain measurements
     # ride alongside it, unused by any gate, so the wallet-vs-RugCheck gap
@@ -342,4 +360,9 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
         "_social_data_missing": True,   # no free source; see README
         "_depth_data_missing": tradeable_depth is None,
         "_price_disagreement": price_disagreement,
+        "_price_disagreement_pct": price_disagreement_pct,
+        "_price_data_untrusted": price_data_untrusted,
+        "_price_dex_usd": dex_price,
+        "_price_jupiter_usd": jup_price,
+        "_price_pair_address": dex_data.get("pair_address"),
     }

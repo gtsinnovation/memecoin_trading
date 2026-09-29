@@ -79,7 +79,10 @@ services:
       retries: 3
       start_period: 120s
     ports:
-      - "8000:8000"
+      # The public-facing route must terminate TLS at a reverse proxy. Keep
+      # the app itself reachable only from the host so port 8000 cannot
+      # bypass that proxy and expose the session over plain HTTP.
+      - "127.0.0.1:8000:8000"
     environment:
       # Same required variable as the db service, so the two cannot drift.
       # Hex only (openssl rand -hex 24): characters like @ : / # would break
@@ -130,6 +133,14 @@ services:
       - JUPITER_API_BASE=${JUPITER_API_BASE:-https://api.jup.ag}
       - DEXSCREENER_API_BASE=${DEXSCREENER_API_BASE:-https://api.dexscreener.com}
       - SLIPPAGE_PROBE_USD=${SLIPPAGE_PROBE_USD:-500}
+      - PRICE_DISAGREEMENT_WARN_PCT=${PRICE_DISAGREEMENT_WARN_PCT:-10}
+      - PRICE_DISAGREEMENT_REJECT_PCT=${PRICE_DISAGREEMENT_REJECT_PCT:-100}
+      # Per-trade notional is bounded by stressed stop loss as a share of
+      # reference equity, then by depth and the hard notional cap.
+      - REFERENCE_EQUITY_USD=${REFERENCE_EQUITY_USD:-1000}
+      - MAX_TRADE_RISK_PERCENT=${MAX_TRADE_RISK_PERCENT:-0.5}
+      - STRESSED_ROUND_TRIP_COST_PERCENT=${STRESSED_ROUND_TRIP_COST_PERCENT:-6.5}
+      - MAX_POSITION_NOTIONAL_USD=${MAX_POSITION_NOTIONAL_USD:-1000}
       # Optional -- see .env.example. Without it, social_volume_score is a
       # labeled placeholder, not real data.
       - LUNARCRUSH_API_KEY=${LUNARCRUSH_API_KEY:-}

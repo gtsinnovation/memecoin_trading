@@ -178,7 +178,7 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     cohort VARCHAR(20) NOT NULL,            -- 'APPROVED' or 'REJECTED'
     rejected_by VARCHAR(40),                -- which gate short-circuited; NULL when approved
     entry_model VARCHAR(20) NOT NULL,       -- 'IMMEDIATE' or 'LIMIT'
-    status VARCHAR(20) NOT NULL,            -- 'PENDING_FILL', 'OPEN', 'CLOSED', 'EXPIRED'
+    status VARCHAR(20) NOT NULL,            -- PENDING_FILL, OPEN, CLOSED, EXPIRED, ABANDONED, INVALID_DATA
     price_at_evaluation NUMERIC NOT NULL,
     entry_trigger_price NUMERIC NOT NULL,
     target_exit_price NUMERIC NOT NULL,

@@ -398,11 +398,16 @@ def record_candidate(conn, snapshot: Dict[str, Any], final_state: Dict[str, Any]
     # level set gave the IMMEDIATE arm a 0.5:1 reward:risk while LIMIT got
     # 2:1, so the two arms were never comparable -- see compute_levels().
     imm_entry, imm_stop, imm_target = compute_levels(price, "IMMEDIATE")
+    price_untrusted = bool(final_state.get("price_data_untrusted"))
     rows = [
-        # IMMEDIATE is filled on the spot at the evaluation price.
-        ("IMMEDIATE", "OPEN", price, imm_entry, imm_stop, imm_target),
-        # LIMIT waits for the pullback and may never fill.
-        ("LIMIT", "PENDING_FILL", None, entry, stop, target),
+        # An untrusted initial quote is kept in the rejection dataset but is
+        # never treated as a fill or allowed to generate return labels.
+        ("IMMEDIATE", "INVALID_DATA" if price_untrusted else "OPEN",
+         None if price_untrusted else price, imm_entry, imm_stop, imm_target),
+        # LIMIT waits for the pullback and may never fill. It also cannot be
+        # simulated from a price that failed the source-integrity check.
+        ("LIMIT", "INVALID_DATA" if price_untrusted else "PENDING_FILL",
+         None, entry, stop, target),
     ]
     with conn.cursor() as cur:
         for entry_model, status, fill_price, row_entry, row_stop, row_target in rows:
@@ -492,6 +497,7 @@ def open_token_addresses(conn) -> List[str]:
             FROM paper_trades t
             WHERE t.status IN ('PENDING_FILL', 'OPEN')
                OR (t.entry_model = 'IMMEDIATE'
+                   AND t.status <> 'INVALID_DATA'
                    AND t.evaluated_at > CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute')
                    AND (SELECT COUNT(*) FROM paper_horizon_returns h
                         WHERE h.paper_trade_id = t.id) < %s)
@@ -505,7 +511,8 @@ def open_token_addresses(conn) -> List[str]:
                -- had already cut short. Pricing is a superset of what it was:
                -- mark_to_market and mark_horizons ignore addresses they have
                -- no due row for, so the only effect is more path samples.
-               OR t.evaluated_at > CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute');
+               OR (t.evaluated_at > CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute')
+                   AND t.status <> 'INVALID_DATA');
         """, (_max_horizon_window(), len(HORIZONS_MINUTES), PATH_WINDOW_MINUTES))
         return [r[0] for r in cur.fetchall()]
 
@@ -613,6 +620,7 @@ def mark_horizons(conn, prices: Dict[str, float]) -> Dict[int, int]:
                    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - t.evaluated_at))/60.0 AS age_min
             FROM paper_trades t
             WHERE t.entry_model = 'IMMEDIATE'
+              AND t.status <> 'INVALID_DATA'
               AND t.evaluated_at > CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute')
               AND (SELECT COUNT(*) FROM paper_horizon_returns h
                    WHERE h.paper_trade_id = t.id) < %s;
