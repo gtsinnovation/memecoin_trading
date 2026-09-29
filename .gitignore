@@ -43,3 +43,4 @@ run*.txt
 !.env.example
 web-crash.txt
 *.log
+*.txt
