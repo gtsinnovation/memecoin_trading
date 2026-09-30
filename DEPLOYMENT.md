@@ -179,24 +179,40 @@ port 8000 stays closed to the internet.
 
 ## Applying schema changes later
 
-If you ever update `schema.sql` after this database volume already
-exists, Postgres will **not** re-run it automatically — that only happens
-the first time a volume is created. Apply the change by hand instead:
-```
-docker compose exec -T db psql -U postgres -d memecoin_trading < migrate.sql
-docker compose restart web
-```
-`migrate.sql` is written to be safe to re-run (it only adds what's
-missing) and won't touch data already in the tables.
+The `migrate` Compose service runs the idempotent `migrate.sql` before the
+web app or signer starts. When deploying a changed migration, force-recreate
+that one-shot service so Compose runs it again, then recreate the app:
 
+```
+docker compose up -d --build --force-recreate migrate web
+```
+
+The web service waits for a successful migration and will not start against
+an outdated schema. The signer has the same dependency. The migration uses
+`ON_ERROR_STOP`, so any SQL error leaves the service failed and blocks both.
+
+For a manual run from PowerShell:
+
+```
+Get-Content .\migrate.sql | docker compose exec -T db psql -v ON_ERROR_STOP=1 -U postgres -d memecoin_trading
+if ($LASTEXITCODE -ne 0) { throw 'Database migration failed.' }
+```
+
+For Linux/macOS:
+
+```
+docker compose exec -T db psql -v ON_ERROR_STOP=1 -U postgres -d memecoin_trading < migrate.sql
+```
+
+`migrate.sql` is safe to rerun and does not recreate or erase the database volume.
 ## Updating the app
 
 ```
 cd /opt/trading-app
 # pull or re-upload your changed files, then:
-docker compose up -d --build
+docker compose up -d --build --force-recreate migrate web
 ```
-This rebuilds only the `web` image; `db` and its data volume are
+This rebuilds the web image and reruns the migration job before web starts; `db` and its data volume are
 untouched unless you explicitly run `docker compose down -v` (which
 deletes the volume — see the schema-changes note above for the
 non-destructive path).

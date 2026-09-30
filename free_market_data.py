@@ -54,7 +54,6 @@ import holder_concentration
 from market_data import (
     sanitize_external_text,
     onchain_flow_velocity_proxy,
-    fetch_price_impact_pct,
     fetch_dex_pair_data,
     jupiter_throttle,
     bounded_cache_put,
@@ -260,10 +259,9 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
     if dex_data is None:
         return None
 
-    rug, jup, price_impact, chain = await asyncio.gather(
+    rug, jup, chain = await asyncio.gather(
         fetch_rugcheck_report(client, token_address),
         fetch_jupiter_token_data(client, token_address),
-        fetch_price_impact_pct(client, token_address),
         holder_concentration.observe_chain(client, token_address),
     )
     rug = rug or {}
@@ -318,7 +316,7 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
         "pool_liquidity_usd": tvl_usd,
         "social_volume_score": 0.0,   # still unsolved by any free source
         "onchain_flow_velocity": onchain_flow_velocity_proxy(dex_data["volume_h1"], tvl_usd),
-        "estimated_slippage_percent": price_impact if price_impact is not None else 0.0,
+        "estimated_slippage_percent": 0.0,  # main fills this after risk/depth sizing
         "onchain_volume_increasing": dex_data["volume_h1"] * 24.0 > dex_data["volume_h24"],
 
         # --- new: honest depth, used for sizing (see module docstring) ---
@@ -356,7 +354,7 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
 
         # --- flags: main.py pops these before the agent network sees them ---
         **holder_fields,
-        "_slippage_data_missing": price_impact is None,
+        "_slippage_data_missing": True,  # main performs the size-aware Jupiter quote
         "_social_data_missing": True,   # no free source; see README
         "_depth_data_missing": tradeable_depth is None,
         "_price_disagreement": price_disagreement,

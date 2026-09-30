@@ -51,6 +51,9 @@ from typing import Optional, Dict, Any, List, Tuple
 
 logger = logging.getLogger("paper_trading")
 
+# Persisted on each row so evaluation results can be split across price-method fixes.
+PRICE_VALIDATION_VERSION = "pair-side-aware-v1"
+
 # Round-trip DEX fee, charged per side. Solana AMM fees are commonly
 # 0.25-1%; the default is deliberately at the low end so the experiment
 # isn't accused of being rigged pessimistic -- raise it to be stricter.
@@ -103,7 +106,10 @@ PATH_WINDOW_MINUTES = max(
 # the apparent variance, and let a handful of tokens masquerade as a
 # statistically meaningful result. This is the difference between measuring
 # the gates and measuring the same coin flip repeatedly.
-REENTRY_COOLDOWN_MINUTES = float(os.environ.get("PAPER_REENTRY_COOLDOWN_MINUTES", "60"))
+REENTRY_COOLDOWN_MINUTES = max(
+    float(os.environ.get("PAPER_REENTRY_COOLDOWN_MINUTES", "60")),
+    PATH_WINDOW_MINUTES,
+)
 
 # How long a live trade may go WITHOUT A PRICE before it is abandoned.
 #
@@ -321,6 +327,12 @@ def record_candidate(conn, snapshot: Dict[str, Any], final_state: Dict[str, Any]
     token_address = snapshot.get("token_address")
     if not token_address:
         return
+    pair_address = snapshot.get("price_pair_address")
+    if not pair_address:
+        # Preserve the evaluated opportunity for coverage accounting, but do
+        # not let it create a return label from an unpinned pool.
+        logger.warning("Recording candidate as INVALID_DATA without pool identity: %s",
+                       token_address)
 
     # One observation per token per opportunity -- see REENTRY_COOLDOWN_MINUTES.
     with conn.cursor() as cur:
@@ -398,7 +410,7 @@ def record_candidate(conn, snapshot: Dict[str, Any], final_state: Dict[str, Any]
     # level set gave the IMMEDIATE arm a 0.5:1 reward:risk while LIMIT got
     # 2:1, so the two arms were never comparable -- see compute_levels().
     imm_entry, imm_stop, imm_target = compute_levels(price, "IMMEDIATE")
-    price_untrusted = bool(final_state.get("price_data_untrusted"))
+    price_untrusted = bool(final_state.get("price_data_untrusted")) or not pair_address
     rows = [
         # An untrusted initial quote is kept in the rejection dataset but is
         # never treated as a fill or allowed to generate return labels.
@@ -419,9 +431,9 @@ def record_candidate(conn, snapshot: Dict[str, Any], final_state: Dict[str, Any]
             try:
                 cur.execute("""
                 INSERT INTO paper_trades (
-                    token_address, token_symbol, cohort, rejected_by, entry_model, status,
+                    token_address, pair_address, token_symbol, cohort, rejected_by, entry_model, status,
                     price_at_evaluation, entry_trigger_price, target_exit_price,
-                    invalidation_level_price, assumed_slippage_percent,
+                    invalidation_level_price, assumed_slippage_percent, slippage_probe_usd,
                     fill_price, filled_at, last_price, last_marked_at,
                     volume_h1_usd, txns_h1, txns_h1_buys, txns_h1_sells,
                     tradeable_depth_usd,
@@ -431,19 +443,19 @@ def record_candidate(conn, snapshot: Dict[str, Any], final_state: Dict[str, Any]
                     holder_concentration_source, holder_pct_provider,
                     holder_pct_chain_raw, holder_pct_chain_wallet,
                     holder_pct_chain_program, holder_pct_chain_burn,
-                    discovery_source
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                    discovery_source, price_validation_version
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                           CASE WHEN %s IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END,
                           %s, CURRENT_TIMESTAMP, %s, %s, %s, %s, %s,
                           %s, %s, %s, %s, %s,
                           %s,
                           %s, %s, %s, %s, %s, %s,
-                          %s);
+                          %s, %s);
                 """, (
-                    token_address, snapshot.get("token_symbol"),
+                    token_address, pair_address, snapshot.get("token_symbol"),
                     cohort, rejected_by, entry_model, status,
                     price, row_entry, row_target, row_stop, slippage,
-                    fill_price, fill_price, price,
+                    snapshot.get("slippage_probe_usd"), fill_price, fill_price, price,
                     volume_h1, txns,
                     int(buys) if buys is not None else None,
                     int(sells) if sells is not None else None,
@@ -455,7 +467,7 @@ def record_candidate(conn, snapshot: Dict[str, Any], final_state: Dict[str, Any]
                     reject_reason,
                     holder_source, holder_provider,
                     holder_raw, holder_wallet, holder_program, holder_burn,
-                    snapshot.get("discovery_source"),
+                    snapshot.get("discovery_source"), PRICE_VALIDATION_VERSION,
                 ))
             except Exception as e:
                 cur.execute("ROLLBACK TO SAVEPOINT paper_row;")
@@ -481,7 +493,7 @@ def record_candidate(conn, snapshot: Dict[str, Any], final_state: Dict[str, Any]
                 cur.execute("RELEASE SAVEPOINT paper_row;")
 
 
-def open_token_addresses(conn) -> List[str]:
+def open_token_pool_map(conn) -> Dict[str, Optional[str]]:
     """Every token still needing a price mark, for either measurement.
 
     Two reasons a token qualifies, and the second is easy to miss: a barrier
@@ -493,7 +505,7 @@ def open_token_addresses(conn) -> List[str]:
     """
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT DISTINCT t.token_address
+            SELECT t.token_address, t.pair_address
             FROM paper_trades t
             WHERE t.status IN ('PENDING_FILL', 'OPEN')
                OR (t.entry_model = 'IMMEDIATE'
@@ -514,7 +526,28 @@ def open_token_addresses(conn) -> List[str]:
                OR (t.evaluated_at > CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute')
                    AND t.status <> 'INVALID_DATA');
         """, (_max_horizon_window(), len(HORIZONS_MINUTES), PATH_WINDOW_MINUTES))
-        return [r[0] for r in cur.fetchall()]
+        by_token: Dict[str, set] = {}
+        for addr, pair in cur.fetchall():
+            by_token.setdefault(addr, set()).add(pair)
+        # Refuse an ambiguous token rather than price old and new pools as
+        # one series. New evaluation cooldown spans the complete path window.
+        ambiguous = [addr for addr, pairs in by_token.items()
+                     if len([pair for pair in pairs if pair is not None]) > 1]
+        unidentified = {addr for addr, pairs in by_token.items() if None in pairs}
+        for addr in ambiguous:
+            logger.warning("Skipping ambiguous paper pool marks for %s", addr)
+        # A provider-selected current pool cannot be used to mark a legacy
+        # trade whose original pool was never recorded. Leave it out of the
+        # request; mark_to_market will age it to ABANDONED/EXPIRED without
+        # inventing a fill or P&L.
+        return {addr: next(iter(pairs))
+                for addr, pairs in by_token.items()
+                if addr not in ambiguous and addr not in unidentified}
+
+
+def open_token_addresses(conn) -> List[str]:
+    """Compatibility wrapper for callers needing only token addresses."""
+    return list(open_token_pool_map(conn))
 
 
 # Keys mark_horizons() uses for dropout accounting. Negative so they cannot
@@ -589,6 +622,23 @@ def _finite_positive(value) -> Optional[float]:
     return v
 
 
+def _finite_nonnegative(value) -> Optional[float]:
+    """A finite nonnegative market measurement, preserving a reported zero."""
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) and v >= 0 else None
+
+
+def _nonnegative_int(value) -> Optional[int]:
+    """A nonnegative transaction count, or None for absent/invalid evidence."""
+    number = _finite_nonnegative(value)
+    return int(number) if number is not None and number.is_integer() else None
+
+
 def mark_horizons(conn, prices: Dict[str, float]) -> Dict[int, int]:
     """Records each evaluation's return at every horizon that has elapsed.
 
@@ -611,12 +661,12 @@ def mark_horizons(conn, prices: Dict[str, float]) -> Dict[int, int]:
     marks: Dict[int, int] = {}
     # Negative keys cannot collide with a horizon in minutes.
     DROPPED_NO_PRICE, DROPPED_NO_BASIS, DUE_TOTAL = -1, -2, -3
-    if not prices or not HORIZONS_MINUTES:
+    if not HORIZONS_MINUTES:
         return marks
 
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT t.id, t.token_address, t.price_at_evaluation,
+            SELECT t.id, t.token_address, t.pair_address, t.price_at_evaluation,
                    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - t.evaluated_at))/60.0 AS age_min
             FROM paper_trades t
             WHERE t.entry_model = 'IMMEDIATE'
@@ -627,7 +677,7 @@ def mark_horizons(conn, prices: Dict[str, float]) -> Dict[int, int]:
         """, (_max_horizon_window(), len(HORIZONS_MINUTES)))
         due = cur.fetchall()
 
-        for tid, addr, basis, age_min in due:
+        for tid, addr, pair, basis, age_min in due:
             # PATH EXTREMES FIRST, before any `continue`. mark_to_market stops
             # updating a trade the moment it closes, so this function -- which
             # keeps pricing a token for the whole horizon window regardless of
@@ -638,7 +688,23 @@ def mark_horizons(conn, prices: Dict[str, float]) -> Dict[int, int]:
             # a trade stopped at minute 5 recorded nothing between minute 5 and
             # minute 30, which is exactly the window where "did it recover
             # after stopping us out" is decided.
-            px = _finite_positive(prices.get(addr))
+            mark = prices.get(addr)
+            mark_pair = mark.get("pair_address") if isinstance(mark, dict) else None
+            px = _finite_positive(mark.get("price") if isinstance(mark, dict) else mark)
+            if not pair or mark_pair != pair:
+                px = None
+            mark_liquidity = _finite_nonnegative(
+                mark.get("liquidity_usd") if isinstance(mark, dict) else None
+            ) if px is not None else None
+            mark_volume_h1 = _finite_nonnegative(
+                mark.get("volume_h1_usd") if isinstance(mark, dict) else None
+            ) if px is not None else None
+            mark_txns_m5 = _nonnegative_int(
+                mark.get("txns_m5") if isinstance(mark, dict) else None
+            ) if px is not None else None
+            mark_txns_h1 = _nonnegative_int(
+                mark.get("txns_h1") if isinstance(mark, dict) else None
+            ) if px is not None else None
             if px is not None:
                 cur.execute("""
                     UPDATE paper_trades
@@ -655,7 +721,13 @@ def mark_horizons(conn, prices: Dict[str, float]) -> Dict[int, int]:
             if not horizon_elapsed(age_min):
                 continue
             marks[DUE_TOTAL] = marks.get(DUE_TOTAL, 0) + 1
-            price = prices.get(addr)
+            # Use the same validated value used for path/context recording.
+            # Reading the raw provider field here let NaN and infinity produce
+            # non-finite horizon returns even though _finite_positive() had
+            # already rejected them above.
+            price = px
+            if not pair or mark_pair != pair:
+                price = None
             verdict = classify_horizon_row(price, basis)
             if verdict == "DROPPED_NO_PRICE":
                 marks[DROPPED_NO_PRICE] = marks.get(DROPPED_NO_PRICE, 0) + 1
@@ -673,10 +745,12 @@ def mark_horizons(conn, prices: Dict[str, float]) -> Dict[int, int]:
                 cur.execute("""
                     INSERT INTO paper_horizon_returns
                         (paper_trade_id, horizon_minutes, price, return_percent,
-                         age_minutes_at_mark)
-                    VALUES (%s,%s,%s,%s,%s)
+                         age_minutes_at_mark, mark_liquidity_usd,
+                         mark_volume_h1_usd, mark_txns_m5, mark_txns_h1)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (paper_trade_id, horizon_minutes) DO NOTHING;
-                """, (tid, horizon, float(price), round(ret, 4), round(age, 2)))
+                """, (tid, horizon, float(price), round(ret, 4), round(age, 2),
+                      mark_liquidity, mark_volume_h1, mark_txns_m5, mark_txns_h1))
                 # Explicitly > 0: DB-API allows -1 for "unknown", and -1 is
                 # truthy, which would count conflict-skipped rows as new marks.
                 if cur.rowcount is not None and cur.rowcount > 0:
@@ -720,13 +794,15 @@ def _as_mark(value) -> tuple:
 
     fetch_current_marks_sync returns the richer form; a bare float is still
     accepted so every existing caller and fixture keeps working -- it simply
-    carries no evidence, which lands as `exit_confirmed = NULL`.
+    carries no evidence, which lands as `exit_confirmed = NULL`. Invalid prices
+    are treated as unavailable so NaN/inf cannot bypass comparisons and enter
+    path samples, horizon returns, or exit accounting.
     """
     if isinstance(value, dict):
-        price = value.get("price")
-        return (None if price is None else float(price),
+        price = _finite_positive(value.get("price"))
+        return (price,
                 value.get("txns_m5"), value.get("txns_h1"))
-    return (float(value), None, None)
+    return (_finite_positive(value), None, None)
 
 
 def barrier_exit(price: float, target: Optional[float],
@@ -825,14 +901,17 @@ def record_path_samples(conn, prices: Dict[str, Any]) -> int:
         price, _, _ = _as_mark(value) if value is not None else (None, None, None)
         if price is None or price <= 0:
             continue
-        rows.append((addr, float(price)))
+        pair = value.get("pair_address") if isinstance(value, dict) else None
+        if not pair:
+            continue
+        rows.append((addr, pair, float(price)))
     if not rows:
         return 0
 
-    values = ",".join(["(%s,%s::numeric)"] * len(rows))
+    values = ",".join(["(%s,%s,%s::numeric)"] * len(rows))
     params: list = []
-    for addr, price in rows:
-        params.extend([addr, price])
+    for addr, pair, price in rows:
+        params.extend([addr, pair, price])
     params.append(PATH_SAMPLE_SECONDS)
     # SAVEPOINT, because catching the exception is not enough on its own.
     # psycopg2 marks the whole transaction ABORTED on any failed statement,
@@ -860,12 +939,13 @@ def record_path_samples(conn, prices: Dict[str, Any]) -> int:
     try:
         with conn.cursor() as cur:
             cur.execute(f"""
-                INSERT INTO paper_price_path (token_address, price)
-                SELECT v.addr, v.px
-                FROM (VALUES {values}) AS v(addr, px)
+                INSERT INTO paper_price_path (token_address, pair_address, price)
+                SELECT v.addr, v.pair, v.px
+                FROM (VALUES {values}) AS v(addr, pair, px)
                 WHERE NOT EXISTS (
                     SELECT 1 FROM paper_price_path p
                     WHERE p.token_address = v.addr
+                      AND p.pair_address IS NOT DISTINCT FROM v.pair
                       AND p.observed_at > CURRENT_TIMESTAMP
                                           - (%s * INTERVAL '1 second')
                 );
@@ -909,7 +989,7 @@ def mark_to_market(conn, prices: Dict[str, float]) -> Dict[str, int]:
 
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT id, token_address, entry_model, status, entry_trigger_price,
+            SELECT id, token_address, pair_address, entry_model, status, entry_trigger_price,
                    target_exit_price, invalidation_level_price, fill_price,
                    assumed_slippage_percent,
                    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - evaluated_at))/60.0 AS age_min,
@@ -923,10 +1003,13 @@ def mark_to_market(conn, prices: Dict[str, float]) -> Dict[str, int]:
         """)
         live = cur.fetchall()
 
-        for (tid, addr, entry_model, status, trigger, target, stop,
+        for (tid, addr, pair, entry_model, status, trigger, target, stop,
              fill_price, slippage, age_min, held_min, silent_min) in live:
-            price, txns_m5, txns_h1 = _as_mark(prices.get(addr)) \
+            mark = prices.get(addr)
+            price, txns_m5, txns_h1 = _as_mark(mark) \
                 if prices.get(addr) is not None else (None, None, None)
+            if not pair or (not isinstance(mark, dict) or mark.get("pair_address") != pair):
+                price, txns_m5, txns_h1 = None, None, None
             if price is None:
                 # A limit order that never filled inside its window is
                 # EXPIRED, and that is knowable WITHOUT a price -- "the trigger
@@ -1118,6 +1201,7 @@ def results_summary(conn) -> List[Dict[str, Any]]:
                        FILTER (WHERE status = 'CLOSED' AND exit_confirmed IS TRUE)::numeric, 2)
                        AS median_net_confirmed
             FROM paper_trades
+            WHERE pair_address IS NOT NULL
             GROUP BY cohort, entry_model
             ORDER BY cohort, entry_model;
         """)
@@ -1136,6 +1220,7 @@ def results_summary(conn) -> List[Dict[str, Any]]:
                 SELECT cohort, entry_model, token_address,
                        AVG(net_pnl_percent) AS net
                 FROM paper_trades WHERE status = 'CLOSED'
+                  AND pair_address IS NOT NULL
                 GROUP BY 1, 2, 3
             )
             SELECT cohort, entry_model,
@@ -1222,6 +1307,7 @@ def horizon_summary(conn, min_txns_h1: Optional[int] = None) -> List[Dict[str, A
             WITH first_eval AS (
                 SELECT DISTINCT ON (token_address) id
                 FROM paper_trades WHERE entry_model = 'IMMEDIATE'
+                  AND pair_address IS NOT NULL
                 ORDER BY token_address, evaluated_at, id
             ),
             marks AS (
@@ -1233,7 +1319,8 @@ def horizon_summary(conn, min_txns_h1: Optional[int] = None) -> List[Dict[str, A
                 FROM paper_horizon_returns h
                 JOIN paper_trades t ON t.id = h.paper_trade_id
                 JOIN first_eval f ON f.id = t.id
-                WHERE h.age_minutes_at_mark <= h.horizon_minutes * %s
+                WHERE t.pair_address IS NOT NULL
+                  AND h.age_minutes_at_mark <= h.horizon_minutes * %s
                   AND (%s IS NULL OR t.txns_h1 >= %s)
             ),
             -- ONE ROW PER TOKEN. Averaging marks let a token that lingered in
@@ -1319,10 +1406,12 @@ def staleness_report(conn) -> List[Dict[str, Any]]:
                    (SELECT ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x.v)::numeric, 0)
                       FROM (SELECT AVG(t2.txns_h1) AS v FROM paper_trades t2
                              WHERE t2.entry_model = 'IMMEDIATE' AND t2.cohort = t.cohort
+                               AND t2.pair_address IS NOT NULL
                              GROUP BY t2.token_address) x) AS median_txns_h1,
                    (SELECT ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x.v)::numeric, 0)
                       FROM (SELECT AVG(t2.volume_h1_usd) AS v FROM paper_trades t2
                              WHERE t2.entry_model = 'IMMEDIATE' AND t2.cohort = t.cohort
+                               AND t2.pair_address IS NOT NULL
                              GROUP BY t2.token_address) x) AS median_volume_h1,
                    -- Zero-return marks, restricted to marks taken INSIDE their
                    -- horizon window. An unrestricted count swept in marks taken
@@ -1351,6 +1440,7 @@ def staleness_report(conn) -> List[Dict[str, Any]]:
             FROM paper_trades t
             LEFT JOIN paper_horizon_returns h ON h.paper_trade_id = t.id
             WHERE t.entry_model = 'IMMEDIATE'
+              AND t.pair_address IS NOT NULL
             GROUP BY t.cohort
             ORDER BY t.cohort;
         """, (HORIZON_TOLERANCE, HORIZON_TOLERANCE))
@@ -1423,7 +1513,8 @@ def feature_correlations(conn, horizon_minutes: Optional[int] = None) -> List[Di
                            ({expr})          AS feat
                     FROM paper_horizon_returns h
                     JOIN paper_trades t ON t.id = h.paper_trade_id
-                    WHERE h.age_minutes_at_mark <= h.horizon_minutes * %s
+                    WHERE t.pair_address IS NOT NULL
+                      AND h.age_minutes_at_mark <= h.horizon_minutes * %s
                       AND (%s IS NULL OR h.horizon_minutes = %s)
                       AND ({expr}) IS NOT NULL
                 ),

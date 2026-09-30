@@ -45,6 +45,24 @@ services:
       timeout: 5s
       retries: 5
 
+  migrate:
+    image: postgres:15-alpine
+    restart: "no"
+    logging: *default-logging
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env -- see .env.example}
+    volumes:
+      - ./migrate.sql:/migrations/migrate.sql:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    command:
+      - psql
+      - --set=ON_ERROR_STOP=1
+      - --host=db
+      - --username=postgres
+      - --dbname=memecoin_trading
+      - --file=/migrations/migrate.sql
   web:
     build: .
     container_name: trading_agent_network
@@ -132,6 +150,7 @@ services:
       - SOLANA_RPC_X_TOKEN=${SOLANA_RPC_X_TOKEN:-}
       - JUPITER_API_BASE=${JUPITER_API_BASE:-https://api.jup.ag}
       - DEXSCREENER_API_BASE=${DEXSCREENER_API_BASE:-https://api.dexscreener.com}
+      # Fallback only; main supplies the risk/depth-capped quote amount.
       - SLIPPAGE_PROBE_USD=${SLIPPAGE_PROBE_USD:-500}
       - PRICE_DISAGREEMENT_WARN_PCT=${PRICE_DISAGREEMENT_WARN_PCT:-10}
       - PRICE_DISAGREEMENT_REJECT_PCT=${PRICE_DISAGREEMENT_REJECT_PCT:-100}
@@ -231,7 +250,9 @@ services:
       # included on purpose so every cell has an anchor to compare against.
       - REPLAY_STOPS=${REPLAY_STOPS:-3,5,7.53,10,15,20}
       - REPLAY_TARGETS=${REPLAY_TARGETS:-3,5,7.5,10,15.06,25}
-      - REPLAY_MIN_SAMPLES=${REPLAY_MIN_SAMPLES:-3}
+      # Include even one post-entry sample so quickly-stopped pricing is not
+      # silently excluded from the replay population.
+      - REPLAY_MIN_SAMPLES=${REPLAY_MIN_SAMPLES:-1}
       - JUPITER_MIN_AGE_MINUTES=${JUPITER_MIN_AGE_MINUTES:-15}
       - JUPITER_MAX_AGE_MINUTES=${JUPITER_MAX_AGE_MINUTES:-90}
       - JUPITER_MIN_INTERVAL_S=${JUPITER_MIN_INTERVAL_S:-1.1}
@@ -284,6 +305,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   # Stage 3 (real signing -- see STAGE3_SETUP.md). A deliberately separate
   # service/container from "web": it is the only place Turnkey credentials
@@ -324,6 +347,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     # No "ports:" mapping on purpose -- this service is reachable only
     # from other containers on the compose network (i.e. "web"), never
     # from the host or the internet.

@@ -90,7 +90,7 @@ free, keyless sources:
 | Field | Source | Notes |
 |---|---|---|
 | Price, liquidity, 1h/24h volume | [DexScreener](https://docs.dexscreener.com/api/reference) | Only covers tokens with an indexed trading pair — a brand-new pre-graduation pump.fun token may not show up yet. |
-| Estimated slippage (`estimated_slippage_percent`) | [Jupiter's quote endpoint](https://dev.jup.ag/docs/swap-api/get-quote) | Price impact for a hypothetical `SLIPPAGE_PROBE_USD`-sized swap, not your actual position size. |
+| Estimated slippage (`estimated_slippage_percent`) | [Jupiter's quote endpoint](https://dev.jup.ag/docs/swap-api/get-quote) | Quoted at the risk/depth-capped notional G_ANCHOR can approve; the quote notional is stored in `slippage_probe_usd`. This remains a route quote, not a realized fill. |
 | Top-10 holder concentration and rug signals | RugCheck | Provider-derived metrics; the legacy DexScreener provider uses Solana JSON-RPC for holder concentration instead. |
 | Social/hype volume (`social_volume_score`) | Not used by current pipeline gate | `free_market_data.py` supplies a placeholder score; current `E_BREADTH` does not use it. Do not interpret it as measured social activity. |
 
@@ -103,7 +103,12 @@ or return label. Periodic position and horizon marks still need pool identity
 checks.
 
 Position sizing applies the lesser of 1% of one-sided tradeable depth, the
-notional cap, and a loss-budget cap. Defaults are $1,000 reference equity,
+notional cap, and a loss-budget cap. New entries also share a hard aggregate
+allocation ceiling equal to `REFERENCE_EQUITY_USD`; the dashboard's total
+capital setting can tighten, but cannot raise, that ceiling. Reservation and
+insertion are serialized on the app-settings row so concurrent entries cannot
+spend the same remaining headroom. Existing positions are not liquidated if
+they already exceed the ceiling. Defaults are $1,000 reference equity,
 0.5% equity risk, a 7.53% stop, and 6.5% stressed round-trip costs; that
 limits notional to about $35.63 per position before gap risk. Set the
 `REFERENCE_EQUITY_USD`, `MAX_TRADE_RISK_PERCENT`,
@@ -116,7 +121,7 @@ the default `ENABLE_TOKEN_DISCOVERY=true`, discovery supplies candidates
 when the watchlist is empty. If discovery is disabled and the watchlist is
 empty, the pipeline idles. See `.env.example` for tunable env vars such as
 `SOLANA_RPC_URL`, `JUPITER_API_BASE`, `DEXSCREENER_API_BASE`, and
-`SLIPPAGE_PROBE_USD`.
+`SLIPPAGE_PROBE_USD` (fallback for direct helper calls; the pipeline supplies its calculated size).
 
 If a watchlisted token has no indexed DexScreener pair yet (or a lookup
 fails outright), that tick is skipped for that token rather than
@@ -221,8 +226,11 @@ Three independent layers decide whether anything actually gets signed:
    from earlier stages) — decides whether to open a position at all.
 2. **The signer service's own re-validation**
    (`signer_service/policy_guard.py`) — authenticates the caller (an HMAC
-   over every request, `signer_auth.py`), refuses any `client_order_id` it
-   has seen before (its own `signer_orders` ledger), checks the pipeline
+   over every request, `signer_auth.py`), binds every `client_order_id` to
+   its original token, amount, and network in the signer's own
+   `signer_orders` ledger. An exact retry returns the first outcome without
+   signing again; reusing the key with changed order details returns a
+   signature-free `IDEMPOTENCY_CONFLICT`. It also checks the pipeline
    really reserved this exact order, verifies the RPC's genesis hash, and
    applies caps from **its own environment** — per trade, total deployed,
    24h notional and 24h order count, plus the pre-signature rails in

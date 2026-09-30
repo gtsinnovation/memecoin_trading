@@ -7,7 +7,17 @@ prints a mean. A Spearman coefficient computed from min-ranks is still a
 number between -1 and 1. Nothing errors; the answer is just wrong, in a
 direction that flatters the strategy.
 """
+import hashlib
+
 from .harness import Suite, make_address
+
+
+_PAIR_BY_TOKEN = {}
+
+def _pair_for(addr):
+    # Stable, structurally valid fixture identity; never use a real pool.
+    seed = int.from_bytes(hashlib.sha256(addr.encode("utf-8")).digest()[:4], "big")
+    return make_address(seed)
 
 
 def _snap(addr, price=1.0, slip=0.4, slip_missing=False, txns=(300, 200)):
@@ -16,7 +26,8 @@ def _snap(addr, price=1.0, slip=0.4, slip_missing=False, txns=(300, 200)):
             "volume_h1_usd": 50000.0, "txns_h1_buys": txns[0], "txns_h1_sells": txns[1],
             "tradeable_depth_usd": 30000.0, "volume_m5_usd": 900.0,
             "txns_m5_buys": 40, "txns_m5_sells": 35,
-            "price_change_m5": 1.0, "price_change_h1": 3.0}
+            "price_change_m5": 1.0, "price_change_h1": 3.0,
+            "price_pair_address": _pair_for(addr)}
 
 
 def run(psycopg2, paper_trading, dsn) -> Suite:
@@ -25,6 +36,7 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
     conn.autocommit = True
 
     def rec(snap, state=None):
+        _PAIR_BY_TOKEN[snap["token_address"]] = snap["price_pair_address"]
         # Mirrors main._record_paper_candidate exactly: record_candidate uses
         # SAVEPOINT for its per-row inserts, and SAVEPOINT is only legal inside
         # a transaction block. Calling it on an autocommit connection fails
@@ -36,6 +48,30 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
                 paper_trading.record_candidate(conn, snap, state or {})
         finally:
             conn.autocommit = True
+
+    def _with_pool_identity(prices):
+        # Production marks are pool-pinned dictionaries. Keep test call sites
+        # concise while ensuring no fixture accidentally exercises the legacy
+        # unpinned-mark path.
+        result = {}
+        for addr, value in prices.items():
+            pair = _PAIR_BY_TOKEN.get(addr)
+            if isinstance(value, dict):
+                mark = dict(value)
+                mark.setdefault("pair_address", pair)
+                result[addr] = mark
+            else:
+                result[addr] = {"price": value, "pair_address": pair}
+        return result
+
+    mark_to_market_impl = paper_trading.mark_to_market
+    mark_horizons_impl = paper_trading.mark_horizons
+
+    def mtm(conn_arg, prices):
+        return mark_to_market_impl(conn_arg, _with_pool_identity(prices))
+
+    def mh(conn_arg, prices):
+        return mark_horizons_impl(conn_arg, _with_pool_identity(prices))
 
     def age(addr, minutes):
         """Age the trade AND its last mark -- i.e. it has been silent that long.
@@ -63,9 +99,9 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
         print("\n[CENSORING] a token that stops pricing must not stay OPEN forever")
         dead = make_address(10)
         rec(_snap(dead))
-        paper_trading.mark_to_market(conn, {dead: 1.0})
+        mtm(conn, {dead: 1.0})
         age(dead, paper_trading.UNPRICEABLE_ABANDON_MINUTES + 20)
-        stats = paper_trading.mark_to_market(conn, {})       # nothing prices at all
+        stats = mtm(conn, {})       # nothing prices at all
         s.check_true("abandoned once past the window", stats["abandoned_no_price"] >= 1)
         with conn.cursor() as cur:
             # EACH ARM GETS ITS OWN CORRECT TERMINAL STATE. This used to
@@ -102,11 +138,73 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
 
         young = make_address(11)
         rec(_snap(young)); age(young, 5)
-        paper_trading.mark_to_market(conn, {})
+        mtm(conn, {})
         with conn.cursor() as cur:
             cur.execute("SELECT count(*) FROM paper_trades WHERE token_address=%s "
                         "AND status='ABANDONED';", (young,))
             s.check("a briefly-unpriceable trade is left alone", int(cur.fetchone()[0]), 0)
+
+        print("\n[POOL IDENTITY] legacy rows cannot use a provider-selected pool")
+        legacy_pool = make_address(14)
+        rec(_snap(legacy_pool))
+        with conn.cursor() as cur:
+            cur.execute("UPDATE paper_trades SET pair_address=NULL WHERE token_address=%s;",
+                        (legacy_pool,))
+        age(legacy_pool, 35)
+        wrong_pool = make_address(15)
+        mtm(conn, {legacy_pool: {"price": 2.0, "pair_address": wrong_pool}})
+        horizon_marks = mh(conn, {legacy_pool: {"price": 2.0, "pair_address": wrong_pool}})
+        s.check("unidentified pool is excluded from market-data requests",
+                legacy_pool in paper_trading.open_token_pool_map(conn), False)
+        s.check("mismatched pool mark counts as missing at a due horizon",
+                horizon_marks.get(paper_trading.HORIZON_DROPPED_NO_PRICE, 0), 1)
+        with conn.cursor() as cur:
+            cur.execute("SELECT entry_model, status, last_price, min_price_seen, max_price_seen, "
+                        "exit_price, net_pnl_percent FROM paper_trades "
+                        "WHERE token_address=%s ORDER BY entry_model;", (legacy_pool,))
+            legacy_rows = cur.fetchall()
+            s.check_true("wrong-pool mark creates no fill, close, or P&L",
+                         all(row[1] in ("OPEN", "PENDING_FILL") and float(row[2]) == 1.0
+                             and row[3] is None and row[4] is None
+                             and row[5] is None and row[6] is None
+                             for row in legacy_rows))
+        age(legacy_pool, paper_trading.UNPRICEABLE_ABANDON_MINUTES + 20)
+        stats = mtm(conn, {})
+        with conn.cursor() as cur:
+            cur.execute("SELECT entry_model, status, exit_reason, exit_price, net_pnl_percent "
+                        "FROM paper_trades WHERE token_address=%s ORDER BY entry_model;",
+                        (legacy_pool,))
+            terminal = cur.fetchall()
+        s.check("unpriceable legacy LIMIT expires and IMMEDIATE abandons",
+                [(r[0], r[1], r[2]) for r in terminal],
+                [("IMMEDIATE", "ABANDONED", "NO_PRICE"), ("LIMIT", "EXPIRED", None)])
+        s.check_true("legacy terminal rows still have no fabricated P&L",
+                     all(r[3] is None and r[4] is None for r in terminal))
+
+        print("\n[INVALID MARKS] non-finite or non-positive quotes are dropouts")
+        invalid_mark_prices = (0.0, -1.0, float("nan"), float("inf"), "not-a-price")
+        for test_index, invalid_price in enumerate(invalid_mark_prices, start=1):
+            offset = 19 + test_index
+            addr = make_address(offset)
+            rec(_snap(addr))
+            age(addr, 35)
+            bad_mark = {addr: {"price": invalid_price,
+                               "pair_address": _PAIR_BY_TOKEN[addr]}}
+            mtm(conn, bad_mark)
+            horizon_stats = mh(conn, bad_mark)
+            s.check(f"invalid quote is counted as no-price dropout ({invalid_price!r})",
+                    horizon_stats.get(paper_trading.HORIZON_DROPPED_NO_PRICE, 0), test_index)
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*) FROM paper_horizon_returns h "
+                            "JOIN paper_trades t ON t.id=h.paper_trade_id "
+                            "WHERE t.token_address=%s;", (addr,))
+                s.check(f"invalid quote creates no horizon return ({invalid_price!r})",
+                        int(cur.fetchone()[0]), 0)
+                cur.execute("SELECT count(*) FROM paper_trades WHERE token_address=%s "
+                            "AND (exit_price IS NOT NULL OR net_pnl_percent IS NOT NULL);",
+                            (addr,))
+                s.check(f"invalid quote creates no exit P&L ({invalid_price!r})",
+                        int(cur.fetchone()[0]), 0)
 
         print("\n[COSTS] unmeasured slippage is NULL, never 0")
         miss = make_address(12)
@@ -175,7 +273,7 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
                 cur.execute("UPDATE paper_trades SET evaluated_at = CURRENT_TIMESTAMP - "
                             "INTERVAL '35 minutes', txns_m5_buys=%s, txns_m5_sells=0 "
                             "WHERE token_address=%s;", (f_val, a))
-            paper_trading.mark_horizons(conn, {a: 1.0 + (r_pct / 100.0)})
+            mh(conn, {a: 1.0 + (r_pct / 100.0)})
         corr = {r["feature"]: r for r in paper_trading.feature_correlations(conn, horizon_minutes=30)}
         rho = corr["txns_m5_total"]["rho"]
         s.check_true("rho matches mid-rank Spearman", abs(rho - MIDRANK_RHO) < 0.03)
@@ -198,7 +296,7 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
         with conn.cursor() as cur:
             cur.execute("UPDATE paper_trades SET evaluated_at=CURRENT_TIMESTAMP - "
                         "INTERVAL '200 minutes' WHERE token_address=%s;", (live_tok,))
-        paper_trading.mark_horizons(conn, {live_tok: 1.05})   # collects 30/60/120
+        mh(conn, {live_tok: 1.05})   # collects 30/60/120
         rep = {r["cohort"]: r for r in paper_trading.staleness_report(conn)}
         med = float(rep["APPROVED"]["median_txns_h1"])
         # True median of {1800, 100} is 950. Fanned out it would be pulled to 1800.
@@ -314,9 +412,9 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
             cur.execute("TRUNCATE paper_trades CASCADE;")
         veteran = make_address(41)
         rec(_snap(veteran))
-        paper_trading.mark_to_market(conn, {veteran: 1.0})     # sets last_marked_at
+        mtm(conn, {veteran: 1.0})     # sets last_marked_at
         age_entry_only(veteran, paper_trading.UNPRICEABLE_ABANDON_MINUTES + 120)
-        stats = paper_trading.mark_to_market(conn, {})          # one tick prices nothing
+        stats = mtm(conn, {})          # one tick prices nothing
         s.check("an old but freshly-priced trade survives a missed tick",
                 stats["abandoned_no_price"], 0)
         with conn.cursor() as cur:
@@ -325,7 +423,7 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
             s.check_true("still live", cur.fetchone()[0] >= 1)
         # ...and genuine silence still abandons it.
         age(veteran, paper_trading.UNPRICEABLE_ABANDON_MINUTES + 120)
-        stats = paper_trading.mark_to_market(conn, {})
+        stats = mtm(conn, {})
         s.check_true("sustained silence still abandons", stats["abandoned_no_price"] >= 1)
 
         print("\n[GAP FILL] a LIMIT that fills on a gap through its stop stops out on that mark")
@@ -339,7 +437,7 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
                         "WHERE token_address=%s AND entry_model='LIMIT';", (gapper,))
             trig, stop = (float(x) for x in cur.fetchone())
         gap_price = stop * 0.5
-        paper_trading.mark_to_market(conn, {gapper: gap_price})
+        mtm(conn, {gapper: gap_price})
         with conn.cursor() as cur:
             cur.execute("SELECT status, exit_reason, fill_price, exit_price, net_pnl_percent "
                         "FROM paper_trades WHERE token_address=%s AND entry_model='LIMIT';", (gapper,))
@@ -355,7 +453,7 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
             cur.execute("SELECT entry_trigger_price, invalidation_level_price FROM paper_trades "
                         "WHERE token_address=%s AND entry_model='LIMIT';", (cleaner,))
             trig2, stop2 = (float(x) for x in cur.fetchone())
-        paper_trading.mark_to_market(conn, {cleaner: (trig2 + stop2) / 2})
+        mtm(conn, {cleaner: (trig2 + stop2) / 2})
         with conn.cursor() as cur:
             cur.execute("SELECT status FROM paper_trades WHERE token_address=%s "
                         "AND entry_model='LIMIT';", (cleaner,))
@@ -367,8 +465,10 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
         flip = make_address(61)
         rec(_snap(flip))                                          # APPROVED first
         with conn.cursor() as cur:
-            cur.execute("UPDATE paper_trades SET evaluated_at = evaluated_at - INTERVAL '3 hours', "
-                        "status = 'CLOSED' WHERE token_address = %s;", (flip,))
+            cur.execute("UPDATE paper_trades SET evaluated_at = evaluated_at "
+                        "- (%s * INTERVAL '1 minute'), status = 'CLOSED' "
+                        "WHERE token_address = %s;",
+                        (paper_trading.REENTRY_COOLDOWN_MINUTES + 1, flip))
         rec(_snap(flip), {"termination_reason": "B_SENTINEL: thin"})  # then REJECTED
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(DISTINCT cohort) FROM paper_trades WHERE token_address=%s;", (flip,))
@@ -407,7 +507,7 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
         ghost = make_address(42)
         rec(_snap(ghost))
         age(ghost, paper_trading.LIMIT_FILL_WINDOW_MINUTES + 5)
-        stats = paper_trading.mark_to_market(conn, {})          # never prices again
+        stats = mtm(conn, {})          # never prices again
         s.check_true("expired, not abandoned", stats["expired"] >= 1)
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM paper_trades WHERE token_address=%s "
@@ -430,7 +530,7 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
             cur.execute("SELECT target_exit_price FROM paper_trades WHERE "
                         "token_address=%s AND entry_model='IMMEDIATE';", (ghost,))
             tgt = float(cur.fetchone()[0])
-        paper_trading.mark_to_market(
+        mtm(
             conn, {ghost: {"price": tgt * 1.05, "txns_m5": 0, "txns_h1": 0}})
         with conn.cursor() as cur:
             cur.execute("SELECT exit_reason, exit_confirmed, exit_txns_m5 FROM paper_trades "
@@ -450,7 +550,7 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
             cur.execute("SELECT target_exit_price FROM paper_trades WHERE "
                         "token_address=%s AND entry_model='IMMEDIATE';", (live,))
             tgt = float(cur.fetchone()[0])
-        paper_trading.mark_to_market(
+        mtm(
             conn, {live: {"price": tgt * 1.05, "txns_m5": 12, "txns_h1": 300}})
         with conn.cursor() as cur:
             cur.execute("SELECT exit_confirmed FROM paper_trades WHERE token_address=%s "
@@ -476,7 +576,7 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
             cur.execute("SELECT target_exit_price FROM paper_trades WHERE "
                         "token_address=%s AND entry_model='IMMEDIATE';", (legacy,))
             tgt = float(cur.fetchone()[0])
-        paper_trading.mark_to_market(conn, {legacy: tgt * 1.05})
+        mtm(conn, {legacy: tgt * 1.05})
         with conn.cursor() as cur:
             cur.execute("SELECT exit_reason, exit_confirmed FROM paper_trades "
                         "WHERE token_address=%s AND status='CLOSED' "
@@ -515,7 +615,7 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
             assert stop_px < px < target_px, (
                 f"fixture price {px} is outside the barriers "
                 f"({stop_px:.4f} .. {target_px:.4f}) and would close the trade")
-            paper_trading.mark_to_market(conn, {path: px})
+            mtm(conn, {path: px})
         with conn.cursor() as cur:
             cur.execute("SELECT DISTINCT status FROM paper_trades "
                         "WHERE token_address=%s AND entry_model='IMMEDIATE';",
@@ -544,7 +644,7 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
             cur.execute("TRUNCATE paper_trades CASCADE;")
         recov = make_address(48)
         rec(_snap(recov, price=1.0))
-        paper_trading.mark_to_market(conn, {recov: 0.80})   # through the stop
+        mtm(conn, {recov: 0.80})   # through the stop
         with conn.cursor() as cur:
             cur.execute("SELECT DISTINCT status FROM paper_trades "
                         "WHERE token_address=%s AND entry_model='IMMEDIATE';",
@@ -556,7 +656,7 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
             hi_before = float(cur.fetchone()[0])
         # Age it so a horizon is due, then price it far ABOVE entry.
         age(recov, paper_trading.HORIZONS_MINUTES[0] + 1)
-        paper_trading.mark_horizons(conn, {recov: 1.40})
+        mh(conn, {recov: 1.40})
         with conn.cursor() as cur:
             cur.execute("SELECT max_price_seen FROM paper_trades "
                         "WHERE token_address=%s AND entry_model='IMMEDIATE';",
@@ -576,7 +676,7 @@ def run(psycopg2, paper_trading, dsn) -> Suite:
             cur.execute("TRUNCATE paper_trades CASCADE;")
         seed = make_address(47)
         rec(_snap(seed, price=1.0))
-        paper_trading.mark_to_market(conn, {seed: 0.5})
+        mtm(conn, {seed: 0.5})
         with conn.cursor() as cur:
             cur.execute("SELECT DISTINCT min_price_seen, max_price_seen FROM paper_trades "
                         "WHERE token_address=%s AND entry_model='IMMEDIATE';", (seed,))

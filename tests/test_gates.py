@@ -38,7 +38,10 @@ def run(psycopg2, engine, dsn) -> Suite:
     s.check("refuses when slippage was never measured", "termination_reason" in r, True)
     s.check("and sizes no position", r.get("max_safe_position_usd"), None)
     r = engine.node_G_ANCHOR(state(estimated_slippage_percent=0.0))
-    s.check("a MEASURED 0% slippage still passes", r.get("max_safe_position_usd"), 500.0)
+    # $1,000 reference equity * 0.5% risk = $5 risk budget. Dividing by
+    # 7.53% stop distance + 6.5% stressed round-trip cost gives $35.63.
+    s.check("a MEASURED 0% slippage still passes at risk-sized notional",
+            r.get("max_safe_position_usd"), 35.63)
     r = engine.node_G_ANCHOR(state(estimated_slippage_percent=9.0))
     s.check("9% slippage is refused", "termination_reason" in r, True)
     r = engine.node_G_ANCHOR(state(tradeable_depth_usd=0.0))

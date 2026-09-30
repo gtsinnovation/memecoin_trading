@@ -34,6 +34,7 @@ import math
 import logging
 import traceback
 import sys
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -240,16 +241,36 @@ async def _reserve(req: ExecuteRequest, sol_lamports: Optional[int], network: st
     """Policy checks and the order reservation, as ONE locked transaction.
 
     Returns (policy_result, None) for a new order, or (None, existing_row)
-    when this client_order_id was seen before -- in which case nothing is
-    checked and nothing will be signed.
+    for a previously seen key. Exact payload retries return its first outcome;
+    a changed token, amount, or network is marked as an idempotency conflict.
     """
     async with _pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SELECT pg_advisory_xact_lock($1);", RESERVATION_LOCK_KEY)
             existing = await conn.fetchrow(
-                "SELECT status, tx_signature, reason, network FROM signer_orders "
+                "SELECT status, tx_signature, reason, network, token_address, requested_usd "
+                "FROM signer_orders "
                 "WHERE client_order_id = $1;", req.client_order_id)
             if existing is not None:
+                existing = dict(existing)
+                # A key identifies one immutable order payload. Returning the
+                # first order's successful outcome for a retry that changes
+                # mint, size, or network can bind that outcome to a different
+                # pipeline reservation and create a misleading audit record.
+                # Compare the canonical stored payload before treating this as
+                # an idempotent retry; a mismatch must never return a signature.
+                try:
+                    same_amount = Decimal(str(existing["requested_usd"])) == Decimal(
+                        str(req.requested_usd))
+                except (InvalidOperation, TypeError, ValueError):
+                    same_amount = False
+                same_payload = (
+                    existing["token_address"] == req.token_address
+                    and same_amount
+                    and existing["network"] == network
+                )
+                if not same_payload:
+                    existing["idempotency_conflict"] = True
                 return None, existing
             policy = await policy_guard.check_execution_allowed(
                 conn, req.token_address, req.requested_usd, req.client_order_id,
@@ -432,6 +453,19 @@ async def _execute(req: ExecuteRequest):
         return _reply(503, None, reason)
 
     if existing is not None:
+        if existing.get("idempotency_conflict"):
+            reason = ("IDEMPOTENCY_CONFLICT: client_order_id was already bound to "
+                      f"token={existing['token_address']}, "
+                      f"requested_usd={existing['requested_usd']}, "
+                      f"network={existing['network']}; refusing the changed payload")
+            # Audit the canonical stored order, never the caller's replacement
+            # values. The conflict response deliberately carries no signature.
+            await _write_audit_log(existing["token_address"], None,
+                                   float(existing["requested_usd"]),
+                                   "IDEMPOTENCY_CONFLICT", reason, None,
+                                   existing["network"] or "unknown")
+            return _reply(409, "IDEMPOTENCY_CONFLICT", reason,
+                          executed=False, client_order_id=req.client_order_id)
         # IDEMPOTENCY. Same key, same answer -- never a second signature.
         reason = (f"duplicate client_order_id: this order was already processed "
                   f"({existing['status']}) -- returning its outcome, not signing again")

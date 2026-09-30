@@ -130,6 +130,295 @@ SELECT COUNT(*) AS immediate_rows,
 FROM paper_trades WHERE entry_model = 'IMMEDIATE';
 
 \echo ''
+\echo '=== 2b. PRICE-METHOD BOUNDARY: legacy versus side-aware observations ==='
+-- NULL versions predate explicit method tagging and must not be pooled with
+-- the side-aware sample. Invalid rows remain visible in coverage counts.
+SELECT COALESCE(price_validation_version, '(legacy / unversioned)') AS price_method,
+       cohort, entry_model,
+       COUNT(DISTINCT t.id)::int AS rows,
+       COUNT(DISTINCT token_address)::int AS tokens,
+       COUNT(DISTINCT t.id) FILTER (WHERE t.status = 'INVALID_DATA')::int AS invalid_rows,
+       COUNT(h.id)::int AS horizon_marks,
+       MIN(evaluated_at) AS first_evaluation,
+       MAX(evaluated_at) AS last_evaluation
+FROM paper_trades t
+LEFT JOIN paper_horizon_returns h ON h.paper_trade_id = t.id
+GROUP BY 1, 2, 3
+ORDER BY 1, 2, 3;
+
+\echo ''
+\echo '=== 2c. CLEAN-SAMPLE HORIZON RETURNS: versioned rows only ==='
+-- One first IMMEDIATE evaluation per token in the current resolver version.
+-- This is an observational paper sample, not evidence of executable fills.
+WITH first_eval AS (
+    SELECT DISTINCT ON (token_address) id, token_address, cohort,
+           assumed_slippage_percent
+    FROM paper_trades
+    WHERE entry_model = 'IMMEDIATE'
+      AND price_validation_version = 'pair-side-aware-v1'
+      AND pair_address IS NOT NULL
+      AND status <> 'INVALID_DATA'
+    ORDER BY token_address, evaluated_at, id
+), marks AS (
+    SELECT f.cohort, f.token_address, h.horizon_minutes, h.return_percent,
+           h.return_percent - (:fee + 2 * ABS(COALESCE(f.assumed_slippage_percent, :unmeasured_slip))) AS net_return_percent
+    FROM first_eval f
+    JOIN paper_horizon_returns h ON h.paper_trade_id = f.id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * :horizon_tolerance
+)
+SELECT horizon_minutes, cohort,
+       COUNT(DISTINCT token_address)::int AS tokens,
+       ROUND(AVG(return_percent), 2) AS mean_gross_pct,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY return_percent)::numeric, 2) AS median_gross_pct,
+       ROUND(AVG(net_return_percent), 2) AS mean_net_pct,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY net_return_percent)::numeric, 2) AS median_net_pct,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE net_return_percent > 0) / NULLIF(COUNT(*), 0), 1) AS positive_net_pct
+FROM marks
+GROUP BY horizon_minutes, cohort
+ORDER BY horizon_minutes, cohort;
+\echo ''
+\echo '=== 2d. CLEAN-SAMPLE DECISION GAP: current resolver, pinned and valid ==='
+-- One first IMMEDIATE evaluation per token in the current price resolver
+-- version, with an immutable entry-pool identity and no INVALID_DATA flag.
+-- This deliberately complements (rather than silently replaces) the
+-- historical all-version sections below. It is still observational: gates
+-- do not randomize cohorts, and quote marks do not prove executable fills.
+WITH first_clean_eval AS (
+    SELECT DISTINCT ON (token_address)
+           id, token_address, cohort, assumed_slippage_percent
+    FROM paper_trades
+    WHERE entry_model = 'IMMEDIATE'
+      AND price_validation_version = 'pair-side-aware-v1'
+      AND pair_address IS NOT NULL
+      AND status <> 'INVALID_DATA'
+    ORDER BY token_address, evaluated_at, id
+), per_token AS (
+    SELECT f.token_address AS token,
+           f.cohort,
+           h.horizon_minutes AS mins,
+           AVG(h.return_percent) AS gross_ret,
+           AVG(h.return_percent
+               - (:fee + 2 * ABS(COALESCE(f.assumed_slippage_percent, :unmeasured_slip)))) AS net_ret
+    FROM first_clean_eval f
+    JOIN paper_horizon_returns h ON h.paper_trade_id = f.id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * :horizon_tolerance
+    GROUP BY f.token_address, f.cohort, h.horizon_minutes
+), per_cohort AS (
+    SELECT mins, cohort, COUNT(*) AS tokens,
+           AVG(gross_ret) AS gross_mean,
+           AVG(net_ret) AS net_mean,
+           COALESCE(VAR_SAMP(net_ret), 0) AS net_var
+    FROM per_token
+    GROUP BY mins, cohort
+), gap AS (
+    SELECT a.mins,
+           a.tokens AS approved_tokens,
+           r.tokens AS rejected_tokens,
+           a.gross_mean AS approved_gross_mean,
+           a.net_mean AS approved_net_mean,
+           r.net_mean AS rejected_net_mean,
+           a.net_mean - r.net_mean AS net_gap,
+           SQRT(a.net_var / NULLIF(a.tokens, 0)
+              + r.net_var / NULLIF(r.tokens, 0)) AS net_gap_se
+    FROM per_cohort a
+    JOIN per_cohort r ON r.mins = a.mins AND r.cohort = 'REJECTED'
+    WHERE a.cohort = 'APPROVED'
+)
+SELECT mins,
+       approved_tokens,
+       rejected_tokens,
+       ROUND(approved_gross_mean::numeric, 2) AS approved_gross_mean_pct,
+       ROUND(approved_net_mean::numeric, 2) AS approved_net_mean_pct,
+       ROUND(rejected_net_mean::numeric, 2) AS rejected_net_mean_pct,
+       ROUND(net_gap::numeric, 2) AS approved_minus_rejected_net_pp,
+       ROUND(net_gap_se::numeric, 2) AS se_of_net_gap,
+       ROUND((net_gap / NULLIF(net_gap_se, 0))::numeric, 2) AS net_gap_t_stat,
+       CASE
+         WHEN LEAST(approved_tokens, rejected_tokens) < 30 THEN 'too few tokens'
+         WHEN net_gap > 2 * net_gap_se THEN 'observational gap > 2 SE'
+         ELSE 'no clear positive gap'
+       END AS verdict
+FROM gap
+ORDER BY mins;
+
+\echo ''
+\echo '=== 2e. CURRENT-VERSION PRICE-ANOMALY SENSITIVITY ==='
+-- Apply the same frozen-mark and 10x-hourly-volume flags as 10d/10e, but
+-- only to the first eligible evaluation in the current resolver version.
+-- This shows whether the large all-sample means also occur in the clean
+-- resolver vintage. The screen is a sensitivity, not ground truth: an
+-- unflagged quote still is not proof of an executable fill.
+WITH first_clean_eval AS (
+    SELECT DISTINCT ON (token_address)
+           id, token_address, cohort, price_at_evaluation,
+           tradeable_depth_usd, volume_h1_usd, assumed_slippage_percent
+    FROM paper_trades
+    WHERE entry_model = 'IMMEDIATE'
+      AND price_validation_version = 'pair-side-aware-v1'
+      AND pair_address IS NOT NULL
+      AND status <> 'INVALID_DATA'
+    ORDER BY token_address, evaluated_at, id
+), mark_shape AS (
+    SELECT h.paper_trade_id,
+           COUNT(DISTINCT h.price) FILTER (
+               WHERE h.age_minutes_at_mark <= h.horizon_minutes * :horizon_tolerance
+           ) AS distinct_marks,
+           COUNT(*) FILTER (
+               WHERE h.age_minutes_at_mark <= h.horizon_minutes * :horizon_tolerance
+           ) AS n_marks
+    FROM first_clean_eval f
+    JOIN paper_horizon_returns h ON h.paper_trade_id = f.id
+    GROUP BY h.paper_trade_id
+), scored AS (
+    SELECT f.token_address AS token,
+           f.cohort,
+           h.horizon_minutes AS mins,
+           h.return_percent AS gross_ret,
+           h.return_percent
+             - (:fee + 2 * ABS(COALESCE(f.assumed_slippage_percent, :unmeasured_slip))) AS net_ret,
+           (COALESCE(f.tradeable_depth_usd, 0) / 2.0)
+             * (SQRT(h.price / NULLIF(f.price_at_evaluation, 0)) - 1) AS buying_needed,
+           COALESCE(f.volume_h1_usd, 0) AS vol_h1,
+           s.distinct_marks,
+           s.n_marks
+    FROM first_clean_eval f
+    JOIN paper_horizon_returns h ON h.paper_trade_id = f.id
+    JOIN mark_shape s ON s.paper_trade_id = f.id
+    WHERE h.age_minutes_at_mark <= h.horizon_minutes * :horizon_tolerance
+      AND h.price > 0
+      AND f.price_at_evaluation > 0
+), flagged AS (
+    SELECT scored.*,
+           (gross_ret > 1000 AND
+             ((distinct_marks = 1 AND n_marks > 1)
+              OR buying_needed > 10 * vol_h1)) AS suspect
+    FROM scored
+)
+SELECT mins,
+       cohort,
+       COUNT(*) AS tokens,
+       COUNT(*) FILTER (WHERE suspect) AS suspect_tokens,
+       ROUND(AVG(gross_ret), 2) AS mean_gross_pct,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY gross_ret)::numeric, 2)
+           AS median_gross_pct,
+       ROUND(AVG(net_ret), 2) AS mean_net_pct,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY net_ret)::numeric, 2)
+           AS median_net_pct,
+       ROUND(AVG(net_ret) FILTER (WHERE NOT suspect), 2) AS mean_net_after_screen_pct,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY net_ret)
+           FILTER (WHERE NOT suspect)::numeric, 2) AS median_net_after_screen_pct,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE net_ret > 0)
+           / NULLIF(COUNT(*), 0), 1) AS positive_net_pct,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE net_ret > 0 AND NOT suspect)
+           / NULLIF(COUNT(*) FILTER (WHERE NOT suspect), 0), 1)
+           AS positive_net_after_screen_pct
+FROM flagged
+GROUP BY mins, cohort
+ORDER BY mins, cohort;
+
+\echo ''
+\echo '=== 2f. OUTLIER MARK-TIME EVIDENCE ==='
+-- Existing horizon rows remain NULL; this section is informative after a fresh
+-- run records new marks with the attached pool context. The current-first flag
+-- lets this all-evaluation scan be cross-checked against Section 2e's cohort.
+WITH first_current AS (
+    SELECT DISTINCT ON (token_address) id, token_address
+    FROM paper_trades
+    WHERE entry_model = 'IMMEDIATE'
+      AND price_validation_version = 'pair-side-aware-v1'
+      AND pair_address IS NOT NULL
+      AND status <> 'INVALID_DATA'
+    ORDER BY token_address, evaluated_at, id
+)
+SELECT t.id AS paper_trade_id,
+       COALESCE(t.price_validation_version, '(legacy / unversioned)') AS price_method,
+       CASE WHEN f.id = t.id THEN 'yes' ELSE 'no' END AS first_current_eval,
+       t.cohort,
+       t.entry_model,
+       LEFT(t.token_address, 8) AS token,
+       h.horizon_minutes AS mins,
+       ROUND(h.return_percent::numeric, 2) AS gross_return_pct,
+       ROUND((h.price / NULLIF(t.price_at_evaluation, 0))::numeric, 2) AS price_multiple,
+       ROUND(h.mark_liquidity_usd::numeric, 0) AS mark_liquidity_usd,
+       ROUND(h.mark_volume_h1_usd::numeric, 0) AS mark_volume_h1_usd,
+       h.mark_txns_m5,
+       h.mark_txns_h1,
+       h.marked_at,
+       CASE WHEN h.mark_liquidity_usd IS NULL
+                  OR h.mark_volume_h1_usd IS NULL
+                  OR h.mark_txns_m5 IS NULL
+                  OR h.mark_txns_h1 IS NULL
+            THEN 'mark context missing' ELSE 'mark context captured' END AS context_status
+FROM paper_horizon_returns h
+JOIN paper_trades t ON t.id = h.paper_trade_id
+LEFT JOIN first_current f ON f.id = t.id
+WHERE h.return_percent > 1000
+  AND h.age_minutes_at_mark <= h.horizon_minutes * :horizon_tolerance
+  AND h.price > 0 AND t.price_at_evaluation > 0
+  AND t.pair_address IS NOT NULL
+ORDER BY h.return_percent DESC
+LIMIT 25;
+
+\echo ''
+\echo '=== 2g. SIZE-AWARE SLIPPAGE QUOTE COVERAGE ==='
+SELECT COALESCE(price_validation_version, '(legacy / unversioned)') AS price_method,
+       cohort,
+       entry_model,
+       COUNT(*) AS rows,
+       COUNT(slippage_probe_usd) AS rows_with_probe_size,
+       COUNT(*) FILTER (WHERE slippage_probe_usd IS NOT NULL
+                         AND assumed_slippage_percent IS NOT NULL) AS rows_with_sized_impact,
+       ROUND(100.0 * COUNT(slippage_probe_usd) / NULLIF(COUNT(*), 0), 1) AS pct_with_probe_size,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY slippage_probe_usd)::numeric, 2)
+           AS median_probe_size_usd,
+       ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY assumed_slippage_percent)::numeric, 3)
+           AS median_quoted_impact_pct
+FROM paper_trades
+GROUP BY price_validation_version, cohort, entry_model
+ORDER BY price_method, cohort, entry_model;
+
+\echo ''
+\echo '=== 2h. CURRENT-VERSION QUOTE COVERAGE BY EVALUATION HOUR ==='
+-- Distinguish a recent instrumentation rollout from a continuing capture gap.
+-- A measured impact without its exact quote notional is not size-aware evidence.
+SELECT date_trunc('hour', evaluated_at) AS evaluation_hour,
+       cohort,
+       COUNT(*) AS rows,
+       COUNT(slippage_probe_usd) AS rows_with_probe_size,
+       COUNT(assumed_slippage_percent) AS rows_with_impact,
+       COUNT(*) FILTER (WHERE slippage_probe_usd IS NOT NULL
+                         AND assumed_slippage_percent IS NOT NULL) AS rows_with_both,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE slippage_probe_usd IS NOT NULL
+                                       AND assumed_slippage_percent IS NOT NULL)
+             / NULLIF(COUNT(*), 0), 1) AS pct_with_both
+FROM paper_trades
+WHERE entry_model = 'IMMEDIATE'
+  AND price_validation_version = 'pair-side-aware-v1'
+GROUP BY 1, 2
+ORDER BY 1, 2;
+
+\echo ''
+\echo '=== 2i. CURRENT-VERSION MARK CONTEXT BY MARK HOUR ==='
+-- Mark context can be absent in older rows or when the provider omits fields.
+-- The hourly shape shows whether complete context is appearing in new marks.
+SELECT date_trunc('hour', h.marked_at) AS mark_hour,
+       COUNT(*) AS marks,
+       COUNT(*) FILTER (WHERE h.mark_liquidity_usd IS NOT NULL
+                         AND h.mark_volume_h1_usd IS NOT NULL
+                         AND h.mark_txns_m5 IS NOT NULL
+                         AND h.mark_txns_h1 IS NOT NULL) AS marks_with_full_context,
+       COUNT(*) FILTER (WHERE h.mark_liquidity_usd IS NULL) AS missing_liquidity,
+       COUNT(*) FILTER (WHERE h.mark_volume_h1_usd IS NULL) AS missing_volume,
+       COUNT(*) FILTER (WHERE h.mark_txns_m5 IS NULL) AS missing_txns_m5,
+       COUNT(*) FILTER (WHERE h.mark_txns_h1 IS NULL) AS missing_txns_h1
+FROM paper_horizon_returns h
+JOIN paper_trades t ON t.id = h.paper_trade_id
+WHERE t.entry_model = 'IMMEDIATE'
+  AND t.price_validation_version = 'pair-side-aware-v1'
+GROUP BY 1
+ORDER BY 1;
+
+\echo ''
 \echo '=== 3. CANDIDATE QUALITY: are these tokens actually trading? ==='
 -- The $USEFUL problem. A high no_txn_pct means discovery is surfacing dead
 -- tokens whose "price" is a stale last print -- pure noise, which dilutes
@@ -192,6 +481,17 @@ FROM paper_trades t
 JOIN first_eval fe ON fe.id = t.id
 WHERE t.entry_model = 'IMMEDIATE'
 GROUP BY t.cohort ORDER BY t.cohort;
+
+\echo ''
+\echo '=== 3e. HOURLY HORIZON DROPOUT ==='
+-- The daily section above can hide a short outage or deployment boundary.
+-- These are still repeated due-row ticks, not unique trades permanently lost.
+SELECT hour, due, marked, dropped_no_price, dropped_no_basis,
+       ROUND(100.0 * (dropped_no_price + dropped_no_basis)
+             / NULLIF(due, 0), 1) AS dropout_pct
+FROM paper_horizon_dropout
+WHERE hour >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+ORDER BY hour DESC;
 
 \echo ''
 \echo '=== 4. STALENESS: how much of the sample is a repeated stale quote? ==='
@@ -797,6 +1097,10 @@ WITH x AS (
            t.price_at_evaluation AS basis,
            h.price AS mark,
            h.return_percent AS ret,
+           h.mark_liquidity_usd,
+           h.mark_volume_h1_usd,
+           h.mark_txns_m5,
+           h.mark_txns_h1,
            t.tradeable_depth_usd AS depth,
            t.volume_h1_usd AS vol_h1,
            h.price / NULLIF(t.price_at_evaluation, 0) AS ratio,
@@ -825,14 +1129,24 @@ SELECT cohort, token, mins,
        ROUND(ratio, 0)                              AS price_x,
        ROUND(depth, 0)                              AS depth_usd,
        ROUND(vol_h1, 0)                             AS volume_h1,
+       ROUND(mark_liquidity_usd, 0)                 AS mark_liquidity_usd,
+       ROUND(mark_volume_h1_usd, 0)                 AS mark_volume_h1_usd,
+       mark_txns_m5,
+       mark_txns_h1,
        ROUND(buying_needed_usd, 0)                  AS buying_needed,
        -- How many times the entire hour's observed volume would have had to
        -- be spent, on this one token, to produce the recorded price.
        ROUND(buying_needed_usd / NULLIF(vol_h1, 0), 0) AS x_of_hourly_volume,
        CASE WHEN distinct_marks = 1 AND n_marks > 1
                  THEN 'FROZEN -- one price repeated across every horizon'
-            WHEN buying_needed_usd > 10 * COALESCE(vol_h1, 0)
+            WHEN depth IS NOT NULL AND depth > 0
+                 AND vol_h1 IS NOT NULL
+                 AND buying_needed_usd > 10 * vol_h1
                  THEN 'IMPOSSIBLE -- needs far more buying than the token saw'
+            WHEN depth IS NULL OR depth <= 0 OR vol_h1 IS NULL
+                 OR mark_liquidity_usd IS NULL OR mark_volume_h1_usd IS NULL
+                 OR mark_txns_m5 IS NULL OR mark_txns_h1 IS NULL
+                 THEN 'UNVERIFIED -- entry or mark context missing'
             ELSE 'plausible -- no test refutes it' END AS verdict
 FROM y
 ORDER BY ret DESC
@@ -928,13 +1242,14 @@ ORDER BY mins, cohort;
 -- Only trades with a recorded path appear. Paths began when paper_price_path
 -- was created, so older trades are simply absent -- they are not zero.
 WITH trades AS (
-    SELECT t.id, t.token_address, t.cohort, t.entry_model,
+    SELECT t.id, t.token_address, t.pair_address, t.cohort, t.entry_model,
            CASE WHEN t.entry_model = 'LIMIT' THEN t.filled_at
                 ELSE t.evaluated_at END AS entered,
            CASE WHEN t.entry_model = 'LIMIT' THEN t.fill_price
                 ELSE t.price_at_evaluation END AS basis
     FROM paper_trades t
     WHERE t.status <> 'INVALID_DATA'
+      AND t.pair_address IS NOT NULL
       AND ((t.entry_model = 'IMMEDIATE' AND t.price_at_evaluation > 0)
        OR (t.entry_model = 'LIMIT' AND t.filled_at IS NOT NULL AND t.fill_price > 0))
 ),
@@ -945,6 +1260,7 @@ path AS (
     FROM trades tr
     JOIN paper_price_path p
       ON p.token_address = tr.token_address
+     AND p.pair_address = tr.pair_address
      AND p.observed_at >= tr.entered
      AND p.observed_at <= tr.entered + INTERVAL '360 minutes'
 ),
@@ -989,10 +1305,11 @@ ORDER BY cohort, entry_model;
 -- the trade-off, which applies the actual exit and cost rules.
 -- Same ordered path and basis as 10f; IMMEDIATE only, so the entry is unambiguous.
 WITH trades AS (
-    SELECT t.id, t.token_address, t.cohort, t.evaluated_at AS entered,
+    SELECT t.id, t.token_address, t.pair_address, t.cohort, t.evaluated_at AS entered,
            t.price_at_evaluation AS basis
     FROM paper_trades t
     WHERE t.entry_model = 'IMMEDIATE' AND t.status <> 'INVALID_DATA'
+      AND t.pair_address IS NOT NULL
       AND t.price_at_evaluation > 0
 ),
 mae AS (
@@ -1001,6 +1318,7 @@ mae AS (
     FROM trades tr
     JOIN paper_price_path p
       ON p.token_address = tr.token_address
+     AND p.pair_address = tr.pair_address
      AND p.observed_at >= tr.entered
      AND p.observed_at <= tr.entered + INTERVAL '360 minutes'
     GROUP BY 1, 2
@@ -1012,6 +1330,20 @@ SELECT cohort, COUNT(*) AS trades,
        ROUND(100.0 * COUNT(*) FILTER (WHERE mae > -20)   / NULLIF(COUNT(*),0), 0) AS survive_20pct,
        ROUND(100.0 * COUNT(*) FILTER (WHERE mae > -35)   / NULLIF(COUNT(*),0), 0) AS survive_35pct
 FROM mae GROUP BY cohort ORDER BY cohort;
+
+\echo ''
+\echo '--- 10h. POOL IDENTITY COVERAGE ---'
+-- Historical rows without a stored pool cannot be reconciled to a single
+-- market series. Keep them visible here, but exclude them from pool-pinned
+-- return summaries and replay rather than guessing which pool produced them.
+SELECT entry_model, status,
+       COUNT(*) AS rows,
+       COUNT(*) FILTER (WHERE pair_address IS NOT NULL) AS pool_pinned,
+       COUNT(*) FILTER (WHERE pair_address IS NULL) AS pool_unverified,
+       COUNT(DISTINCT pair_address) AS distinct_pools
+FROM paper_trades
+GROUP BY entry_model, status
+ORDER BY entry_model, status;
 
 \echo ''
 \echo '=== 11. EXIT CONFIRMATION -- were the wins traded, or just quoted? ==='

@@ -7,9 +7,12 @@
 # that persists even after the file is later deleted from disk.
 #
 # The signer is a SEPARATE service with its own build context
-# (build: ./signer_service) and its own .dockerignore. The web image has no
-# use for any of it.
-signer_service/
+# (build: ./signer_service) and its own .dockerignore. The web image must not
+# contain signer code or credentials. Keep only its Dockerfile so the web
+# image's source-level deployment hardening regression check can inspect the
+# signer container's user and copied auth module without embedding its code.
+signer_service/**
+!signer_service/Dockerfile
 
 # Secrets. The web container receives these as environment variables at
 # RUNTIME via docker-compose; baking them into an image layer is both

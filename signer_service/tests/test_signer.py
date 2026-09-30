@@ -354,6 +354,27 @@ def run() -> Suite:
                 ("SIGNED_BROADCAST", "FIRSTSIG"))
         s.check("and nothing is signed a second time", len(signs), 0)
 
+        audited = []
+        async def conflict_before(*a, **k):
+            return None, {"status": "SIGNED_BROADCAST", "tx_signature": "FIRSTSIG",
+                          "reason": "done", "network": "devnet",
+                          "token_address": ADDR, "requested_usd": 5.0,
+                          "idempotency_conflict": True}
+        async def audit_spy(*a, **k):
+            audited.append(a)
+            return True
+        signer_main._reserve = conflict_before
+        signer_main._write_audit_log = audit_spy
+        changed = asyncio.new_event_loop().run_until_complete(signer_main._execute(
+            signer_main.ExecuteRequest(token_address="ChangedMint", requested_usd=99,
+                                       client_order_id=OID)))
+        changed_payload = _json.loads(changed.body)
+        s.check("changed idempotency payload is refused", changed.status_code, 409)
+        s.check("conflict has no signature", changed_payload.get("tx_signature"), None)
+        s.check("conflict is not reported as executed", changed_payload.get("executed"), False)
+        s.check("conflict audit uses stored token and size",
+                (audited[-1][0], audited[-1][2]), (ADDR, 5.0))
+
         # The chain, not the hostname, decides what may be signed.
         s.check_true("an unverified network refuses", signer_main._genesis_refusal(None))
         s.check_true("a mainnet genesis refuses in devnet mode", signer_main._genesis_refusal("mainnet"))
@@ -400,7 +421,9 @@ def run() -> Suite:
 
     saved_pool, saved_check = signer_main._pool, signer_main.policy_guard.check_execution_allowed
     try:
-        rc = _RConn({"status": "SIGNED_BROADCAST", "tx_signature": "S", "reason": "", "network": "devnet"})
+        rc = _RConn({"status": "SIGNED_BROADCAST", "tx_signature": "S", "reason": "",
+                     "network": "devnet", "token_address": ADDR,
+                     "requested_usd": 5.0})
         signer_main._pool = _Pool(rc)
         signer_main.policy_guard.check_execution_allowed = must_not_check
         pol, existing = asyncio.new_event_loop().run_until_complete(signer_main._reserve(
@@ -410,6 +433,16 @@ def run() -> Suite:
         s.check_true("the reservation runs under the advisory lock",
                      any("pg_advisory_xact_lock" in q for q in rc.sql))
         s.check_true("and nothing new is inserted", not any("INSERT INTO signer_orders" in q for q in rc.sql))
+
+        pol, existing = asyncio.new_event_loop().run_until_complete(signer_main._reserve(
+            signer_main.ExecuteRequest(token_address=ADDR, requested_usd=6,
+                                       client_order_id=OID),
+            50_000_000, "devnet"))
+        s.check_true("same key with a changed amount is a payload conflict",
+                     pol is None and existing.get("idempotency_conflict") is True)
+        s.check("the conflict retains the stored amount", existing["requested_usd"], 5.0)
+        s.check("the conflict retains the stored token", existing["token_address"], ADDR)
+        s.check("the conflict retains the stored network", existing["network"], "devnet")
 
         async def allow_check(*a, **k):
             return signer_main.policy_guard.PolicyResult(True, "ok")

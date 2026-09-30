@@ -70,25 +70,27 @@ def load_trades(conn, cohort: str) -> List[dict]:
     """IMMEDIATE trades whose token has an ordered path recorded after entry."""
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT t.id, t.token_address, t.price_at_evaluation,
+            SELECT t.id, t.token_address, t.pair_address, t.price_at_evaluation,
                    t.evaluated_at, t.assumed_slippage_percent,
                    t.status, t.net_pnl_percent
             FROM paper_trades t
             WHERE t.entry_model = 'IMMEDIATE'
               AND t.cohort = %s
+              AND t.pair_address IS NOT NULL
               AND t.price_at_evaluation > 0
               AND EXISTS (SELECT 1 FROM paper_price_path p
                           WHERE p.token_address = t.token_address
+                            AND p.pair_address = t.pair_address
                             AND p.observed_at >= t.evaluated_at)
             ORDER BY t.evaluated_at;
         """, (cohort,))
-        return [{"id": r[0], "addr": r[1], "basis": float(r[2]),
-                 "entered": r[3], "slip": r[4], "status": r[5],
-                 "prod_net": (None if r[6] is None else float(r[6]))}
+        return [{"id": r[0], "addr": r[1], "pair": r[2], "basis": float(r[3]),
+                 "entered": r[4], "slip": r[5], "status": r[6],
+                 "prod_net": (None if r[7] is None else float(r[7]))}
                 for r in cur.fetchall()]
 
 
-def load_path(conn, addr: str, since) -> List[Tuple[float, float]]:
+def load_path(conn, addr: str, pair: str, since) -> List[Tuple[float, float]]:
     """(minutes_since_entry, price), in time order, WITHIN the hold window.
 
     Bounded above. paper_price_path is keyed by TOKEN, so an unbounded read
@@ -102,10 +104,11 @@ def load_path(conn, addr: str, since) -> List[Tuple[float, float]]:
             SELECT EXTRACT(EPOCH FROM (observed_at - %s))/60.0, price
             FROM paper_price_path
             WHERE token_address = %s
+              AND pair_address = %s
               AND observed_at >= %s
               AND observed_at <= %s + (%s * INTERVAL '1 minute')
             ORDER BY observed_at;
-        """, (since, addr, since, since, pt.MAX_HOLD_MINUTES))
+        """, (since, addr, pair, since, since, pt.MAX_HOLD_MINUTES))
         return [(float(a), float(b)) for a, b in cur.fetchall()]
 
 
@@ -209,7 +212,7 @@ def main() -> int:
         trades = load_trades(conn, cohort)
         paths = []
         for t in trades:
-            p = load_path(conn, t["addr"], t["entered"])
+            p = load_path(conn, t["addr"], t["pair"], t["entered"])
             if len(p) >= MIN_SAMPLES:
                 paths.append((t, p))
 

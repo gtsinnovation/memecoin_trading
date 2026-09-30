@@ -220,6 +220,18 @@ def entry_slippage_for(state: Dict[str, Any]) -> Optional[float]:
     return abs(v) if math.isfinite(v) else None
 
 
+def effective_total_capital_cap(configured_cap: Optional[float]) -> float:
+    """The operator cap can tighten, but never raise, reference equity."""
+    if not math.isfinite(REFERENCE_EQUITY_USD) or REFERENCE_EQUITY_USD <= 0:
+        raise ValueError("REFERENCE_EQUITY_USD must be finite and positive")
+    if configured_cap is None:
+        return REFERENCE_EQUITY_USD
+    configured_cap = float(configured_cap)
+    if not math.isfinite(configured_cap) or configured_cap < 0:
+        raise ValueError("max_total_capital_usd must be finite and non-negative")
+    return min(REFERENCE_EQUITY_USD, configured_cap)
+
+
 def save_active_position(state: AgentNetworkState) -> Optional[Dict[str, Any]]:
     """Appends successful entries into the asset exposure position table.
 
@@ -243,6 +255,48 @@ def save_active_position(state: AgentNetworkState) -> Optional[Dict[str, Any]]:
         conn = db_connect()
         with conn:
             with conn.cursor() as cur:
+                # Serialize all position reservations on the singleton settings
+                # row. The earlier check in node_I_ACCOUNTANT used a separate
+                # connection from this INSERT, so concurrent approvals could
+                # both observe the same headroom and exceed the aggregate cap.
+                # The $1,000 reference equity is a hard ceiling even when the
+                # optional dashboard cap is unset or configured higher.
+                cur.execute("""
+                    SELECT run_status, max_total_capital_usd
+                    FROM app_settings WHERE id = 1 FOR UPDATE;
+                """)
+                settings_row = cur.fetchone()
+                if not settings_row:
+                    logger.error("Cannot reserve position: app settings row is missing.")
+                    return None
+                run_status, configured_cap = settings_row
+                if run_status != "RUNNING":
+                    logger.warning(
+                        f"Position reservation refused for {state.get('token_symbol')}: "
+                        f"trading status is {run_status}.")
+                    return None
+                try:
+                    effective_cap = effective_total_capital_cap(configured_cap)
+                except (TypeError, ValueError) as exc:
+                    logger.error(f"Cannot reserve position: invalid capital cap: {exc}")
+                    return None
+                position_size = float(state.get("max_safe_position_usd", 0.0))
+                if not math.isfinite(position_size) or position_size <= 0:
+                    logger.error("Cannot reserve position: proposed allocation is invalid.")
+                    return None
+                cur.execute("SELECT COALESCE(SUM(allocated_usd), 0.0) FROM active_positions;")
+                deployed = float(cur.fetchone()[0])
+                if not math.isfinite(deployed) or deployed + position_size > effective_cap + 1e-9:
+                    message = (
+                        f"Aggregate capital cap reached: ${deployed:.2f} deployed; "
+                        f"${position_size:.2f} requested; effective cap "
+                        f"${effective_cap:.2f}. New position refused.")
+                    cur.execute("""
+                        INSERT INTO system_alerts (log_level, agent_name, message)
+                        VALUES ('WARN', 'I_ACCOUNTANT', %s);
+                    """, (message,))
+                    logger.warning(message)
+                    return None
                 # ONE OPEN POSITION PER TOKEN.
                 #
                 # Without this, an approved token opens a fresh position on
@@ -666,8 +720,15 @@ def check_kill_switch() -> Dict[str, Any]:
                     write_system_alert("CRITICAL", "KILL_SWITCH", reason + " New entries paused.")
                     return {"gate_open": False, "reason": "PAUSED_KILL_SWITCH"}
 
-                if settings["kill_switch_max_drawdown_pct"] is not None and settings["max_total_capital_usd"]:
-                    drawdown_pct = max(0.0, (-total_realized_pnl / float(settings["max_total_capital_usd"])) * 100.0)
+                try:
+                    drawdown_basis = effective_total_capital_cap(
+                        settings["max_total_capital_usd"])
+                except (TypeError, ValueError) as exc:
+                    logger.error(f"Capital limit is invalid; refusing drawdown check: {exc}")
+                    return {"gate_open": False, "reason": "GATE_CHECK_FAILED"}
+                if (settings["kill_switch_max_drawdown_pct"] is not None
+                        and drawdown_basis > 0):
+                    drawdown_pct = max(0.0, (-total_realized_pnl / drawdown_basis) * 100.0)
                     if drawdown_pct >= float(settings["kill_switch_max_drawdown_pct"]):
                         reason = f"Drawdown of {round(drawdown_pct, 2)}% breached the configured {settings['kill_switch_max_drawdown_pct']}% limit."
                         cur.execute(
@@ -1131,6 +1192,30 @@ def node_F_ATLAS(state: AgentNetworkState) -> Dict[str, Any]:
         write_system_alert("WARN", "F_ATLAS", reason)
         return {"holder_data_fresh": False, "termination_reason": reason}
     return {"holder_data_fresh": True}
+def calculate_safe_position_size(depth_usd: Any) -> Optional[float]:
+    """Risk/depth-capped notional shared by Jupiter quoting and G_ANCHOR."""
+    try:
+        depth = float(depth_usd)
+    except (TypeError, ValueError):
+        return None
+    risk_fraction = (STOP_DISTANCE_PERCENT + STRESSED_ROUND_TRIP_COST_PERCENT) / 100.0
+    sizing_values = (depth, REFERENCE_EQUITY_USD, MAX_TRADE_RISK_PERCENT,
+                     STRESSED_ROUND_TRIP_COST_PERCENT,
+                     MAX_POSITION_NOTIONAL_USD, risk_fraction)
+    if (not all(math.isfinite(value) for value in sizing_values)
+            or depth <= 0 or REFERENCE_EQUITY_USD <= 0
+            or MAX_TRADE_RISK_PERCENT <= 0
+            or STRESSED_ROUND_TRIP_COST_PERCENT < 0
+            or MAX_POSITION_NOTIONAL_USD <= 0 or risk_fraction <= 0):
+        return None
+    risk_budget_usd = REFERENCE_EQUITY_USD * MAX_TRADE_RISK_PERCENT / 100.0
+    risk_limited_notional = risk_budget_usd / risk_fraction
+    size_ceiling = min(depth * 0.01, risk_limited_notional,
+                       MAX_POSITION_NOTIONAL_USD, REFERENCE_EQUITY_USD)
+    safe_size = math.floor(size_ceiling * 100.0) / 100.0
+    return safe_size if math.isfinite(safe_size) and safe_size > 0 else None
+
+
 def node_G_ANCHOR(state: AgentNetworkState) -> Dict[str, Any]:
     # Rule validation: Price impact protection threshold
     max_slippage = 2.5
@@ -1175,12 +1260,8 @@ def node_G_ANCHOR(state: AgentNetworkState) -> Dict[str, Any]:
         reason = "G_ANCHOR: Risk-sizing configuration is invalid; refusing to size a position."
         write_system_alert("ERROR", "G_ANCHOR", reason)
         return {"termination_reason": reason}
-    risk_budget_usd = REFERENCE_EQUITY_USD * MAX_TRADE_RISK_PERCENT / 100.0
-    risk_limited_notional = risk_budget_usd / risk_fraction
-    size_ceiling = min(depth * 0.01, risk_limited_notional,
-                       MAX_POSITION_NOTIONAL_USD, REFERENCE_EQUITY_USD)
-    safe_size = math.floor(size_ceiling * 100.0) / 100.0
-    if not math.isfinite(safe_size) or safe_size <= 0:
+    safe_size = calculate_safe_position_size(depth)
+    if safe_size is None:
         reason = "G_ANCHOR: Calculated position size is invalid; refusing to approve the position."
         write_system_alert("ERROR", "G_ANCHOR", reason)
         return {"termination_reason": reason}
@@ -1225,27 +1306,34 @@ def node_I_ACCOUNTANT(state: AgentNetworkState) -> Dict[str, Any]:
         )
         return {"position_logged": False}
 
-    # NULL here legitimately means "no cap configured", which is why this
-    # stays an `is not None` test rather than a truthiness one.
-    if settings.get("max_total_capital_usd") is not None:
-        cap = float(settings["max_total_capital_usd"])
-        position_size = float(state.get("max_safe_position_usd", 0.0))
-        try:
-            deployed = get_total_deployed_capital()
-        except CapitalReadError as e:
-            write_system_alert(
-                "CRITICAL", "I_ACCOUNTANT",
-                f"Cannot read deployed capital ({e}) -- refusing entry for "
-                f"${state['token_symbol']} rather than risk opening over the cap."
-            )
-            return {"position_logged": False}
-        if deployed + position_size > cap:
-            write_system_alert(
-                "WARN", "I_ACCOUNTANT",
-                f"Capital allocation limit reached (${round(deployed, 2)} deployed of ${cap} cap). "
-                f"Skipping entry for ${state['token_symbol']}."
-            )
-            return {"position_logged": False}
+    # Fast pre-check for an operator-readable rejection. The authoritative
+    # check is repeated under a row lock inside save_active_position(), in the
+    # same transaction as the INSERT, so this optimization cannot overspend.
+    try:
+        cap = effective_total_capital_cap(settings.get("max_total_capital_usd"))
+    except (TypeError, ValueError) as e:
+        write_system_alert(
+            "CRITICAL", "I_ACCOUNTANT",
+            f"Capital limit is invalid ({e}) -- refusing entry for ${state['token_symbol']}."
+        )
+        return {"position_logged": False}
+    position_size = float(state.get("max_safe_position_usd", 0.0))
+    try:
+        deployed = get_total_deployed_capital()
+    except CapitalReadError as e:
+        write_system_alert(
+            "CRITICAL", "I_ACCOUNTANT",
+            f"Cannot read deployed capital ({e}) -- refusing entry for "
+            f"${state['token_symbol']} rather than risk opening over the cap."
+        )
+        return {"position_logged": False}
+    if deployed + position_size > cap:
+        write_system_alert(
+            "WARN", "I_ACCOUNTANT",
+            f"Aggregate capital cap reached (${round(deployed, 2)} deployed of ${cap} cap). "
+            f"Skipping entry for ${state['token_symbol']}."
+        )
+        return {"position_logged": False}
 
     # position_logged gates Stage 3 execution (see main.maybe_execute_via_signer),
     # so it must reflect whether a row was ACTUALLY written -- not merely that

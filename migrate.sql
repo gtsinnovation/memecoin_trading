@@ -167,9 +167,17 @@ CREATE TABLE IF NOT EXISTS paper_horizon_returns (
     return_percent NUMERIC NOT NULL,      -- gross, vs price_at_evaluation
     age_minutes_at_mark NUMERIC NOT NULL, -- true elapsed time; a mark taken
                                           -- 50 min late is not a 30-min return
+    mark_liquidity_usd NUMERIC,           -- pool liquidity reported with this exact mark
+    mark_volume_h1_usd NUMERIC,           -- rolling-hour volume at mark time
+    mark_txns_m5 INTEGER,                 -- recent activity evidence at mark time
+    mark_txns_h1 INTEGER,
     marked_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (paper_trade_id, horizon_minutes)
 );
+ALTER TABLE paper_horizon_returns ADD COLUMN IF NOT EXISTS mark_liquidity_usd NUMERIC;
+ALTER TABLE paper_horizon_returns ADD COLUMN IF NOT EXISTS mark_volume_h1_usd NUMERIC;
+ALTER TABLE paper_horizon_returns ADD COLUMN IF NOT EXISTS mark_txns_m5 INTEGER;
+ALTER TABLE paper_horizon_returns ADD COLUMN IF NOT EXISTS mark_txns_h1 INTEGER;
 
 CREATE INDEX IF NOT EXISTS idx_horizon_returns_trade
     ON paper_horizon_returns(paper_trade_id);
@@ -214,6 +222,7 @@ CREATE INDEX IF NOT EXISTS idx_alerts_dispatch ON system_alerts(is_dispatched) W
 ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS volume_h1_usd NUMERIC;
 ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS txns_h1 INTEGER;
 ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS tradeable_depth_usd NUMERIC;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS slippage_probe_usd NUMERIC;
 
 -- Short-window features, recorded for MEASUREMENT ONLY.
 --
@@ -362,6 +371,12 @@ ALTER TABLE discovery_pen ADD COLUMN IF NOT EXISTS qualified BOOLEAN;
 -- go quiet for six hours and the cohort silently becomes a study of
 -- established tokens while every count still looks healthy.
 ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS discovery_source VARCHAR(20);
+-- Pin every new observation and mark series to the exact DEX pool selected at
+-- evaluation. Existing rows stay NULL because their historical pool cannot
+-- be reconstructed safely from token-level prices.
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS pair_address VARCHAR(128);
+-- Rows recorded after the side-aware price resolver carry a method version; legacy rows remain NULL.
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS price_validation_version VARCHAR(40);
 
 -- Exit confirmation: did the mark that triggered this exit have a
 -- counterparty? See the column comments in schema.sql. Existing rows keep
@@ -381,11 +396,14 @@ ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS max_price_seen NUMERIC;
 CREATE TABLE IF NOT EXISTS paper_price_path (
     id BIGSERIAL PRIMARY KEY,
     token_address VARCHAR(64) NOT NULL,
+    pair_address VARCHAR(128),
     price NUMERIC NOT NULL,
     observed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS idx_price_path_token_time
-    ON paper_price_path(token_address, observed_at);
+ALTER TABLE paper_price_path ADD COLUMN IF NOT EXISTS pair_address VARCHAR(128);
+DROP INDEX IF EXISTS idx_price_path_token_time;
+CREATE INDEX idx_price_path_token_time
+    ON paper_price_path(token_address, pair_address, observed_at);
 
 -- Index parity with schema.sql. These were added to schema.sql alongside
 -- retention.py but never here, so the LIVE database -- which is only ever
@@ -441,3 +459,35 @@ CREATE TABLE IF NOT EXISTS paper_horizon_dropout (
     dropped_no_price INTEGER NOT NULL DEFAULT 0,
     dropped_no_basis INTEGER NOT NULL DEFAULT 0
 );
+
+-- CODEX_POOL_IDENTITY_SCHEMA_REPAIR_V1
+-- Preserve legacy rows as NULL; their original pool cannot be reconstructed.
+ALTER TABLE IF EXISTS active_positions ADD COLUMN IF NOT EXISTS pair_address VARCHAR(128);
+ALTER TABLE IF EXISTS closed_positions ADD COLUMN IF NOT EXISTS entry_pair_address VARCHAR(128);
+ALTER TABLE IF EXISTS closed_positions ADD COLUMN IF NOT EXISTS exit_pair_address VARCHAR(128);
+ALTER TABLE IF EXISTS paper_trades ADD COLUMN IF NOT EXISTS pair_address VARCHAR(128);
+DO $pool_identity_guard$
+DECLARE
+    missing_columns TEXT;
+BEGIN
+    SELECT string_agg(required.table_name || '.' || required.column_name,
+                      ', ' ORDER BY required.table_name, required.column_name)
+      INTO missing_columns
+      FROM (VALUES
+          ('active_positions', 'pair_address'),
+          ('closed_positions', 'entry_pair_address'),
+          ('closed_positions', 'exit_pair_address'),
+          ('paper_trades', 'pair_address')
+      ) AS required(table_name, column_name)
+     WHERE NOT EXISTS (
+         SELECT 1
+           FROM information_schema.columns c
+          WHERE c.table_schema = 'public'
+            AND c.table_name = required.table_name
+            AND c.column_name = required.column_name
+     );
+    IF missing_columns IS NOT NULL THEN
+        RAISE EXCEPTION 'Pool identity migration incomplete; missing: %', missing_columns;
+    END IF;
+END;
+$pool_identity_guard$;

@@ -53,6 +53,11 @@ def admin_dsn() -> str:
         "postgres"
     )
 
+def _dbname_of(dsn: str) -> str:
+    """Return the database name from a PostgreSQL URL DSN."""
+    from urllib.parse import urlparse
+    return urlparse(dsn).path.lstrip("/")
+
 def assert_is_test_db(dsn: str) -> None:
     """Hard stop if this is not a throwaway database.
 

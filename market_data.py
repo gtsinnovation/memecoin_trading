@@ -39,6 +39,7 @@ import os
 import time
 import asyncio
 import logging
+import math
 import unicodedata
 from typing import Optional, Dict, Any, List
 
@@ -47,6 +48,8 @@ import httpx
 import holder_concentration
 
 logger = logging.getLogger("market_data")
+_MARK_COVERAGE_LOG_INTERVAL_S = 300.0
+_last_mark_coverage_log_at = 0.0
 
 
 # Longest token symbol we'll accept. Real ones are a handful of characters;
@@ -126,7 +129,7 @@ async def jupiter_throttle() -> None:
 # tick rate to TTL -- the difference between comfortably under the limit and
 # repeatedly banned.
 JUPITER_CACHE_TTL_S = float(os.environ.get("JUPITER_CACHE_TTL_S", "120"))
-_slippage_cache: Dict[str, Any] = {}
+_slippage_cache: Dict[Any, Any] = {}
 # Per-mint caches are keyed by every token discovery ever surfaces -- tens of
 # thousands a day on Solana -- and nothing ever removed an entry, so memory
 # grew for the life of the process. Expired entries are swept whenever a
@@ -134,7 +137,7 @@ _slippage_cache: Dict[str, Any] = {}
 CACHE_MAX_ENTRIES = int(os.environ.get("CACHE_MAX_ENTRIES", "5000"))
 
 
-def bounded_cache_put(cache: Dict[str, Any], key: str, value: Any, ttl_s: float,
+def bounded_cache_put(cache: Dict[Any, Any], key: Any, value: Any, ttl_s: float,
                       now: Optional[float] = None) -> None:
     """cache[key] = {"value", "at"} (monotonic), pruning expired entries -- and,
     if everything is still live, the oldest -- once the cache is too large."""
@@ -169,10 +172,8 @@ LUNARCRUSH_API_KEY = os.environ.get("LUNARCRUSH_API_KEY", "")
 # a meaningful number regardless of which token is being evaluated.
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
-# How large a hypothetical trade to probe Jupiter with when estimating
-# slippage, in USD. This is a fixed proxy, not the pipeline's actual
-# position size (which G_ANCHOR computes later, per-token, from real
-# liquidity) -- it just needs to be roughly the scale of a real position.
+# Fallback for direct helper calls that omit a notional. The pipeline
+# always passes its risk/depth-capped position size.
 SLIPPAGE_PROBE_USD = float(os.environ.get("SLIPPAGE_PROBE_USD", "500"))
 
 
@@ -432,7 +433,8 @@ def fetch_current_prices_sync(token_addresses: List[str]) -> Dict[str, float]:
     return {a: m["price"] for a, m in fetch_current_marks_sync(token_addresses).items()}
 
 
-def fetch_current_marks_sync(token_addresses: List[str]) -> Dict[str, Dict[str, Any]]:
+def fetch_current_marks_sync(token_addresses: List[str],
+                             pinned_pairs: Optional[Dict[str, Optional[str]]] = None) -> Dict[str, Dict[str, Any]]:
     """Current price PLUS the liveness evidence from the same response.
 
     DexScreener returns the whole pair object on this endpoint, transaction
@@ -440,16 +442,16 @@ def fetch_current_marks_sync(token_addresses: List[str]) -> Dict[str, Dict[str, 
     no second rate-limit budget. Discarding it was what left mark_to_market
     unable to tell a real fill from a stale print.
 
-    Each value is {"price", "liquidity_usd", "txns_m5", "txns_h1"}, where the
-    two counts are None when the provider reported none. None is not zero: see
-    _opt_count.
+    Each value includes the selected pair address plus price, liquidity and
+    transaction counts. A supplied non-null pinned pair is matched exactly;
+    an omitted/unpinned legacy row uses the deepest current pool.
 
     Synchronous on purpose: this is called from evaluate_open_positions(),
     which the pipeline already runs in a worker thread via run_in_executor,
     so a blocking client is the simpler correct choice there than threading
     an event loop through the engine.
 
-    Returns a dict of address -> price, omitting any token that couldn't be
+    Returns a dict of address -> mark, omitting any token that couldn't be
     priced. A missing entry means "unknown", and callers must leave that
     position untouched rather than treating it as a price of zero -- marking
     a position to zero would instantly trigger its stop-loss and book a
@@ -459,6 +461,15 @@ def fetch_current_marks_sync(token_addresses: List[str]) -> Dict[str, Dict[str, 
         return {}
 
     marks: Dict[str, Dict[str, Any]] = {}
+    returned_for_token = set()
+    pinned_pair_mismatch = set()
+    unusable_price = set()
+    failed_batch_tokens = set()
+    pinned_fallback_requested = 0
+    pinned_fallback_recovered = 0
+    pinned_fallback_failed_batches = 0
+    pinned_fallback_error_types = set()
+    pinned_pairs = pinned_pairs or {}
     unique = list(dict.fromkeys(a for a in token_addresses if is_plausible_solana_address(a)))
     skipped = [a for a in token_addresses if a and not is_plausible_solana_address(a)]
     if skipped:
@@ -495,14 +506,22 @@ def fetch_current_marks_sync(token_addresses: List[str]) -> Dict[str, Dict[str, 
                     # never missing; it was misfiled.
                     wanted = {a.lower(): a for a in chunk}
                     for pair in (resp.json() or []):
+                        pair_address = str(pair.get("pairAddress") or "")
                         base_addr = str(((pair.get("baseToken") or {}).get("address")) or "").lower()
                         quote_addr = str(((pair.get("quoteToken") or {}).get("address")) or "").lower()
                         for side_addr in (base_addr, quote_addr):
                             addr = wanted.get(side_addr)
                             if not addr:
                                 continue
+                            returned_for_token.add(addr)
+                            pinned = pinned_pairs.get(addr)
+                            # Solana addresses are base58 and case-sensitive.
+                            if pinned and pair_address != pinned:
+                                pinned_pair_mismatch.add(addr)
+                                continue
                             value = _price_for_side(pair, addr)
                             if value is None:
+                                unusable_price.add(addr)
                                 continue
                             # A token can appear in many pools; keep the deepest
                             # pool's price, matching how fetch_dex_pair_data picks.
@@ -511,6 +530,12 @@ def fetch_current_marks_sync(token_addresses: List[str]) -> Dict[str, Dict[str, 
                                 continue
                             txns = pair.get("txns") or {}
                             m5, h1 = txns.get("m5"), txns.get("h1")
+                            volumes = pair.get("volume") or {}
+                            try:
+                                volume_h1 = (float(volumes["h1"])
+                                             if volumes.get("h1") is not None else None)
+                            except (TypeError, ValueError):
+                                volume_h1 = None
 
                             def _total(bucket):
                                 b = _opt_count(bucket, "buys")
@@ -521,17 +546,121 @@ def fetch_current_marks_sync(token_addresses: List[str]) -> Dict[str, Dict[str, 
 
                             marks[addr] = {
                                 "price": value,
+                                "pair_address": pair_address or None,
                                 "liquidity_usd": liq,
+                                "volume_h1_usd": volume_h1,
                                 "txns_m5": _total(m5),
                                 "txns_h1": _total(h1),
                             }
                 except Exception as e:
+                    failed_batch_tokens.update(chunk)
                     logger.warning(f"Batch price lookup failed for chunk {i // PRICE_BATCH_SIZE + 1} "
                                    f"({len(chunk)} tokens); continuing with the rest: "
                                    f"{type(e).__name__}: {e}")
                     continue
+
+            # The token endpoint may return another, deeper pool for a token
+            # while omitting the pool that an open paper position is pinned
+            # to. Never substitute that other pool's price. Ask the provider
+            # for the exact stored pair addresses, batched to the same bounded
+            # size, then accept only a response whose pair and token sides both
+            # match the request. A missing exact pair remains unpriceable.
+            missing_pinned = [addr for addr in unique
+                              if addr not in marks and pinned_pairs.get(addr)]
+            pair_to_tokens = {}
+            for addr in missing_pinned:
+                pair_to_tokens.setdefault(pinned_pairs[addr], []).append(addr)
+            pinned_pair_ids = list(pair_to_tokens)
+            pinned_fallback_requested = len(missing_pinned)
+            for i in range(0, len(pinned_pair_ids), PRICE_BATCH_SIZE):
+                pair_chunk = pinned_pair_ids[i:i + PRICE_BATCH_SIZE]
+                try:
+                    url = (f"{DEXSCREENER_BASE}/latest/dex/pairs/solana/"
+                           f"{','.join(pair_chunk)}")
+                    resp = client.get(url)
+                    resp.raise_for_status()
+                    payload = resp.json() or {}
+                    pair_rows = (payload.get("pairs") or []) if isinstance(payload, dict) else []
+                    for pair in pair_rows:
+                        pair_address = str(pair.get("pairAddress") or "")
+                        addresses = pair_to_tokens.get(pair_address, [])
+                        if not addresses:
+                            continue
+                        base_addr = str(((pair.get("baseToken") or {}).get("address")) or "").lower()
+                        quote_addr = str(((pair.get("quoteToken") or {}).get("address")) or "").lower()
+                        for addr in addresses:
+                            if addr.lower() not in (base_addr, quote_addr):
+                                continue
+                            value = _price_for_side(pair, addr)
+                            if value is None:
+                                unusable_price.add(addr)
+                                continue
+                            liq = float((pair.get("liquidity") or {}).get("usd") or 0.0)
+                            txns = pair.get("txns") or {}
+                            m5, h1 = txns.get("m5"), txns.get("h1")
+                            volumes = pair.get("volume") or {}
+                            try:
+                                volume_h1 = (float(volumes["h1"])
+                                             if volumes.get("h1") is not None else None)
+                            except (TypeError, ValueError):
+                                volume_h1 = None
+
+                            def _total(bucket):
+                                b = _opt_count(bucket, "buys")
+                                sells = _opt_count(bucket, "sells")
+                                if b is None and sells is None:
+                                    return None
+                                return (b or 0) + (sells or 0)
+
+                            marks[addr] = {
+                                "price": value,
+                                "pair_address": pair_address,
+                                "liquidity_usd": liq,
+                                "volume_h1_usd": volume_h1,
+                                "txns_m5": _total(m5),
+                                "txns_h1": _total(h1),
+                            }
+                            pinned_fallback_recovered += 1
+                except Exception as e:
+                    pinned_fallback_failed_batches += 1
+                    pinned_fallback_error_types.add(type(e).__name__)
     except Exception as e:
         logger.warning(f"Batch price lookup failed: {e}")
+
+    # The horizon ledger counts a missing mark on every due tick, but until
+    # now a successful HTTP response that omitted a token or its pinned pool
+    # left no diagnostic explaining why the mark was absent. Rate-limit this
+    # summary: the same missing pools can persist across many fast ticks.
+    missing = [addr for addr in unique if addr not in marks]
+    if missing or pinned_fallback_requested:
+        global _last_mark_coverage_log_at
+        now = time.monotonic()
+        if (_last_mark_coverage_log_at == 0.0 or
+                now - _last_mark_coverage_log_at >= _MARK_COVERAGE_LOG_INTERVAL_S):
+            no_pair_returned = [addr for addr in missing
+                                if addr not in returned_for_token
+                                and addr not in failed_batch_tokens]
+            pinned_missing = [addr for addr in missing if pinned_pairs.get(addr)]
+            pinned_mismatched = [addr for addr in missing if addr in pinned_pair_mismatch]
+            log = logger.warning if missing else logger.info
+            log(
+                "Current market mark coverage: requested=%d priced=%d missing=%d; "
+                "missing_in_failed_batches=%d no_pair_returned=%d pinned_pool_missing=%d "
+                "returned_on_other_pools=%d exact_pair_fallback_requested=%d "
+                "exact_pair_fallback_recovered=%d exact_pair_fallback_failed_batches=%d "
+                "exact_pair_fallback_error_types=%s returned_without_usable_price=%d; "
+                "sample_pinned=%s sample_unpinned=%s. "
+                "Pinned positions are not repriced from another pool.",
+                len(unique), len(marks), len(missing),
+                sum(addr in failed_batch_tokens for addr in missing),
+                len(no_pair_returned), len(pinned_missing), len(pinned_mismatched),
+                pinned_fallback_requested, pinned_fallback_recovered,
+                pinned_fallback_failed_batches, sorted(pinned_fallback_error_types),
+                sum(addr in unusable_price for addr in missing),
+                pinned_missing[:3],
+                [addr for addr in missing if not pinned_pairs.get(addr)][:3],
+            )
+            _last_mark_coverage_log_at = now
 
     return marks
 
@@ -564,11 +693,19 @@ async def fetch_price_impact_pct(client: httpx.AsyncClient, token_address: str,
         logger.debug("Skipping Jupiter impact quote for the USDC reference mint.")
         return None
 
-    cached = _slippage_cache.get(token_address)
+    try:
+        quote_size = float(trade_size_usd)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(quote_size) or quote_size <= 0:
+        return None
+    usdc_amount = int(round(quote_size * 1_000_000))  # USDC has 6 decimals
+    if usdc_amount <= 0:
+        return None
+    cache_key = (token_address, usdc_amount)
+    cached = _slippage_cache.get(cache_key)
     if cached and (time.monotonic() - cached["at"]) < JUPITER_CACHE_TTL_S:
         return cached["value"]
-
-    usdc_amount = int(max(trade_size_usd, 1.0) * 1_000_000)  # USDC has 6 decimals
     url = f"{JUPITER_BASE}/swap/v1/quote"
     await jupiter_throttle()
     params = {
@@ -600,7 +737,7 @@ async def fetch_price_impact_pct(client: httpx.AsyncClient, token_address: str,
                 f"Jupiter reported zero price impact for {token_address} -- treating as "
                 f"unmeasured rather than free. A real quote is never exactly 0.")
             value = None
-        bounded_cache_put(_slippage_cache, token_address, value, JUPITER_CACHE_TTL_S)
+        bounded_cache_put(_slippage_cache, cache_key, value, JUPITER_CACHE_TTL_S)
         return value
     except Exception as e:
         logger.warning(f"Jupiter quote failed for {token_address}: {e}")
@@ -682,8 +819,7 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
     if dex_data is None:
         return None
 
-    price_impact, chain, social_score = await asyncio.gather(
-        fetch_price_impact_pct(client, token_address),
+    chain, social_score = await asyncio.gather(
         holder_concentration.fetch_chain_concentration(client, token_address),
         fetch_social_volume_score(client, dex_data["token_symbol"]),
     )
@@ -699,7 +835,7 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
         "pool_liquidity_usd": dex_data["liquidity_usd"],
         "social_volume_score": social_score,
         "onchain_flow_velocity": onchain_flow_velocity_proxy(dex_data["volume_h1"], dex_data["liquidity_usd"]),
-        "estimated_slippage_percent": price_impact if price_impact is not None else 0.0,
+        "estimated_slippage_percent": 0.0,  # main fills this after risk/depth sizing
         "onchain_volume_increasing": dex_data["volume_h1"] * 24.0 > dex_data["volume_h24"],
         # DexScreener reports total value locked (both sides of the pool),
         # so the side we actually trade against is about half of it. See
@@ -728,7 +864,7 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
         "token_age_hours": None,
         "launchpad": None,
         **holder_fields,
-        "_slippage_data_missing": price_impact is None,
+        "_slippage_data_missing": True,  # main performs the size-aware Jupiter quote
         "_depth_data_missing": not dex_data["liquidity_usd"],
         "_price_disagreement": False,
         # Without a LunarCrush key the score above is a fixed placeholder,

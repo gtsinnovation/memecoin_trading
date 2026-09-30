@@ -33,6 +33,7 @@ try:
         DB_IDLE_TX_TIMEOUT_MS, evaluate_open_positions, check_kill_switch,
         get_app_settings, resume_trading, pause_trading, set_run_status,
         write_system_alert, AgentUnresponsiveError, get_agent_latencies,
+        effective_total_capital_cap, calculate_safe_position_size,
     )
     import market_data
     import token_discovery
@@ -942,22 +943,25 @@ def _mark_paper_trades() -> None:
         # before a fetch that can take tens of seconds -- and the transaction
         # sat idle holding its snapshot the whole time.
         with conn:
-            addresses = paper_trading.open_token_addresses(conn)
-        if not addresses:
-            return
+            pinned_pairs = paper_trading.open_token_pool_map(conn)
+            addresses = list(pinned_pairs)
+        # With no pool-pinned addresses, skip the HTTP request but still run
+        # the ledger passes below. They must expire/abandon legacy unpinned rows
+        # and count due horizon observations as missing instead of leaving rows
+        # live forever.
         # marks, not bare prices: the same DexScreener response carries
         # the transaction counts that say whether an exit at this mark
         # could actually have filled. See paper_trading.exit_is_confirmed.
-        marks = market_data.fetch_current_marks_sync(addresses)
+        marks = (market_data.fetch_current_marks_sync(addresses, pinned_pairs=pinned_pairs)
+                 if pinned_pairs else {})
         with conn:
             stats = paper_trading.mark_to_market(conn, marks)
             # Independent of the barrier trades above: records what each token
             # actually did at fixed elapsed times. Must run even when
             # mark_to_market() changed nothing, because a token whose barrier
             # trade closed long ago still owes its later horizons.
-            # mark_horizons needs only the price half of each mark.
-            prices = {a: mk["price"] for a, mk in marks.items()}
-            horizons = paper_trading.mark_horizons(conn, prices)
+            # Passing full marks keeps horizon labels pinned to the entry pool.
+            horizons = paper_trading.mark_horizons(conn, marks)
             if horizons:
                 paper_trading.record_horizon_dropout(conn, horizons)
             if any(stats.values()):
@@ -1331,6 +1335,10 @@ async def pipeline_executor_worker():
                           WHERE session_status = 'REJECTED') r;
                 """)
                 alert_rows = await conn.fetch("SELECT agent_name, message FROM system_alerts WHERE log_level IN ('WARN', 'ERROR', 'CRITICAL') ORDER BY id DESC LIMIT 3;")
+                # Fetch these dashboard metrics while this acquired connection
+                # is still checked out. Using `conn` after the async-with exits
+                # raises asyncpg.InterfaceError and aborts this tick before the
+                # WebSocket metrics broadcast.
                 pnl_row = await conn.fetchrow("""
                     SELECT COUNT(*)::int AS closed_trades,
                            COALESCE(SUM(realized_pnl_usd), 0.0)::float AS total_realized_pnl,
@@ -1344,6 +1352,16 @@ async def pipeline_executor_worker():
                            closed_at
                     FROM closed_positions ORDER BY id DESC LIMIT 5;
                 """)
+
+            capital_limit = None
+            capital_limit_verified = False
+            if settings_snapshot is not None:
+                try:
+                    capital_limit = effective_total_capital_cap(
+                        settings_snapshot.get("max_total_capital_usd"))
+                    capital_limit_verified = True
+                except (TypeError, ValueError) as exc:
+                    logger.error(f"Dashboard could not verify the capital ceiling: {exc}")
 
             # "E_SIGNAL" is the pre-rename name of E_BREADTH; historical rows
             # still carry it, so both count (see the query above).
@@ -1416,6 +1434,25 @@ async def pipeline_executor_worker():
                     f"gate, so this token is skipped rather than evaluated on it.")
                 await asyncio.sleep(3.0)
                 continue
+
+            # Quote the same risk/depth-capped notional G_ANCHOR can approve.
+            # The old fixed $500 probe was about 14x the default $35.63 cap.
+            slippage_probe_usd = calculate_safe_position_size(
+                snapshot.get("tradeable_depth_usd"))
+            snapshot["slippage_probe_usd"] = slippage_probe_usd
+            impact = None
+            if slippage_probe_usd is not None:
+                impact = await market_data.fetch_price_impact_pct(
+                    http_client, target_address, trade_size_usd=slippage_probe_usd)
+                logger.info(
+                    f"Jupiter impact quote for ${target_token}: notional=${slippage_probe_usd:.2f}, "
+                    f"impact={impact if impact is not None else 'unmeasured'}%")
+            else:
+                logger.warning(
+                    f"Cannot size a Jupiter impact quote for ${target_token}; "
+                    "invalid or insufficient risk/depth cap.")
+            snapshot["estimated_slippage_percent"] = impact if impact is not None else 0.0
+            snapshot["_slippage_data_missing"] = impact is None
 
             # These two are POPPED into real state fields rather than logged
             # and discarded. The numeric columns they describe are NOT NULL in
@@ -1544,7 +1581,9 @@ async def pipeline_executor_worker():
                     "total_sessions": (totals["total"] if totals else 0) + 1,
                     "approved_sessions": totals["approved"] if totals else 0,
                     "rejected_sessions": totals["rejected"] if totals else 0,
-                    "total_capital": funds or 0.0
+                    "total_capital": funds or 0.0,
+                    "capital_limit_usd": capital_limit,
+                    "capital_limit_verified": capital_limit_verified,
                 },
                 "pnl_summary": {
                     "total_realized_pnl": pnl_row["total_realized_pnl"] if pnl_row else 0.0,
@@ -1799,15 +1838,15 @@ async def get_dashboard_interface(request: Request):
                 <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl">
                     <p class="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Capital Deployed</p>
                     <p id="stat-capital" class="text-xl font-bold text-slate-300 mt-1 balance-value">$--</p>
-                    <p class="text-[9px] text-slate-600 mt-0.5">Open exposure, not P&amp;L</p>
+                    <p id="stat-capital-limit" class="text-[9px] text-slate-600 mt-0.5">Open/reserved allocation</p>
                 </div>
                 <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl">
-                    <p class="text-[10px] font-bold text-indigo-400 uppercase tracking-wider">Net Realized P&amp;L</p>
+                    <p class="text-[10px] font-bold text-indigo-400 uppercase tracking-wider">Quote-Marked Net P&amp;L</p>
                     <p id="stat-pnl" class="text-xl font-bold text-slate-300 mt-1 balance-value">$--</p>
-                    <p id="stat-pnl-trades" class="text-[9px] text-slate-600 mt-0.5">0 closed trades</p>
+                    <p id="stat-pnl-trades" class="text-[9px] text-slate-600 mt-0.5">Modeled ledger outcomes; fills unverified</p>
                 </div>
                 <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl">
-                    <p class="text-[10px] font-bold text-amber-400 uppercase tracking-wider">Win Rate</p>
+                    <p class="text-[10px] font-bold text-amber-400 uppercase tracking-wider">Quote-Marked Win Rate</p>
                     <p id="stat-winrate" class="text-xl font-bold text-amber-400 mt-1">--</p>
                 </div>
             </section>
@@ -1838,7 +1877,7 @@ async def get_dashboard_interface(request: Request):
                 </div>
 
                 <div class="lg:col-span-2 bg-slate-900 border border-slate-800 p-5 rounded-xl flex flex-col">
-                    <h3 class="text-xs font-bold text-slate-300 uppercase tracking-wider mb-2">Realized Trade History</h3>
+                    <h3 class="text-xs font-bold text-slate-300 uppercase tracking-wider mb-2">Quote-Marked Ledger History</h3>
                     <div id="closed-trades-box" class="flex-1 space-y-2 text-xs overflow-y-auto pt-1">
                         <p class="text-slate-500 italic">No closed trades yet.</p>
                     </div>
@@ -1872,13 +1911,13 @@ async def get_dashboard_interface(request: Request):
                 <div class="p-5 space-y-5 text-xs">
 
                     <div>
-                        <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Capital Allocation Limit</label>
+                        <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Additional Capital Allocation Limit</label>
                         <div class="flex items-center gap-2">
                             <span class="text-slate-500">$</span>
-                            <input id="set-max-capital" type="number" min="0" step="1" class="flex-1 bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-slate-100" placeholder="No limit">
-                            <label class="flex items-center gap-1 text-slate-400 whitespace-nowrap"><input id="set-max-capital-nolimit" type="checkbox" class="accent-indigo-500"> No limit</label>
+                            <input id="set-max-capital" type="number" min="0" step="1" class="flex-1 bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-slate-100" placeholder="Use reference-equity cap">
+                            <label class="flex items-center gap-1 text-slate-400 whitespace-nowrap"><input id="set-max-capital-nolimit" type="checkbox" class="accent-indigo-500"> No extra cap</label>
                         </div>
-                        <p class="text-[9px] text-slate-600 mt-1">Blocks new entries once total deployed capital would exceed this.</p>
+                        <p class="text-[9px] text-slate-600 mt-1">This can tighten the reference-equity ceiling; it cannot raise it. Existing positions are not liquidated.</p>
                     </div>
 
                     <div>
@@ -2289,14 +2328,31 @@ async def get_dashboard_interface(request: Request):
                     document.getElementById('stat-total').innerText = data.summary.total_sessions;
                     document.getElementById('stat-approved').innerText = data.summary.approved_sessions;
                     document.getElementById('stat-rejected').innerText = data.summary.rejected_sessions;
-                    document.getElementById('stat-capital').innerText = `$` + data.summary.total_capital.toLocaleString();
+                    const capital = Number(data.summary.total_capital || 0);
+                    const capitalEl = document.getElementById('stat-capital');
+                    capitalEl.innerText = `$` + capital.toLocaleString();
+                    const capNote = document.getElementById('stat-capital-limit');
+                    if (!data.summary.capital_limit_verified || data.summary.capital_limit_usd == null) {
+                        capitalEl.className = "text-xl font-bold mt-1 balance-value text-rose-400";
+                        capNote.innerText = "Capital limit unavailable; new entries must remain blocked";
+                        capNote.className = "text-[9px] text-rose-400 mt-0.5";
+                    } else {
+                        const capitalLimit = Number(data.summary.capital_limit_usd);
+                        const overBy = capital - capitalLimit;
+                        const overCap = overBy > 0.005;
+                        capitalEl.className = "text-xl font-bold mt-1 balance-value " + (overCap ? "text-rose-400" : "text-slate-300");
+                        capNote.innerText = overCap
+                            ? `OVER CAP by $${overBy.toLocaleString(undefined, { maximumFractionDigits: 2 })}; existing rows are not liquidated`
+                            : `$${capitalLimit.toLocaleString()} aggregate allocation ceiling`;
+                        capNote.className = "text-[9px] mt-0.5 " + (overCap ? "text-rose-400 font-bold" : "text-slate-600");
+                    }
 
                     const pnl = data.pnl_summary || { total_realized_pnl: 0, closed_trades: 0, win_rate: 0 };
                     const pnlEl = document.getElementById('stat-pnl');
                     const pnlPositive = pnl.total_realized_pnl >= 0;
                     pnlEl.innerText = (pnlPositive ? '+$' : '-$') + Math.abs(pnl.total_realized_pnl).toLocaleString(undefined, { maximumFractionDigits: 2 });
                     pnlEl.className = "text-xl font-bold mt-1 balance-value " + (pnlPositive ? "text-emerald-400" : "text-rose-400");
-                    document.getElementById('stat-pnl-trades').innerText = `${pnl.closed_trades} closed trade${pnl.closed_trades === 1 ? '' : 's'}`;
+                    document.getElementById('stat-pnl-trades').innerText = `${pnl.closed_trades} quote-marked ledger outcome${pnl.closed_trades === 1 ? '' : 's'}; fills unverified`;
                     document.getElementById('stat-winrate').innerText = pnl.closed_trades > 0 ? `${pnl.win_rate.toFixed(1)}%` : '--';
 
                     cFunnel.data.datasets[0].data = [

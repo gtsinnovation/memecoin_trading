@@ -174,6 +174,8 @@ CREATE INDEX IF NOT EXISTS idx_holder_samples_token_time
 CREATE TABLE IF NOT EXISTS paper_trades (
     id SERIAL PRIMARY KEY,
     token_address VARCHAR(128) NOT NULL,
+    pair_address VARCHAR(128),           -- immutable pool selected at evaluation; NULL means legacy/unverifiable
+    price_validation_version VARCHAR(40), -- NULL marks legacy rows recorded before price-method versioning
     token_symbol VARCHAR(50),
     cohort VARCHAR(20) NOT NULL,            -- 'APPROVED' or 'REJECTED'
     rejected_by VARCHAR(40),                -- which gate short-circuited; NULL when approved
@@ -184,6 +186,7 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     target_exit_price NUMERIC NOT NULL,
     invalidation_level_price NUMERIC NOT NULL,
     assumed_slippage_percent NUMERIC,       -- measured at evaluation, charged on both sides
+    slippage_probe_usd NUMERIC,             -- exact notional sent to Jupiter for this impact quote
     fill_price NUMERIC,
     filled_at TIMESTAMP WITH TIME ZONE,
     last_price NUMERIC,
@@ -302,6 +305,10 @@ CREATE TABLE IF NOT EXISTS paper_horizon_returns (
     return_percent NUMERIC NOT NULL,      -- gross, vs price_at_evaluation
     age_minutes_at_mark NUMERIC NOT NULL, -- true elapsed time; a mark taken
                                           -- 50 min late is not a 30-min return
+    mark_liquidity_usd NUMERIC,           -- pool liquidity reported with this exact mark
+    mark_volume_h1_usd NUMERIC,           -- rolling-hour volume at mark time
+    mark_txns_m5 INTEGER,                 -- recent activity evidence at mark time
+    mark_txns_h1 INTEGER,
     marked_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (paper_trade_id, horizon_minutes)
 );
@@ -382,13 +389,14 @@ CREATE INDEX IF NOT EXISTS idx_holder_samples_sampled_at ON token_holder_samples
 CREATE TABLE IF NOT EXISTS paper_price_path (
     id BIGSERIAL PRIMARY KEY,
     token_address VARCHAR(64) NOT NULL,
+    pair_address VARCHAR(128),
     price NUMERIC NOT NULL,
     observed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 -- The replay reads one token's series in time order; the sampler asks whether
 -- a recent row exists for a token. Both are this index.
 CREATE INDEX IF NOT EXISTS idx_price_path_token_time
-    ON paper_price_path(token_address, observed_at);
+    ON paper_price_path(token_address, pair_address, observed_at);
 
 -- Index parity with migrate.sql (see the note there). Segmenting the rejected
 -- cohort by reason runs over the whole table.

@@ -115,7 +115,9 @@ def _schema_parity():
     def read(name):
         return open(_os.path.join(root, name), encoding="utf-8").read()
 
-    idx = _re.compile(r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+(\w+)", _re.I)
+    # Some migrations deliberately DROP an obsolete index definition before
+    # recreating it, so CREATE INDEX there need not repeat IF NOT EXISTS.
+    idx = _re.compile(r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)", _re.I)
     tbl = _re.compile(r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(\w+)", _re.I)
     schema, migrate = read("schema.sql"), read("migrate.sql")
     a, b = set(idx.findall(schema)), set(idx.findall(migrate))
@@ -216,6 +218,9 @@ def run() -> Suite:
             pt._as_mark({"price": 2.0, "txns_m5": 7, "txns_h1": 40}), (2.0, 7, 40))
     s.check("a mark missing its counts is unknown, not zero",
             pt._as_mark({"price": 2.0}), (2.0, None, None))
+    for bad_price in (0.0, -1.0, float("nan"), float("inf"), "not-a-price"):
+        s.check_true(f"invalid mark price {bad_price!r} is unavailable",
+                     pt._as_mark({"price": bad_price})[0] is None)
 
     # --- compose forwards every knob, across the WHOLE codebase ------------
     # The existing check covered token_discovery.py only, and passed while

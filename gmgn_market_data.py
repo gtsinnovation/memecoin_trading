@@ -60,7 +60,6 @@ import holder_concentration
 from market_data import (
     sanitize_external_text,
     onchain_flow_velocity_proxy,
-    fetch_price_impact_pct,
 )
 
 logger = logging.getLogger("gmgn_market_data")
@@ -336,9 +335,8 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
     if info is None:
         return None
 
-    social_score, price_impact, chain = await asyncio.gather(
+    social_score, chain = await asyncio.gather(
         fetch_social_volume_score(client, token_address),
-        fetch_price_impact_pct(client, token_address),
         holder_concentration.observe_chain(client, token_address),
     )
     holder_fields = holder_concentration.snapshot_fields(
@@ -351,7 +349,7 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
         "pool_liquidity_usd": info["liquidity_usd"],
         "social_volume_score": social_score if social_score is not None else 0.0,
         "onchain_flow_velocity": onchain_flow_velocity_proxy(info["volume_h1"], info["liquidity_usd"]),
-        "estimated_slippage_percent": price_impact if price_impact is not None else 0.0,
+        "estimated_slippage_percent": 0.0,  # main fills this after risk/depth sizing
         "onchain_volume_increasing": info["volume_h1"] * 24.0 > info["volume_h24"],
         # GMGN reports pool TVL like DexScreener, so the tradeable side is
         # about half -- see free_market_data.compute_tradeable_depth().
@@ -369,7 +367,7 @@ async def fetch_full_snapshot(client: httpx.AsyncClient, token_address: str) -> 
         "token_age_hours": None,
         "launchpad": None,
         **holder_fields,
-        "_slippage_data_missing": price_impact is None,
+        "_slippage_data_missing": True,  # main performs the size-aware Jupiter quote
         "_social_data_missing": social_score is None,
         "_depth_data_missing": not info["liquidity_usd"],
         "_price_disagreement": False,

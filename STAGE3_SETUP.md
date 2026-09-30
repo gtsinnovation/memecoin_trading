@@ -270,9 +270,10 @@ docker compose exec db psql -U postgres -d memecoin_trading -c "SELECT * FROM si
 `ALLOWED_EXECUTION_TOKENS`, and a `--usd` above `MAX_TRADE_USD`, must both
 come back `HTTP 403 -> VOID` and appear as `REFUSED_POLICY`. Pause trading
 from the dashboard and confirm the refusal names `PAUSED_MANUAL`. Re-sending
-an order id (`stage3_smoke.py order <id>` shows its outcome) can never sign
-twice: `/execute` answers a known `client_order_id` with `409` and the first
-outcome.
+re-sending the exact same order id and payload (`stage3_smoke.py order <id>`
+shows its outcome) can never sign twice: `/execute` answers with `409` and
+the first outcome. Reusing that id with a different token, amount, or network
+returns `IDEMPOTENCY_CONFLICT` without returning the first signature.
 
 If all four checks pass, the signing plumbing is proven end-to-end on
 devnet.
